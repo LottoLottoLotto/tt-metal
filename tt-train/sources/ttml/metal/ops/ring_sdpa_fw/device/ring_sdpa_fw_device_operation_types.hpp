@@ -22,14 +22,14 @@ struct RingSDPAFwParams {
     uint32_t step = 0;
     ttml::metal::AttentionMaskType mask_type = ttml::metal::AttentionMaskType::None;
     RingDirection ring_direction =
-        ttnn_fixed::distributed::RingShiftDirection::Backward;   // Direction K/V is shifting in the ring
-    RingLaneSelection lane_selection = RingLaneSelection::None;  // See RingLaneSelection in ring_sdpa_utils.hpp
+        ttnn_fixed::distributed::RingShiftDirection::Backward;      // Direction K/V is shifting in the ring
+    RingChunkSelection chunk_selection = RingChunkSelection::None;  // See RingChunkSelection in ring_sdpa_utils.hpp
 };
 
-// Second-lane tensors for RingLaneSelection::ZigZag. Devices assigned lane 1 at a step read
+// Second-chunk tensors for RingChunkSelection::ZigZag. Devices assigned chunk 1 at a step read
 // these instead of the primary query/key/value and write their result into output and
-// intermediates (written in place; the op's return value always refers to lane 0).
-struct RingSDPAFwLane {
+// intermediates (written in place; the op's return value always refers to chunk 0).
+struct RingSDPAFwChunk {
     ttnn::Tensor query;
     ttnn::Tensor key;
     ttnn::Tensor value;
@@ -43,7 +43,7 @@ struct RingSDPAFwInputs {
     ttnn::Tensor value;
     std::optional<ttnn::Tensor> preallocated_output;         // Preallocated output buffer
     std::optional<ttnn::Tensor> preallocated_intermediates;  // Preallocated intermediates buffer
-    std::optional<RingSDPAFwLane> lane1;                     // Required iff lane_selection == ZigZag
+    std::optional<RingSDPAFwChunk> chunk1;                   // Required iff chunk_selection == ZigZag
 };
 
 using operation_attributes_t = RingSDPAFwParams;

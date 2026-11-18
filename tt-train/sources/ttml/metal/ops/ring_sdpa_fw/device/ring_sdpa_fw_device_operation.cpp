@@ -25,15 +25,19 @@ void RingSDPAFwDeviceOperation::validate_on_program_cache_miss(
         validate_intermediates_tensor(tensor_args.preallocated_intermediates.value(), tensor_args.query);
     }
 
-    validate_ring_lane_selection(attrs, tensor_args.lane1.has_value());
-    if (tensor_args.lane1.has_value()) {
-        const auto& lane1 = tensor_args.lane1.value();
-        validate_ring_qkv(lane1.query, lane1.key, lane1.value);
-        validate_same_spec(lane1.query, tensor_args.query, "query");
-        validate_same_spec(lane1.key, tensor_args.key, "key");
-        validate_same_spec(lane1.value, tensor_args.value, "value");
-        validate_output_like_tensor(lane1.output, "Second-lane output", lane1.query, lane1.value);
-        validate_intermediates_tensor(lane1.intermediates, lane1.query);
+    validate_ring_chunk_selection(attrs, tensor_args.chunk1.has_value());
+    validate_chunk0_output_given(attrs, tensor_args.preallocated_output, "output");
+    validate_chunk0_output_given(attrs, tensor_args.preallocated_intermediates, "intermediates");
+    if (tensor_args.chunk1.has_value()) {
+        const auto& chunk1 = tensor_args.chunk1.value();
+        validate_ring_qkv(chunk1.query, chunk1.key, chunk1.value);
+        validate_output_like_tensor(chunk1.output, "Second-chunk output", chunk1.query, chunk1.value);
+        validate_intermediates_tensor(chunk1.intermediates, chunk1.query);
+        validate_same_spec(chunk1.query, tensor_args.query, "query");
+        validate_same_spec(chunk1.key, tensor_args.key, "key");
+        validate_same_spec(chunk1.value, tensor_args.value, "value");
+        validate_same_spec(chunk1.output, tensor_args.preallocated_output.value(), "output");
+        validate_same_spec(chunk1.intermediates, tensor_args.preallocated_intermediates.value(), "intermediates");
     }
 }
 
@@ -79,21 +83,6 @@ RingSDPAFwDeviceOperation::tensor_return_value_t RingSDPAFwDeviceOperation::crea
     return {output, intermediates};
 }
 
-ttsl::hash::hash_t RingSDPAFwDeviceOperation::compute_program_hash(
-    const operation_attributes_t& attrs, const tensor_args_t& tensor_args) {
-    // Hash based on operation configuration - buffer addresses are updated via override_runtime_arguments
-    return ttsl::hash::hash_objects(
-        attrs.ring_size,
-        attrs.ring_axis,
-        attrs.step,
-        attrs.mask_type,
-        static_cast<int>(attrs.ring_direction),
-        static_cast<int>(attrs.lane_selection),
-        tensor_args.query.logical_shape(),
-        tensor_args.query.dtype(),
-        tensor_args.key.logical_shape());
-}
-
 }  // namespace ttml::metal::ops::ring_sdpa_fw
 
 namespace ttnn::prim {
@@ -109,8 +98,8 @@ ttml::metal::ops::ring_sdpa_fw::RingSDPAFwDeviceOperation::tensor_return_value_t
     ttml::metal::ops::ring_sdpa_fw::RingDirection ring_direction,
     const std::optional<ttnn::Tensor>& preallocated_output,
     const std::optional<ttnn::Tensor>& preallocated_intermediates,
-    ttml::metal::ops::RingLaneSelection lane_selection,
-    const std::optional<ttml::metal::ops::ring_sdpa_fw::RingSDPAFwLane>& lane1) {
+    ttml::metal::ops::RingChunkSelection chunk_selection,
+    const std::optional<ttml::metal::ops::ring_sdpa_fw::RingSDPAFwChunk>& chunk1) {
     using OperationType = ttml::metal::ops::ring_sdpa_fw::RingSDPAFwDeviceOperation;
 
     auto operation_attributes = OperationType::operation_attributes_t{
@@ -119,7 +108,7 @@ ttml::metal::ops::ring_sdpa_fw::RingSDPAFwDeviceOperation::tensor_return_value_t
         .step = step,
         .mask_type = mask_type,
         .ring_direction = ring_direction,
-        .lane_selection = lane_selection};
+        .chunk_selection = chunk_selection};
 
     auto tensor_args = OperationType::tensor_args_t{
         .query = query,
@@ -127,7 +116,7 @@ ttml::metal::ops::ring_sdpa_fw::RingSDPAFwDeviceOperation::tensor_return_value_t
         .value = value,
         .preallocated_output = preallocated_output,
         .preallocated_intermediates = preallocated_intermediates,
-        .lane1 = lane1};
+        .chunk1 = chunk1};
 
     return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
 }

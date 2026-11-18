@@ -25,27 +25,27 @@ std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor> ring_sdpa_bw(
     const std::optional<ttnn::Tensor>& preallocated_grad_query,
     const std::optional<ttnn::Tensor>& preallocated_grad_key,
     const std::optional<ttnn::Tensor>& preallocated_grad_value,
-    ops::RingLaneSelection lane_selection,
-    const std::optional<RingSDPABwLane>& lane1) {
-    std::optional<ops::ring_sdpa_bw::q::RingSDPABwQLane> q_lane1;
-    std::optional<ops::ring_sdpa_bw::kv::RingSDPABwKVLane> kv_lane1;
-    if (lane1.has_value()) {
-        q_lane1 = ops::ring_sdpa_bw::q::RingSDPABwQLane{
-            .grad_output = lane1->grad_output,
-            .attn_output = lane1->attn_output,
-            .query = lane1->query,
-            .key = lane1->key,
-            .value = lane1->value,
-            .intermediates = lane1->intermediates,
-            .grad_query = lane1->grad_query};
-        kv_lane1 = ops::ring_sdpa_bw::kv::RingSDPABwKVLane{
-            .grad_output = lane1->grad_output,
-            .query = lane1->query,
-            .key = lane1->key,
-            .value = lane1->value,
-            .intermediates = lane1->intermediates,
-            .grad_key = lane1->grad_key,
-            .grad_value = lane1->grad_value};
+    ops::RingChunkSelection chunk_selection,
+    const std::optional<RingSDPABwChunk>& chunk1) {
+    std::optional<ops::ring_sdpa_bw::q::RingSDPABwQChunk> q_chunk1;
+    std::optional<ops::ring_sdpa_bw::kv::RingSDPABwKVChunk> kv_chunk1;
+    if (chunk1.has_value()) {
+        q_chunk1 = ops::ring_sdpa_bw::q::RingSDPABwQChunk{
+            .grad_output = chunk1->grad_output,
+            .attn_output = chunk1->attn_output,
+            .query = chunk1->query,
+            .key = chunk1->key,
+            .value = chunk1->value,
+            .intermediates = chunk1->intermediates,
+            .grad_query = chunk1->grad_query};
+        kv_chunk1 = ops::ring_sdpa_bw::kv::RingSDPABwKVChunk{
+            .grad_output = chunk1->grad_output,
+            .query = chunk1->query,
+            .key = chunk1->key,
+            .value = chunk1->value,
+            .intermediates = chunk1->intermediates,
+            .grad_key = chunk1->grad_key,
+            .grad_value = chunk1->grad_value};
     }
 
     // Q kernel first: computes grad_Q and u_scaler = rowsum(dO * O)
@@ -62,11 +62,11 @@ std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor> ring_sdpa_bw(
         mask_type,
         ring_direction,
         preallocated_grad_query,
-        lane_selection,
-        q_lane1);
+        chunk_selection,
+        q_chunk1);
 
-    // KV kernel: uses precomputed u_scaler (shared by both lanes: each device fills it for the
-    // one lane it computes at this step)
+    // KV kernel: uses precomputed u_scaler (shared by both chunks: each device fills it for the
+    // one chunk it computes at this step)
     auto [grad_K, grad_V] = ttnn::prim::ttml_ring_sdpa_bw_kv(
         grad_output,
         u_scaler,
@@ -81,8 +81,8 @@ std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor> ring_sdpa_bw(
         ring_direction,
         preallocated_grad_key,
         preallocated_grad_value,
-        lane_selection,
-        kv_lane1);
+        chunk_selection,
+        kv_chunk1);
 
     return {grad_Q, grad_K, grad_V};
 }

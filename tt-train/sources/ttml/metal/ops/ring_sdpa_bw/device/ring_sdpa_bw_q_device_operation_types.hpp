@@ -22,14 +22,14 @@ struct RingSDPABwQParams {
     uint32_t step = 0;
     ttml::metal::AttentionMaskType mask_type = ttml::metal::AttentionMaskType::None;
     RingDirection ring_direction =
-        ttnn_fixed::distributed::RingShiftDirection::Backward;   // Direction K/V is shifting in the ring
-    RingLaneSelection lane_selection = RingLaneSelection::None;  // See RingLaneSelection in ring_sdpa_utils.hpp
+        ttnn_fixed::distributed::RingShiftDirection::Backward;      // Direction K/V is shifting in the ring
+    RingChunkSelection chunk_selection = RingChunkSelection::None;  // See RingChunkSelection in ring_sdpa_utils.hpp
 };
 
-// Second-lane tensors for RingLaneSelection::ZigZag. Devices assigned lane 1 at a step read
+// Second-chunk tensors for RingChunkSelection::ZigZag. Devices assigned chunk 1 at a step read
 // these and write grad_query in place; u_scaler is shared (each device fills it for the
-// one lane it computes, and the KV op on the same device consumes it for that lane).
-struct RingSDPABwQLane {
+// one chunk it computes, and the KV op on the same device consumes it for that chunk).
+struct RingSDPABwQChunk {
     ttnn::Tensor grad_output;
     ttnn::Tensor attn_output;
     ttnn::Tensor query;
@@ -47,7 +47,7 @@ struct RingSDPABwQInputs {
     ttnn::Tensor value;
     ttnn::Tensor intermediates;
     std::optional<ttnn::Tensor> preallocated_grad_query;  // Preallocated output buffer
-    std::optional<RingSDPABwQLane> lane1;                 // Required iff lane_selection == ZigZag
+    std::optional<RingSDPABwQChunk> chunk1;               // Required iff chunk_selection == ZigZag
 };
 
 using operation_attributes_t = RingSDPABwQParams;

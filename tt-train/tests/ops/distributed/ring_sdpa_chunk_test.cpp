@@ -3,18 +3,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Device tests for RingLaneSelection::ZigZag in the ring SDPA ops.
+ * Device tests for RingChunkSelection::ZigZag in the ring SDPA ops.
  *
- * With zig-zag lane selection one ring_sdpa_fw / ring_sdpa_bw call carries two sets of
- * tensors ("lanes"), and the ring program factory binds each device's program to the lane
- * the schedule assigns it (lane 0 when src < d, lane 1 when src > d, nothing on the
- * diagonal step). These tests replicate distinct random inputs per lane to every device,
+ * With zig-zag chunk selection one ring_sdpa_fw / ring_sdpa_bw call carries two sets of
+ * tensors ("chunks"), and the ring program factory binds each device's program to the chunk
+ * the schedule assigns it (chunk 0 when src < d, chunk 1 when src > d, nothing on the
+ * diagonal step). These tests replicate distinct random inputs per chunk to every device,
  * run every ring step in both ring directions, and check on each device that
- *   - the assigned lane's outputs match an unmasked SDPA reference of that lane's inputs,
- *   - the other lane's outputs are left untouched (pre-filled sentinels survive).
+ *   - the assigned chunk's outputs match an unmasked SDPA reference of that chunk's inputs,
+ *   - the other chunk's outputs are left untouched (pre-filled sentinels survive).
  * Every step runs twice: a program-cache miss (create_mesh_workload) and then a hit with
  * fresh inputs and outputs at new buffer addresses (override_runtime_arguments), so both
- * paths that bind lanes are exercised.
+ * paths that bind chunks are exercised.
  * They use the whole system mesh with the ring along its longest axis, so they run on a
  * LoudBox (1x8, TT_MESH_GRAPH_DESC_PATH=bh_lb_1x8_line_graph_descriptor) as well as a
  * Galaxy (8x4) and skip on single-device systems.
@@ -46,15 +46,15 @@ using ::testing::HasSubstr;
 using ::testing::ThrowsMessage;
 using ttml::metal::AttentionMaskType;
 using ttml::metal::ops::get_ring_step_work;
-using ttml::metal::ops::RingLaneSelection;
+using ttml::metal::ops::RingChunkSelection;
 using ttml::ttnn_fixed::distributed::RingShiftDirection;
 
 constexpr float kSentinel = 7.0F;
 constexpr float kNegInf = -std::numeric_limits<float>::infinity();
-// B, Q heads, KV heads (GQA), lane sequence length C (4 tiles), head dim.
+// B, Q heads, KV heads (GQA), chunk sequence length C (4 tiles), head dim.
 constexpr size_t kB = 1, kH = 4, kG = 2, kC = 128, kD = 64;
 // Q is drawn from U(-kQScale, kQScale) so the scaled scores have std ~1: a near-uniform softmax would
-// make the gradients too insensitive to the lane's K and u = rowsum(dO * O) to catch a wrong binding.
+// make the gradients too insensitive to the chunk's K and u = rowsum(dO * O) to catch a wrong binding.
 constexpr float kQScale = 3.0F;
 // Relative L2 error accepted against the FP32 host reference (bf16 inputs and outputs).
 constexpr double kForwardRelTol = 2e-2;
@@ -75,7 +75,7 @@ uint32_t ring_axis_of(const tt::tt_metal::distributed::MeshShape& shape) {
     return axis;
 }
 
-class RingSDPALaneTest : public ::testing::Test {
+class RingSDPAChunkTest : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
         if (system_mesh_shape().mesh_size() > 1U) {
@@ -90,7 +90,7 @@ protected:
     }
     void SetUp() override {
         if (system_mesh_shape().mesh_size() <= 1U) {
-            GTEST_SKIP() << "Ring SDPA lane tests need a multi-device mesh";
+            GTEST_SKIP() << "Ring SDPA chunk tests need a multi-device mesh";
         }
         ttml::autograd::ctx().get_device().clear_program_cache();
     }
@@ -210,33 +210,33 @@ double rel_l2(const xt::xarray<float>& actual, const xt::xarray<float>& expected
     return std::sqrt(diff / std::max(norm, 1e-30));
 }
 
-// Host data of one lane: bf16-rounded inputs and FP32 references.
-struct Lane {
+// Host data of one chunk: bf16-rounded inputs and FP32 references.
+struct Chunk {
     xt::xarray<float> q, k, v;
-    xt::xarray<float> o;    // attention output fed to backward (independent of the forward, see make_lanes)
+    xt::xarray<float> o;    // attention output fed to backward (independent of the forward, see make_chunks)
     xt::xarray<float> d_o;  // upstream gradient
     ForwardReference fw;
     Gradients bw;
 };
 
-// Two lanes with independent random data. For backward each lane gets an independent random
+// Two chunks with independent random data. For backward each chunk gets an independent random
 // attention output O, so u = rowsum(dO * O) is O(1) and dominates dS: a device that read the
-// other lane's O (or a stale u_scaler) produces gradients far outside the tolerance, which the
-// test asserts explicitly via the cross-lane reference.
-std::array<Lane, 2> make_lanes(uint32_t seed) {
-    std::array<Lane, 2> lanes;
+// other chunk's O (or a stale u_scaler) produces gradients far outside the tolerance, which the
+// test asserts explicitly via the cross-chunk reference.
+std::array<Chunk, 2> make_chunks(uint32_t seed) {
+    std::array<Chunk, 2> chunks;
     for (uint32_t i = 0; i < 2; ++i) {
-        auto& lane = lanes[i];
+        auto& chunk = chunks[i];
         const uint32_t s = seed + 100U * i;
-        lane.q = uniform({kB, kH, kC, kD}, kQScale, s);
-        lane.k = uniform({kB, kG, kC, kD}, 1.0F, s + 1);
-        lane.v = uniform({kB, kG, kC, kD}, 1.0F, s + 2);
-        lane.o = uniform({kB, kH, kC, kD}, 1.0F, s + 3);
-        lane.d_o = uniform({kB, kH, kC, kD}, 1.0F, s + 4);
-        lane.fw = reference_forward(lane.q, lane.k, lane.v);
-        lane.bw = reference_backward(lane.q, lane.k, lane.v, lane.o, lane.fw.probabilities, lane.d_o);
+        chunk.q = uniform({kB, kH, kC, kD}, kQScale, s);
+        chunk.k = uniform({kB, kG, kC, kD}, 1.0F, s + 1);
+        chunk.v = uniform({kB, kG, kC, kD}, 1.0F, s + 2);
+        chunk.o = uniform({kB, kH, kC, kD}, 1.0F, s + 3);
+        chunk.d_o = uniform({kB, kH, kC, kD}, 1.0F, s + 4);
+        chunk.fw = reference_forward(chunk.q, chunk.k, chunk.v);
+        chunk.bw = reference_backward(chunk.q, chunk.k, chunk.v, chunk.o, chunk.fw.probabilities, chunk.d_o);
     }
-    return lanes;
+    return chunks;
 }
 
 // LSE in the (B, H, S, 32) FP32 intermediates layout the SDPA kernels use (column 0).
@@ -267,8 +267,13 @@ ttnn::Tensor to_device_fp32(const xt::xarray<float>& x) {
         x, &ttml::autograd::ctx().get_device(), ttnn::Layout::TILE);
 }
 
-ttnn::Tensor filled(const ttnn::Shape& shape, float value, ttnn::DataType dtype) {
-    return ttnn::full(shape, value, dtype, ttnn::Layout::TILE, std::ref(ttml::autograd::ctx().get_device()));
+ttnn::Tensor filled(
+    const ttnn::Shape& shape,
+    float value,
+    ttnn::DataType dtype,
+    const ttnn::MemoryConfig& memory_config = ttnn::DRAM_MEMORY_CONFIG) {
+    return ttnn::full(
+        shape, value, dtype, ttnn::Layout::TILE, std::ref(ttml::autograd::ctx().get_device()), memory_config);
 }
 
 std::vector<xt::xarray<float>> per_device(const ttnn::Tensor& tensor) {
@@ -301,13 +306,13 @@ RingSetup ring_setup() {
     return RingSetup{mesh_shape, ring_axis, mesh_shape[ring_axis], static_cast<uint32_t>(mesh_shape.mesh_size())};
 }
 
-// Lane the schedule assigns to a device; every device runs a lane at steps 1..N-1.
-uint32_t active_lane(uint32_t ring_id, uint32_t step, const RingSetup& ring, RingShiftDirection direction) {
+// Chunk the schedule assigns to a device; every device runs a chunk at steps 1..N-1.
+uint32_t active_chunk(uint32_t ring_id, uint32_t step, const RingSetup& ring, RingShiftDirection direction) {
     const auto work = get_ring_step_work(
-        ring_id, step, ring.ring_size, AttentionMaskType::Causal, direction, RingLaneSelection::ZigZag);
+        ring_id, step, ring.ring_size, AttentionMaskType::Causal, direction, RingChunkSelection::ZigZag);
     EXPECT_TRUE(work.execute);
     EXPECT_EQ(work.mask_type, AttentionMaskType::None);
-    return work.lane;
+    return work.chunk;
 }
 
 // Runs `launch` for every (direction, step) twice: a program-cache miss, then a hit with fresh data at
@@ -341,91 +346,118 @@ void for_each_direction_step_and_pass(const RingSetup& ring, Launch&& launch) {
     }
 }
 
-}  // namespace
-
-TEST_F(RingSDPALaneTest, ZigZagForwardBindsAssignedLanePerDevice) {
-    const auto ring = ring_setup();
+// One zig-zag forward call at (direction, step) with sentinel-filled outputs of both chunks in
+// `output_memory`, checked on every device: the assigned chunk matches its reference, the idle
+// chunk's outputs are untouched.
+void run_zigzag_forward_and_check(
+    const RingSetup& ring,
+    RingShiftDirection direction,
+    uint32_t step,
+    uint32_t seed,
+    std::vector<ttnn::Tensor>& keep_alive,
+    const ttnn::MemoryConfig& output_memory = ttnn::DRAM_MEMORY_CONFIG) {
     const ttnn::Shape out_shape{kB, kH, kC, kD};
     const ttnn::Shape inter_shape{kB, kH, kC, 32};
+    const auto chunks = make_chunks(seed);
+    std::array<ttnn::Tensor, 2> q, k, v, out, inter;
+    for (uint32_t chunk = 0; chunk < 2; ++chunk) {
+        q[chunk] = to_device_bf16(chunks[chunk].q);
+        k[chunk] = to_device_bf16(chunks[chunk].k);
+        v[chunk] = to_device_bf16(chunks[chunk].v);
+        out[chunk] = filled(out_shape, kSentinel, ttnn::DataType::BFLOAT16, output_memory);
+        inter[chunk] = filled(inter_shape, kNegInf, ttnn::DataType::FLOAT32, output_memory);
+        keep_alive.insert(keep_alive.end(), {q[chunk], k[chunk], v[chunk], out[chunk], inter[chunk]});
+    }
 
+    ttml::metal::ring_sdpa_fw(
+        q[0],
+        k[0],
+        v[0],
+        ring.ring_size,
+        ring.ring_axis,
+        step,
+        AttentionMaskType::Causal,
+        direction,
+        out[0],
+        inter[0],
+        RingChunkSelection::ZigZag,
+        ttml::metal::ops::ring_sdpa_fw::RingSDPAFwChunk{
+            .query = q[1], .key = k[1], .value = v[1], .output = out[1], .intermediates = inter[1]});
+
+    const std::array<std::vector<xt::xarray<float>>, 2> out_host{per_device(out[0]), per_device(out[1])};
+    const std::array<std::vector<xt::xarray<float>>, 2> inter_host{per_device(inter[0]), per_device(inter[1])};
+
+    for (uint32_t dev = 0; dev < ring.num_devices; ++dev) {
+        const uint32_t ring_id = ring_id_of(dev, ring.mesh_shape, ring.ring_axis);
+        const uint32_t active = active_chunk(ring_id, step, ring, direction);
+        const uint32_t idle = 1U - active;
+        SCOPED_TRACE(fmt::format("device {} (ring id {}) active chunk {}", dev, ring_id, active));
+
+        EXPECT_LT(rel_l2(out_host[active][dev], chunks[active].fw.output), kForwardRelTol);
+        EXPECT_LT(rel_l2(lse_column(inter_host[active][dev]), chunks[active].fw.lse), kForwardRelTol);
+        // The other chunk's reference must be far off, so a swapped binding cannot pass.
+        EXPECT_GT(rel_l2(out_host[active][dev], chunks[idle].fw.output), 10 * kForwardRelTol);
+
+        EXPECT_TRUE(all_equal(out_host[idle][dev], kSentinel)) << "wrote into the idle chunk's output";
+        EXPECT_TRUE(all_equal(lse_column(inter_host[idle][dev]), kNegInf))
+            << "wrote into the idle chunk's intermediates";
+    }
+}
+
+}  // namespace
+
+TEST_F(RingSDPAChunkTest, ZigZagForwardBindsAssignedChunkPerDevice) {
+    const auto ring = ring_setup();
     for_each_direction_step_and_pass(
         ring, [&](RingShiftDirection direction, uint32_t step, uint32_t seed, std::vector<ttnn::Tensor>& keep_alive) {
-            const auto lanes = make_lanes(seed);
-            std::array<ttnn::Tensor, 2> q, k, v, out, inter;
-            for (uint32_t lane = 0; lane < 2; ++lane) {
-                q[lane] = to_device_bf16(lanes[lane].q);
-                k[lane] = to_device_bf16(lanes[lane].k);
-                v[lane] = to_device_bf16(lanes[lane].v);
-                out[lane] = filled(out_shape, kSentinel, ttnn::DataType::BFLOAT16);
-                inter[lane] = filled(inter_shape, kNegInf, ttnn::DataType::FLOAT32);
-                keep_alive.insert(keep_alive.end(), {q[lane], k[lane], v[lane], out[lane], inter[lane]});
-            }
-
-            ttml::metal::ring_sdpa_fw(
-                q[0],
-                k[0],
-                v[0],
-                ring.ring_size,
-                ring.ring_axis,
-                step,
-                AttentionMaskType::Causal,
-                direction,
-                out[0],
-                inter[0],
-                RingLaneSelection::ZigZag,
-                ttml::metal::ops::ring_sdpa_fw::RingSDPAFwLane{
-                    .query = q[1], .key = k[1], .value = v[1], .output = out[1], .intermediates = inter[1]});
-
-            const std::array<std::vector<xt::xarray<float>>, 2> out_host{per_device(out[0]), per_device(out[1])};
-            const std::array<std::vector<xt::xarray<float>>, 2> inter_host{per_device(inter[0]), per_device(inter[1])};
-
-            for (uint32_t dev = 0; dev < ring.num_devices; ++dev) {
-                const uint32_t ring_id = ring_id_of(dev, ring.mesh_shape, ring.ring_axis);
-                const uint32_t active = active_lane(ring_id, step, ring, direction);
-                const uint32_t idle = 1U - active;
-                SCOPED_TRACE(fmt::format("device {} (ring id {}) active lane {}", dev, ring_id, active));
-
-                EXPECT_LT(rel_l2(out_host[active][dev], lanes[active].fw.output), kForwardRelTol);
-                EXPECT_LT(rel_l2(lse_column(inter_host[active][dev]), lanes[active].fw.lse), kForwardRelTol);
-                // The other lane's reference must be far off, so a swapped binding cannot pass.
-                EXPECT_GT(rel_l2(out_host[active][dev], lanes[idle].fw.output), 10 * kForwardRelTol);
-
-                EXPECT_TRUE(all_equal(out_host[idle][dev], kSentinel)) << "wrote into the idle lane's output";
-                EXPECT_TRUE(all_equal(lse_column(inter_host[idle][dev]), kNegInf))
-                    << "wrote into the idle lane's intermediates";
-            }
+            run_zigzag_forward_and_check(ring, direction, step, seed, keep_alive);
         });
 }
 
-TEST_F(RingSDPALaneTest, ZigZagBackwardBindsAssignedLanePerDevice) {
+// The SDPA writer kernel is compiled for its output buffers' type (DRAM or L1), so the outputs'
+// memory config must be part of the program-cache key: the same step with L1 outputs must build
+// new programs instead of reusing the DRAM-output ones, and still write the right chunk.
+TEST_F(RingSDPAChunkTest, ZigZagForwardOutputMemoryConfigIsPartOfProgramCacheKey) {
+    const auto ring = ring_setup();
+    auto& device = ttml::autograd::ctx().get_device();
+    std::vector<ttnn::Tensor> keep_alive;
+
+    run_zigzag_forward_and_check(ring, RingShiftDirection::Backward, /*step=*/1U, /*seed=*/11U, keep_alive);
+    const auto entries_after_dram = device.num_program_cache_entries();
+    run_zigzag_forward_and_check(
+        ring, RingShiftDirection::Backward, /*step=*/1U, /*seed=*/12U, keep_alive, ttnn::L1_MEMORY_CONFIG);
+    EXPECT_GT(device.num_program_cache_entries(), entries_after_dram)
+        << "L1 outputs must not reuse the programs built for DRAM outputs";
+}
+
+TEST_F(RingSDPAChunkTest, ZigZagBackwardBindsAssignedChunkPerDevice) {
     const auto ring = ring_setup();
 
     for_each_direction_step_and_pass(
         ring, [&](RingShiftDirection direction, uint32_t step, uint32_t seed, std::vector<ttnn::Tensor>& keep_alive) {
-            const auto lanes = make_lanes(seed);
-            // Sanity check of the test's sensitivity: gradients computed with the other lane's O
+            const auto chunks = make_chunks(seed);
+            // Sanity check of the test's sensitivity: gradients computed with the other chunk's O
             // (i.e. a wrong u = rowsum(dO * O)) must be far outside the tolerance.
-            for (uint32_t lane = 0; lane < 2; ++lane) {
-                const auto& l = lanes[lane];
-                const auto wrong_u = reference_backward(l.q, l.k, l.v, lanes[1U - lane].o, l.fw.probabilities, l.d_o);
+            for (uint32_t chunk = 0; chunk < 2; ++chunk) {
+                const auto& l = chunks[chunk];
+                const auto wrong_u = reference_backward(l.q, l.k, l.v, chunks[1U - chunk].o, l.fw.probabilities, l.d_o);
                 ASSERT_GT(rel_l2(wrong_u.dq, l.bw.dq), 4 * kBackwardRelTol);
                 ASSERT_GT(rel_l2(wrong_u.dk, l.bw.dk), 4 * kBackwardRelTol);
             }
 
             std::array<ttnn::Tensor, 2> q, k, v, o, d_o, inter, dq, dk, dv;
-            for (uint32_t lane = 0; lane < 2; ++lane) {
-                q[lane] = to_device_bf16(lanes[lane].q);
-                k[lane] = to_device_bf16(lanes[lane].k);
-                v[lane] = to_device_bf16(lanes[lane].v);
-                o[lane] = to_device_bf16(lanes[lane].o);
-                d_o[lane] = to_device_bf16(lanes[lane].d_o);
-                inter[lane] = to_device_fp32(lse_to_intermediates(lanes[lane].fw.lse));
-                dq[lane] = filled(q[lane].logical_shape(), kSentinel, ttnn::DataType::BFLOAT16);
-                dk[lane] = filled(k[lane].logical_shape(), kSentinel, ttnn::DataType::BFLOAT16);
-                dv[lane] = filled(v[lane].logical_shape(), kSentinel, ttnn::DataType::BFLOAT16);
-                keep_alive.insert(
-                    keep_alive.end(),
-                    {q[lane], k[lane], v[lane], o[lane], d_o[lane], inter[lane], dq[lane], dk[lane], dv[lane]});
+            for (uint32_t chunk = 0; chunk < 2; ++chunk) {
+                q[chunk] = to_device_bf16(chunks[chunk].q);
+                k[chunk] = to_device_bf16(chunks[chunk].k);
+                v[chunk] = to_device_bf16(chunks[chunk].v);
+                o[chunk] = to_device_bf16(chunks[chunk].o);
+                d_o[chunk] = to_device_bf16(chunks[chunk].d_o);
+                inter[chunk] = to_device_fp32(lse_to_intermediates(chunks[chunk].fw.lse));
+                dq[chunk] = filled(q[chunk].logical_shape(), kSentinel, ttnn::DataType::BFLOAT16);
+                dk[chunk] = filled(k[chunk].logical_shape(), kSentinel, ttnn::DataType::BFLOAT16);
+                dv[chunk] = filled(v[chunk].logical_shape(), kSentinel, ttnn::DataType::BFLOAT16);
+                keep_alive.insert(keep_alive.end(), {q[chunk], k[chunk], v[chunk], o[chunk], d_o[chunk]});
+                keep_alive.insert(keep_alive.end(), {inter[chunk], dq[chunk], dk[chunk], dv[chunk]});
             }
 
             ttml::metal::ring_sdpa_bw(
@@ -443,8 +475,8 @@ TEST_F(RingSDPALaneTest, ZigZagBackwardBindsAssignedLanePerDevice) {
                 dq[0],
                 dk[0],
                 dv[0],
-                RingLaneSelection::ZigZag,
-                ttml::metal::RingSDPABwLane{
+                RingChunkSelection::ZigZag,
+                ttml::metal::RingSDPABwChunk{
                     .grad_output = d_o[1],
                     .attn_output = o[1],
                     .query = q[1],
@@ -461,41 +493,41 @@ TEST_F(RingSDPALaneTest, ZigZagBackwardBindsAssignedLanePerDevice) {
 
             for (uint32_t dev = 0; dev < ring.num_devices; ++dev) {
                 const uint32_t ring_id = ring_id_of(dev, ring.mesh_shape, ring.ring_axis);
-                const uint32_t active = active_lane(ring_id, step, ring, direction);
+                const uint32_t active = active_chunk(ring_id, step, ring, direction);
                 const uint32_t idle = 1U - active;
-                SCOPED_TRACE(fmt::format("device {} (ring id {}) active lane {}", dev, ring_id, active));
-                const auto& ref = lanes[active].bw;
+                SCOPED_TRACE(fmt::format("device {} (ring id {}) active chunk {}", dev, ring_id, active));
+                const auto& ref = chunks[active].bw;
 
                 EXPECT_LT(rel_l2(dq_host[active][dev], ref.dq), kBackwardRelTol);
                 EXPECT_LT(rel_l2(dk_host[active][dev], ref.dk), kBackwardRelTol);
                 EXPECT_LT(rel_l2(dv_host[active][dev], ref.dv), kBackwardRelTol);
 
-                EXPECT_TRUE(all_equal(dq_host[idle][dev], kSentinel)) << "wrote into the idle lane's dQ";
-                EXPECT_TRUE(all_equal(dk_host[idle][dev], kSentinel)) << "wrote into the idle lane's dK";
-                EXPECT_TRUE(all_equal(dv_host[idle][dev], kSentinel)) << "wrote into the idle lane's dV";
+                EXPECT_TRUE(all_equal(dq_host[idle][dev], kSentinel)) << "wrote into the idle chunk's dQ";
+                EXPECT_TRUE(all_equal(dk_host[idle][dev], kSentinel)) << "wrote into the idle chunk's dK";
+                EXPECT_TRUE(all_equal(dv_host[idle][dev], kSentinel)) << "wrote into the idle chunk's dV";
             }
         });
 }
 
-// Lane selection is validated before any program is built, with a specific reason.
-TEST_F(RingSDPALaneTest, ZigZagValidationRejectsInconsistentLaneArguments) {
+// Chunk selection is validated before any program is built, with a specific reason.
+TEST_F(RingSDPAChunkTest, ZigZagValidationRejectsInconsistentChunkArguments) {
     const auto ring = ring_setup();
-    const auto lanes = make_lanes(4242U);
-    const auto q = to_device_bf16(lanes[0].q);
-    const auto k = to_device_bf16(lanes[0].k);
-    const auto v = to_device_bf16(lanes[0].v);
-    const auto o = to_device_bf16(lanes[0].o);
-    const auto d_o = to_device_bf16(lanes[0].d_o);
-    const auto inter = to_device_fp32(lse_to_intermediates(lanes[0].fw.lse));
+    const auto chunks = make_chunks(4242U);
+    const auto q = to_device_bf16(chunks[0].q);
+    const auto k = to_device_bf16(chunks[0].k);
+    const auto v = to_device_bf16(chunks[0].v);
+    const auto o = to_device_bf16(chunks[0].o);
+    const auto d_o = to_device_bf16(chunks[0].d_o);
+    const auto inter = to_device_fp32(lse_to_intermediates(chunks[0].fw.lse));
     const ttnn::Shape out_shape{kB, kH, kC, kD};
     const ttnn::Shape inter_shape{kB, kH, kC, 32};
-    const ttml::metal::ops::ring_sdpa_fw::RingSDPAFwLane fw_lane{
+    const ttml::metal::ops::ring_sdpa_fw::RingSDPAFwChunk fw_chunk{
         .query = q,
         .key = k,
         .value = v,
         .output = filled(out_shape, 0.0F, ttnn::DataType::BFLOAT16),
         .intermediates = filled(inter_shape, 0.0F, ttnn::DataType::FLOAT32)};
-    const ttml::metal::RingSDPABwLane bw_lane{
+    const ttml::metal::RingSDPABwChunk bw_chunk{
         .grad_output = d_o,
         .attn_output = o,
         .query = q,
@@ -506,22 +538,36 @@ TEST_F(RingSDPALaneTest, ZigZagValidationRejectsInconsistentLaneArguments) {
         .grad_key = filled(k.logical_shape(), 0.0F, ttnn::DataType::BFLOAT16),
         .grad_value = filled(v.logical_shape(), 0.0F, ttnn::DataType::BFLOAT16)};
 
-    // Second lane with a different sequence length.
-    const auto short_lanes = [] {
+    // Second chunk with a different sequence length.
+    const auto short_chunks = [] {
         auto q_short = uniform({kB, kH, kC / 2, kD}, kQScale, 7U);
         auto kv_short = uniform({kB, kG, kC / 2, kD}, 1.0F, 8U);
         return std::pair{to_device_bf16(q_short), to_device_bf16(kv_short)};
     }();
-    const ttml::metal::ops::ring_sdpa_fw::RingSDPAFwLane fw_short_lane{
-        .query = short_lanes.first,
-        .key = short_lanes.second,
-        .value = short_lanes.second,
-        .output = filled(short_lanes.first.logical_shape(), 0.0F, ttnn::DataType::BFLOAT16),
+    const ttml::metal::ops::ring_sdpa_fw::RingSDPAFwChunk fw_short_chunk{
+        .query = short_chunks.first,
+        .key = short_chunks.second,
+        .value = short_chunks.second,
+        .output = filled(short_chunks.first.logical_shape(), 0.0F, ttnn::DataType::BFLOAT16),
         .intermediates = filled(ttnn::Shape{kB, kH, kC / 2, 32}, 0.0F, ttnn::DataType::FLOAT32)};
 
-    using FwLaneOpt = std::optional<ttml::metal::ops::ring_sdpa_fw::RingSDPAFwLane>;
-    auto fw = [&](uint32_t step, RingLaneSelection selection, const FwLaneOpt& lane1) {
-        return [&, step, selection, lane1] {
+    // Chunk-0 outputs, required under zig-zag (devices that compute chunk 1 never write them).
+    const auto out0 = filled(out_shape, 0.0F, ttnn::DataType::BFLOAT16);
+    const auto inter0 = filled(inter_shape, 0.0F, ttnn::DataType::FLOAT32);
+    const auto dq0 = filled(q.logical_shape(), 0.0F, ttnn::DataType::BFLOAT16);
+    const auto dk0 = filled(k.logical_shape(), 0.0F, ttnn::DataType::BFLOAT16);
+    const auto dv0 = filled(v.logical_shape(), 0.0F, ttnn::DataType::BFLOAT16);
+
+    // Second chunk whose output lives in L1 while chunk 0's is in DRAM.
+    auto fw_l1_output_chunk = fw_chunk;
+    fw_l1_output_chunk.output = filled(out_shape, 0.0F, ttnn::DataType::BFLOAT16, ttnn::L1_MEMORY_CONFIG);
+    auto bw_l1_attn_output_chunk = bw_chunk;
+    bw_l1_attn_output_chunk.attn_output = ttnn::to_memory_config(o, ttnn::L1_MEMORY_CONFIG);
+
+    using FwChunkOpt = std::optional<ttml::metal::ops::ring_sdpa_fw::RingSDPAFwChunk>;
+    using BwChunkOpt = std::optional<ttml::metal::RingSDPABwChunk>;
+    auto fw = [&](uint32_t step, RingChunkSelection selection, const FwChunkOpt& chunk1, bool give_chunk0 = true) {
+        return [&, step, selection, chunk1, give_chunk0] {
             ttml::metal::ring_sdpa_fw(
                 q,
                 k,
@@ -531,14 +577,14 @@ TEST_F(RingSDPALaneTest, ZigZagValidationRejectsInconsistentLaneArguments) {
                 step,
                 AttentionMaskType::Causal,
                 RingShiftDirection::Backward,
-                std::nullopt,
-                std::nullopt,
+                give_chunk0 ? std::optional{out0} : std::nullopt,
+                give_chunk0 ? std::optional{inter0} : std::nullopt,
                 selection,
-                lane1);
+                chunk1);
         };
     };
-    auto bw = [&](uint32_t step, RingLaneSelection selection, const std::optional<ttml::metal::RingSDPABwLane>& lane1) {
-        return [&, step, selection, lane1] {
+    auto bw = [&](uint32_t step, RingChunkSelection selection, const BwChunkOpt& chunk1, bool give_chunk0 = true) {
+        return [&, step, selection, chunk1, give_chunk0] {
             ttml::metal::ring_sdpa_bw(
                 d_o,
                 o,
@@ -551,34 +597,46 @@ TEST_F(RingSDPALaneTest, ZigZagValidationRejectsInconsistentLaneArguments) {
                 step,
                 AttentionMaskType::Causal,
                 RingShiftDirection::Backward,
-                std::nullopt,
-                std::nullopt,
-                std::nullopt,
+                give_chunk0 ? std::optional{dq0} : std::nullopt,
+                give_chunk0 ? std::optional{dk0} : std::nullopt,
+                give_chunk0 ? std::optional{dv0} : std::nullopt,
                 selection,
-                lane1);
+                chunk1);
         };
     };
 
     EXPECT_THAT(
-        fw(1U, RingLaneSelection::ZigZag, FwLaneOpt{}),
-        ThrowsMessage<std::runtime_error>(HasSubstr("requires the second-lane tensors")));
+        fw(1U, RingChunkSelection::ZigZag, FwChunkOpt{}),
+        ThrowsMessage<std::runtime_error>(HasSubstr("requires the second-chunk tensors")));
     EXPECT_THAT(
-        fw(0U, RingLaneSelection::ZigZag, FwLaneOpt{fw_lane}),
+        fw(0U, RingChunkSelection::ZigZag, FwChunkOpt{fw_chunk}),
         ThrowsMessage<std::runtime_error>(HasSubstr("not defined for step 0")));
     EXPECT_THAT(
-        fw(1U, RingLaneSelection::None, FwLaneOpt{fw_lane}),
-        ThrowsMessage<std::runtime_error>(HasSubstr("lane selection is None")));
+        fw(1U, RingChunkSelection::None, FwChunkOpt{fw_chunk}),
+        ThrowsMessage<std::runtime_error>(HasSubstr("chunk selection is None")));
     EXPECT_THAT(
-        fw(1U, RingLaneSelection::ZigZag, FwLaneOpt{fw_short_lane}),
-        ThrowsMessage<std::runtime_error>(HasSubstr("Second-lane tensor 'query'")));
+        fw(1U, RingChunkSelection::ZigZag, FwChunkOpt{fw_chunk}, /*give_chunk0=*/false),
+        ThrowsMessage<std::runtime_error>(HasSubstr("requires a preallocated chunk-0 'output'")));
+    EXPECT_THAT(
+        fw(1U, RingChunkSelection::ZigZag, FwChunkOpt{fw_short_chunk}),
+        ThrowsMessage<std::runtime_error>(HasSubstr("Second-chunk tensor 'query'")));
+    EXPECT_THAT(
+        fw(1U, RingChunkSelection::ZigZag, FwChunkOpt{fw_l1_output_chunk}),
+        ThrowsMessage<std::runtime_error>(HasSubstr("Second-chunk tensor 'output'")));
 
     EXPECT_THAT(
-        bw(1U, RingLaneSelection::ZigZag, std::nullopt),
-        ThrowsMessage<std::runtime_error>(HasSubstr("requires the second-lane tensors")));
+        bw(1U, RingChunkSelection::ZigZag, BwChunkOpt{}),
+        ThrowsMessage<std::runtime_error>(HasSubstr("requires the second-chunk tensors")));
     EXPECT_THAT(
-        bw(0U, RingLaneSelection::ZigZag, bw_lane),
+        bw(0U, RingChunkSelection::ZigZag, BwChunkOpt{bw_chunk}),
         ThrowsMessage<std::runtime_error>(HasSubstr("not defined for step 0")));
     EXPECT_THAT(
-        bw(1U, RingLaneSelection::None, bw_lane),
-        ThrowsMessage<std::runtime_error>(HasSubstr("lane selection is None")));
+        bw(1U, RingChunkSelection::None, BwChunkOpt{bw_chunk}),
+        ThrowsMessage<std::runtime_error>(HasSubstr("chunk selection is None")));
+    EXPECT_THAT(
+        bw(1U, RingChunkSelection::ZigZag, BwChunkOpt{bw_chunk}, /*give_chunk0=*/false),
+        ThrowsMessage<std::runtime_error>(HasSubstr("requires a preallocated chunk-0 'grad query'")));
+    EXPECT_THAT(
+        bw(1U, RingChunkSelection::ZigZag, BwChunkOpt{bw_l1_attn_output_chunk}),
+        ThrowsMessage<std::runtime_error>(HasSubstr("Second-chunk tensor 'attention output'")));
 }

@@ -10,9 +10,11 @@
 
 namespace ttml::metal {
 
-// Returns [output, intermediates] of lane 0. With RingLaneSelection::ZigZag the devices
-// assigned lane 1 at this step write into lane1->output / lane1->intermediates instead
-// (see RingLaneSelection in metal/ops/common/ring_sdpa_utils.hpp).
+// Returns [output, intermediates] of chunk 0. With RingChunkSelection::ZigZag the devices
+// assigned chunk 1 at this step write into chunk1->output / chunk1->intermediates instead
+// and leave chunk 0's untouched, so preallocated_output and preallocated_intermediates are
+// required and every chunk-1 tensor must have its chunk-0 counterpart's spec
+// (see RingChunkSelection in metal/ops/common/ring_sdpa_utils.hpp).
 std::tuple<ttnn::Tensor, ttnn::Tensor> ring_sdpa_fw(
     const ttnn::Tensor& query,
     const ttnn::Tensor& key,
@@ -24,7 +26,7 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> ring_sdpa_fw(
     ops::ring_sdpa_fw::RingDirection ring_direction = ops::ring_sdpa_fw::RingDirection::Backward,
     const std::optional<ttnn::Tensor>& preallocated_output = std::nullopt,
     const std::optional<ttnn::Tensor>& preallocated_intermediates = std::nullopt,
-    ops::RingLaneSelection lane_selection = ops::RingLaneSelection::None,
-    const std::optional<ops::ring_sdpa_fw::RingSDPAFwLane>& lane1 = std::nullopt);
+    ops::RingChunkSelection chunk_selection = ops::RingChunkSelection::None,
+    const std::optional<ops::ring_sdpa_fw::RingSDPAFwChunk>& chunk1 = std::nullopt);
 
 }  // namespace ttml::metal

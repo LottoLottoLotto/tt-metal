@@ -19,8 +19,8 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> ring_sdpa_fw(
     ops::ring_sdpa_fw::RingDirection ring_direction,
     const std::optional<ttnn::Tensor>& preallocated_output,
     const std::optional<ttnn::Tensor>& preallocated_intermediates,
-    ops::RingLaneSelection lane_selection,
-    const std::optional<ops::ring_sdpa_fw::RingSDPAFwLane>& lane1) {
+    ops::RingChunkSelection chunk_selection,
+    const std::optional<ops::ring_sdpa_fw::RingSDPAFwChunk>& chunk1) {
     return ttnn::prim::ttml_ring_sdpa_fw(
         query,
         key,
@@ -32,8 +32,8 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> ring_sdpa_fw(
         ring_direction,
         preallocated_output,
         preallocated_intermediates,
-        lane_selection,
-        lane1);
+        chunk_selection,
+        chunk1);
 }
 
 }  // namespace ttml::metal

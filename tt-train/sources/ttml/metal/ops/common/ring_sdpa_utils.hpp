@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string_view>
 #include <tt-metalium/constants.hpp>
 #include <tt_stl/assert.hpp>
@@ -18,15 +19,16 @@ namespace ttml::metal::ops {
 
 // How the ring ops pick the tensors each device computes on at a ring step.
 // - None:   every executing device uses the single set of Q/K/V/output tensors.
-// - ZigZag: load-balanced causal layout. Device d holds sequence chunks [d | 2N-1-d] of a
-//           sequence cut into 2N chunks, so its local Q/K/V split into a first half
-//           ("lane 0", chunk d / chunk src) and a second half ("lane 1", chunk 2N-1-d /
-//           chunk 2N-1-src). The ring op computes the one same-half block that is visible
-//           at this step: (Q0, K0, V0) when src < d, (Q1, K1, V1) when src > d, both
-//           unmasked. The cross block (Q1, K0) is always fully visible and is computed by a
-//           separate mask-None call; (Q0, K1) is never visible; the src == d step is a plain
-//           causal call over the full local sequence (local order is monotone).
-enum class RingLaneSelection : uint8_t { None = 0, ZigZag = 1 };
+// - ZigZag: load-balanced causal layout. The sequence is cut into 2N global chunks and
+//           device d holds global chunks [d | 2N-1-d], so its local Q/K/V are two chunks:
+//           local chunk 0 (global chunk d for Q, global chunk src for the K/V it holds) and
+//           local chunk 1 (global chunk 2N-1-d for Q, 2N-1-src for K/V). The ring op computes
+//           the one same-chunk block that is visible at this step: (Q0, K0, V0) when src < d,
+//           (Q1, K1, V1) when src > d, both unmasked. The cross block (Q1, K0) is always
+//           fully visible and is computed by a separate mask-None call; (Q0, K1) is never
+//           visible; the src == d step is a plain causal call over the full local sequence
+//           (local order is monotone).
+enum class RingChunkSelection : uint8_t { None = 0, ZigZag = 1 };
 
 // Source device of the K/V a device holds at a ring step:
 // - Backward ring direction: src = (d + s) mod ring_size
@@ -77,44 +79,44 @@ inline std::pair<bool, AttentionMaskType> get_device_execution_info(
     }
 }
 
-// Work of one device at one ring step: whether it runs, with which mask, on which lane.
+// Work of one device at one ring step: whether it runs, with which mask, on which chunk.
 struct RingStepWork {
     bool execute = false;
     AttentionMaskType mask_type = AttentionMaskType::None;
-    uint32_t lane = 0;  // 0: primary tensors, 1: the op's second-lane tensors
+    uint32_t chunk = 0;  // 0: primary tensors, 1: the op's second-chunk tensors
 
     bool operator==(const RingStepWork&) const = default;
 };
 
-// Schedule used by the ring program factories. RingLaneSelection::None is exactly
-// get_device_execution_info on lane 0. RingLaneSelection::ZigZag (causal only) returns
-// the unmasked same-half block described at RingLaneSelection: lane 0 when src < d,
-// lane 1 when src > d, and no work when src == d.
+// Schedule used by the ring program factories. RingChunkSelection::None is exactly
+// get_device_execution_info on chunk 0. RingChunkSelection::ZigZag (causal only) returns
+// the unmasked same-chunk block described at RingChunkSelection: chunk 0 when src < d,
+// chunk 1 when src > d, and no work when src == d.
 inline RingStepWork get_ring_step_work(
     uint32_t device_ring_id,
     uint32_t step,
     uint32_t ring_size,
     AttentionMaskType mask_type,
     ttnn_fixed::distributed::RingShiftDirection ring_direction,
-    RingLaneSelection lane_selection) {
-    if (lane_selection == RingLaneSelection::None) {
+    RingChunkSelection chunk_selection) {
+    if (chunk_selection == RingChunkSelection::None) {
         const auto [execute, effective_mask] =
             get_device_execution_info(device_ring_id, step, ring_size, mask_type, ring_direction);
-        return {.execute = execute, .mask_type = effective_mask, .lane = 0U};
+        return {.execute = execute, .mask_type = effective_mask, .chunk = 0U};
     }
 
     TT_FATAL(
         mask_type == AttentionMaskType::Causal,
-        "Zig-zag lane selection is only defined for causal attention, got mask type {}",
+        "Zig-zag chunk selection is only defined for causal attention, got mask type {}",
         static_cast<int>(mask_type));
     const uint32_t src_device = get_ring_source_device(device_ring_id, step, ring_size, ring_direction);
     if (src_device == device_ring_id) {
-        return {.execute = false, .mask_type = AttentionMaskType::None, .lane = 0U};
+        return {.execute = false, .mask_type = AttentionMaskType::None, .chunk = 0U};
     }
     return {
         .execute = true,
         .mask_type = AttentionMaskType::None,
-        .lane = src_device < device_ring_id ? 0U : 1U,
+        .chunk = src_device < device_ring_id ? 0U : 1U,
     };
 }
 
@@ -146,43 +148,53 @@ inline void validate_ring_attributes(const RingAttrs& attrs, const ttnn::Tensor&
         attrs.ring_axis);
 }
 
-// Lane-selection contract shared by the ring ops: the second lane is supplied exactly
-// when zig-zag lane selection is requested, and zig-zag is only defined for causal
+// Chunk-selection contract shared by the ring ops: the second chunk is supplied exactly
+// when zig-zag chunk selection is requested, and zig-zag is only defined for causal
 // steps other than the diagonal step (step 0), which the caller runs as one full causal
 // call over the whole local sequence.
 template <typename RingAttrs>
-inline void validate_ring_lane_selection(const RingAttrs& attrs, bool has_second_lane) {
-    if (attrs.lane_selection == RingLaneSelection::None) {
-        TT_FATAL(!has_second_lane, "Second-lane tensors were given but lane selection is None");
+inline void validate_ring_chunk_selection(const RingAttrs& attrs, bool has_second_chunk) {
+    if (attrs.chunk_selection == RingChunkSelection::None) {
+        TT_FATAL(!has_second_chunk, "Second-chunk tensors were given but chunk selection is None");
         return;
     }
-    TT_FATAL(has_second_lane, "Zig-zag lane selection requires the second-lane tensors");
+    TT_FATAL(has_second_chunk, "Zig-zag chunk selection requires the second-chunk tensors");
     TT_FATAL(
         attrs.mask_type == AttentionMaskType::Causal,
-        "Zig-zag lane selection requires a causal mask, got mask type {}",
+        "Zig-zag chunk selection requires a causal mask, got mask type {}",
         static_cast<int>(attrs.mask_type));
     TT_FATAL(
         attrs.step != 0U,
-        "Zig-zag lane selection is not defined for step 0 (every device holds its own K/V); run step 0 as one "
+        "Zig-zag chunk selection is not defined for step 0 (every device holds its own K/V); run step 0 as one "
         "causal call over the full local sequence");
 }
 
-// Second-lane tensors must have exactly the spec (shape, dtype, layout, memory config) of
-// their first-lane counterparts: the per-device program is built from whichever lane the
-// device uses, while the ring forward's program hash is computed from lane 0 only.
-inline void validate_same_spec(const ttnn::Tensor& lane1, const ttnn::Tensor& lane0, std::string_view name) {
+// With zig-zag chunk selection the devices that compute chunk 1 at a step never write the
+// chunk-0 outputs, so a chunk-0 output the op allocated itself would hold uninitialized memory
+// on those devices. The caller must supply (and pre-fill) every chunk-0 output, exactly as it
+// supplies the chunk-1 outputs.
+template <typename RingAttrs>
+inline void validate_chunk0_output_given(
+    const RingAttrs& attrs, const std::optional<ttnn::Tensor>& preallocated, std::string_view name) {
     TT_FATAL(
-        lane1.logical_shape() == lane0.logical_shape() && lane1.dtype() == lane0.dtype() &&
-            lane1.layout() == lane0.layout() && lane1.memory_config() == lane0.memory_config(),
-        "Second-lane tensor '{}' ({}, {}, {}) must match its first-lane counterpart ({}, {}, {})",
+        attrs.chunk_selection == RingChunkSelection::None || preallocated.has_value(),
+        "Zig-zag chunk selection requires a preallocated chunk-0 '{}': devices that compute chunk 1 at this step "
+        "never write it",
+        name);
+}
+
+// Every second-chunk tensor must have exactly the tensor spec (logical and padded shape, dtype,
+// layout, memory config) and device of its first-chunk counterpart: the two chunks are halves of
+// one local sequence, each device's program is built from whichever chunk it computes, and
+// buffers sized from chunk 0 (the backward u_scaler) serve both chunks.
+inline void validate_same_spec(const ttnn::Tensor& chunk1, const ttnn::Tensor& chunk0, std::string_view name) {
+    TT_FATAL(chunk1.device() == chunk0.device(), "Second-chunk tensor '{}' must be on the same mesh device", name);
+    TT_FATAL(
+        chunk1.tensor_spec() == chunk0.tensor_spec(),
+        "Second-chunk tensor '{}' spec {} must match its first-chunk counterpart's spec {}",
         name,
-        lane1.logical_shape(),
-        lane1.dtype(),
-        lane1.memory_config(),
-        lane0.logical_shape(),
-        lane0.dtype(),
-        lane0.memory_config());
-    TT_FATAL(lane1.device() == lane0.device(), "Second-lane tensor '{}' must be on the same mesh device", name);
+        chunk1.tensor_spec(),
+        chunk0.tensor_spec());
 }
 
 // Per-tensor device contract of the reused SDPA kernels: on device, allocated,

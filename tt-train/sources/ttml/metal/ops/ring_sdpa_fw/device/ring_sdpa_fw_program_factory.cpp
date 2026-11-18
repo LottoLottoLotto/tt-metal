@@ -18,21 +18,21 @@ namespace ttml::metal::ops::ring_sdpa_fw {
 namespace {
 
 // SDPAForwardInputs holds the mask and gate as const references, so the "absent" value they
-// bind to must outlive the LaneBinding returned below (a temporary std::nullopt would dangle).
+// bind to must outlive the ChunkBinding returned below (a temporary std::nullopt would dangle).
 const std::optional<ttnn::Tensor> kNoTensor = std::nullopt;
 
-// SDPA forward inputs and outputs of one device at one ring step: lane 0 is the op's
-// primary tensors, lane 1 the second-lane tensors (RingLaneSelection::ZigZag only).
-struct LaneBinding {
+// SDPA forward inputs and outputs of one device at one ring step: chunk 0 is the op's
+// primary tensors, chunk 1 the second-chunk tensors (RingChunkSelection::ZigZag only).
+struct ChunkBinding {
     ttml::metal::ops::sdpa_fw::device::tensor_args_t tensor_args;
     ttml::metal::ops::sdpa_fw::device::tensor_return_value_t return_value;
 };
 
-LaneBinding bind_lane(uint32_t lane, const tensor_args_t& tensor_args, tensor_return_value_t& tensor_return_value) {
-    if (lane == 0U) {
+ChunkBinding bind_chunk(uint32_t chunk, const tensor_args_t& tensor_args, tensor_return_value_t& tensor_return_value) {
+    if (chunk == 0U) {
         auto& output = std::get<0>(tensor_return_value);
         auto& intermediates = std::get<1>(tensor_return_value);
-        return LaneBinding{
+        return ChunkBinding{
             .tensor_args =
                 {.query = tensor_args.query,
                  .key = tensor_args.key,
@@ -43,18 +43,18 @@ LaneBinding bind_lane(uint32_t lane, const tensor_args_t& tensor_args, tensor_re
                  .gate = kNoTensor},
             .return_value = {output, intermediates}};
     }
-    TT_FATAL(tensor_args.lane1.has_value(), "Device was assigned lane 1 but no second-lane tensors were given");
-    const auto& lane1 = tensor_args.lane1.value();
-    return LaneBinding{
+    TT_FATAL(tensor_args.chunk1.has_value(), "Device was assigned chunk 1 but no second-chunk tensors were given");
+    const auto& chunk1 = tensor_args.chunk1.value();
+    return ChunkBinding{
         .tensor_args =
-            {.query = lane1.query,
-             .key = lane1.key,
-             .value = lane1.value,
+            {.query = chunk1.query,
+             .key = chunk1.key,
+             .value = chunk1.value,
              .mask = kNoTensor,
-             .preallocated_intermediate = lane1.intermediates,
-             .preallocated_output = lane1.output,
+             .preallocated_intermediate = chunk1.intermediates,
+             .preallocated_output = chunk1.output,
              .gate = kNoTensor},
-        .return_value = {lane1.output, lane1.intermediates}};
+        .return_value = {chunk1.output, chunk1.intermediates}};
 }
 
 }  // namespace
@@ -75,7 +75,7 @@ RingSDPAFwProgramFactory::cached_mesh_workload_t RingSDPAFwProgramFactory::creat
     const uint32_t step = operation_attributes.step;
     const auto mask_type = operation_attributes.mask_type;
     const auto ring_direction = operation_attributes.ring_direction;
-    const auto lane_selection = operation_attributes.lane_selection;
+    const auto chunk_selection = operation_attributes.chunk_selection;
 
     TT_FATAL(ring_axis < mesh_shape.dims(), "Ring axis {} must be < mesh dimensions {}", ring_axis, mesh_shape.dims());
 
@@ -86,9 +86,9 @@ RingSDPAFwProgramFactory::cached_mesh_workload_t RingSDPAFwProgramFactory::creat
     for (const auto& mesh_coord : ttnn::MeshCoordinateRange(mesh_shape)) {
         uint32_t device_ring_id = mesh_coord[ring_axis];
 
-        // Check if this device should execute at this step, with which mask and on which lane
+        // Check if this device should execute at this step, with which mask and on which chunk
         const auto work =
-            get_ring_step_work(device_ring_id, step, ring_size, mask_type, ring_direction, lane_selection);
+            get_ring_step_work(device_ring_id, step, ring_size, mask_type, ring_direction, chunk_selection);
 
         if (!work.execute) {
             continue;
@@ -96,7 +96,7 @@ RingSDPAFwProgramFactory::cached_mesh_workload_t RingSDPAFwProgramFactory::creat
 
         sdpa_fw::device::operation_attributes_t sdpa_attrs{
             .return_intermediates = true, .mask_type = work.mask_type, .dropout_probability = 0.0F};
-        auto binding = bind_lane(work.lane, tensor_args, tensor_return_value);
+        auto binding = bind_chunk(work.chunk, tensor_args, tensor_return_value);
 
         // Create the program
         auto cached_program =
@@ -137,7 +137,7 @@ void RingSDPAFwProgramFactory::override_runtime_arguments(
     const uint32_t step = operation_attributes.step;
     const auto mask_type = operation_attributes.mask_type;
     const auto ring_direction = operation_attributes.ring_direction;
-    const auto lane_selection = operation_attributes.lane_selection;
+    const auto chunk_selection = operation_attributes.chunk_selection;
 
     // Iterate over cached programs and update runtime arguments
     for (auto& [coord_range, program] : cached_workload.workload.get_programs()) {
@@ -146,15 +146,15 @@ void RingSDPAFwProgramFactory::override_runtime_arguments(
         // Get the mesh coordinate for this program (single coord range)
         const auto& start_coord = coord_range.start_coord();
 
-        // Determine this device's mask and lane (only executing devices have a cached program)
+        // Determine this device's mask and chunk (only executing devices have a cached program)
         uint32_t device_ring_id = start_coord[ring_axis];
         const auto work =
-            get_ring_step_work(device_ring_id, step, ring_size, mask_type, ring_direction, lane_selection);
+            get_ring_step_work(device_ring_id, step, ring_size, mask_type, ring_direction, chunk_selection);
         TT_FATAL(work.execute, "Cached ring SDPA forward program found for a device that does not execute");
 
         sdpa_fw::operation_attributes_t sdpa_attrs{
             .return_intermediates = true, .mask_type = work.mask_type, .dropout_probability = 0.0F};
-        auto binding = bind_lane(work.lane, tensor_args, tensor_return_value);
+        auto binding = bind_chunk(work.chunk, tensor_args, tensor_return_value);
 
         // Convert our shared_variables to SDPA's shared_variables type
         sdpa_fw::SDPAForwardProgramFactory::shared_variables_t sdpa_shared_vars{

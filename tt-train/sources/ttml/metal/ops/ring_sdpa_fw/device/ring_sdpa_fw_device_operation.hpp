@@ -24,8 +24,9 @@ struct RingSDPAFwDeviceOperation {
     static tensor_return_value_t create_output_tensors(
         const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args);
 
-    static ttsl::hash::hash_t compute_program_hash(
-        const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args);
+    // No custom compute_program_hash: the default hash covers the full tensor spec of every
+    // input, output and chunk-1 tensor, including the memory configs (DRAM vs L1) the SDPA
+    // reader/writer kernels are compiled for.
 };
 
 }  // namespace ttml::metal::ops::ring_sdpa_fw
@@ -44,7 +45,7 @@ ttml::metal::ops::ring_sdpa_fw::RingSDPAFwDeviceOperation::tensor_return_value_t
         ttml::metal::ops::ring_sdpa_fw::RingDirection::Backward,
     const std::optional<ttnn::Tensor>& preallocated_output = std::nullopt,
     const std::optional<ttnn::Tensor>& preallocated_intermediates = std::nullopt,
-    ttml::metal::ops::RingLaneSelection lane_selection = ttml::metal::ops::RingLaneSelection::None,
-    const std::optional<ttml::metal::ops::ring_sdpa_fw::RingSDPAFwLane>& lane1 = std::nullopt);
+    ttml::metal::ops::RingChunkSelection chunk_selection = ttml::metal::ops::RingChunkSelection::None,
+    const std::optional<ttml::metal::ops::ring_sdpa_fw::RingSDPAFwChunk>& chunk1 = std::nullopt);
 
 }  // namespace ttnn::prim

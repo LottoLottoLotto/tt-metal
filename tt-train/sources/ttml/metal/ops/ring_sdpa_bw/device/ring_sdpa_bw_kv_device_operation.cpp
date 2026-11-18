@@ -46,17 +46,23 @@ void RingSDPABwKVDeviceOperation::validate_on_program_cache_miss(
             tensor_args.query);
     }
 
-    validate_ring_lane_selection(attrs, tensor_args.lane1.has_value());
-    if (tensor_args.lane1.has_value()) {
-        const auto& lane1 = tensor_args.lane1.value();
-        validate_ring_qkv(lane1.query, lane1.key, lane1.value);
-        validate_same_spec(lane1.query, tensor_args.query, "query");
-        validate_same_spec(lane1.key, tensor_args.key, "key");
-        validate_same_spec(lane1.value, tensor_args.value, "value");
-        validate_output_like_tensor(lane1.grad_output, "Second-lane grad output", lane1.query, lane1.value);
-        validate_intermediates_tensor(lane1.intermediates, lane1.query);
-        validate_grad_like_tensor(lane1.grad_key, "Second-lane grad key", lane1.key, lane1.query);
-        validate_grad_like_tensor(lane1.grad_value, "Second-lane grad value", lane1.value, lane1.query);
+    validate_ring_chunk_selection(attrs, tensor_args.chunk1.has_value());
+    validate_chunk0_output_given(attrs, tensor_args.preallocated_grad_key, "grad key");
+    validate_chunk0_output_given(attrs, tensor_args.preallocated_grad_value, "grad value");
+    if (tensor_args.chunk1.has_value()) {
+        const auto& chunk1 = tensor_args.chunk1.value();
+        validate_ring_qkv(chunk1.query, chunk1.key, chunk1.value);
+        validate_output_like_tensor(chunk1.grad_output, "Second-chunk grad output", chunk1.query, chunk1.value);
+        validate_intermediates_tensor(chunk1.intermediates, chunk1.query);
+        validate_grad_like_tensor(chunk1.grad_key, "Second-chunk grad key", chunk1.key, chunk1.query);
+        validate_grad_like_tensor(chunk1.grad_value, "Second-chunk grad value", chunk1.value, chunk1.query);
+        validate_same_spec(chunk1.query, tensor_args.query, "query");
+        validate_same_spec(chunk1.key, tensor_args.key, "key");
+        validate_same_spec(chunk1.value, tensor_args.value, "value");
+        validate_same_spec(chunk1.grad_output, tensor_args.grad_output, "grad output");
+        validate_same_spec(chunk1.intermediates, tensor_args.intermediates, "intermediates");
+        validate_same_spec(chunk1.grad_key, tensor_args.preallocated_grad_key.value(), "grad key");
+        validate_same_spec(chunk1.grad_value, tensor_args.preallocated_grad_value.value(), "grad value");
     }
 }
 
@@ -118,8 +124,8 @@ ttml::metal::ops::ring_sdpa_bw::kv::RingSDPABwKVDeviceOperation::tensor_return_v
     ttml::metal::ops::ring_sdpa_bw::RingDirection ring_direction,
     const std::optional<ttnn::Tensor>& preallocated_grad_key,
     const std::optional<ttnn::Tensor>& preallocated_grad_value,
-    ttml::metal::ops::RingLaneSelection lane_selection,
-    const std::optional<ttml::metal::ops::ring_sdpa_bw::kv::RingSDPABwKVLane>& lane1) {
+    ttml::metal::ops::RingChunkSelection chunk_selection,
+    const std::optional<ttml::metal::ops::ring_sdpa_bw::kv::RingSDPABwKVChunk>& chunk1) {
     using OperationType = ttml::metal::ops::ring_sdpa_bw::kv::RingSDPABwKVDeviceOperation;
 
     auto operation_attributes = OperationType::operation_attributes_t{
@@ -128,7 +134,7 @@ ttml::metal::ops::ring_sdpa_bw::kv::RingSDPABwKVDeviceOperation::tensor_return_v
         .step = step,
         .mask_type = mask_type,
         .ring_direction = ring_direction,
-        .lane_selection = lane_selection};
+        .chunk_selection = chunk_selection};
 
     auto tensor_args = OperationType::tensor_args_t{
         .grad_output = grad_output,
@@ -139,7 +145,7 @@ ttml::metal::ops::ring_sdpa_bw::kv::RingSDPABwKVDeviceOperation::tensor_return_v
         .intermediates = intermediates,
         .preallocated_grad_key = preallocated_grad_key,
         .preallocated_grad_value = preallocated_grad_value,
-        .lane1 = lane1};
+        .chunk1 = chunk1};
 
     return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
 }
