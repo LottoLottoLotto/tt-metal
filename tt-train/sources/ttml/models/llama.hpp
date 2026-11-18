@@ -13,6 +13,7 @@
 #include "modules/llama_block.hpp"
 #include "modules/module_base.hpp"
 #include "modules/rms_norm_module.hpp"
+#include "ops/distributed/ring_attention_layout.hpp"
 #include "ops/rope_op.hpp"
 #include "yaml-cpp/yaml.h"
 
@@ -38,6 +39,10 @@ struct LlamaConfig {
     float high_freq_factor = 4.0F;
     float low_freq_factor = 1.0F;
     uint32_t original_context_length = 0U;
+    // Sequence layout across the context-parallel ring (yaml `cp_layout: contiguous|zigzag`). ZigZag balances
+    // causal ring attention across CP ranks; the training data must then be laid out the same way
+    // (see ops::distributed::zigzag_global_position). Only used with CP.
+    ops::distributed::RingAttentionLayout cp_layout = ops::distributed::RingAttentionLayout::Contiguous;
 };
 
 class Llama : public BaseTransformer {

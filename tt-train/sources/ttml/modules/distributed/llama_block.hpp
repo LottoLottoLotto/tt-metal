@@ -9,6 +9,7 @@
 
 #include "modules/linear_module.hpp"
 #include "modules/module_base.hpp"
+#include "ops/distributed/ring_attention_layout.hpp"
 #include "ops/rope_op.hpp"
 
 namespace ttml::modules::distributed {
@@ -38,7 +39,8 @@ public:
         uint32_t num_groups,
         const ops::RotaryEmbeddingParams& rope_params,
         float dropout_prob = 0.0F,
-        std::optional<uint32_t> intermediate_dim = std::nullopt);
+        std::optional<uint32_t> intermediate_dim = std::nullopt,
+        ops::distributed::RingAttentionLayout cp_layout = ops::distributed::RingAttentionLayout::Contiguous);
 
     autograd::TensorPtr operator()(
         const autograd::TensorPtr& input, const std::optional<autograd::TensorPtr>& mask) override;

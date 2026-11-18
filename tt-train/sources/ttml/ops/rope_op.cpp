@@ -274,12 +274,16 @@ autograd::TensorPtr rope(
     return rope_impl(input, rows.cos, rows.sin, rows.neg_sin, params.trans_mat);
 }
 
-std::pair<ttnn::Tensor, ttnn::Tensor> gen_freqs(
+namespace {
+
+// cos/sin caches [1, 1, L, head_dim] for the token positions `pos` (L of them, in tensor row order).
+std::pair<ttnn::Tensor, ttnn::Tensor> gen_freqs_at(
     uint32_t head_dim,
-    uint32_t sequence_length,
+    xt::xarray<float> pos,
     float theta,
     const RopeScalingParams& p,
     const ttnn::distributed::TensorToMesh* mesh_mapper) {
+    const auto sequence_length = static_cast<uint32_t>(pos.size());
     // pair indices: 0,0,1,1,2,2,... size=head_dim
     xt::xarray<uint32_t> pair_idx_u = xt::arange<uint32_t>(head_dim) / 2u;  // integer divide
     xt::xarray<float> pair_idx = xt::cast<float>(pair_idx_u);
@@ -296,8 +300,6 @@ std::pair<ttnn::Tensor, ttnn::Tensor> gen_freqs(
     }
 
     // positions column vector [L,1]
-    // positions column vector [L,1]
-    xt::xarray<float> pos = xt::arange<float>(static_cast<float>(sequence_length));
     pos.reshape({sequence_length, 1u});  // member reshape
 
     // θ = pos * inv_freq  -> broadcast to [L,D]
@@ -320,6 +322,17 @@ std::pair<ttnn::Tensor, ttnn::Tensor> gen_freqs(
         core::from_xtensor(cos_freqs, device, ttnn::Layout::TILE, mesh_mapper)};
 }
 
+}  // namespace
+
+std::pair<ttnn::Tensor, ttnn::Tensor> gen_freqs(
+    uint32_t head_dim,
+    uint32_t sequence_length,
+    float theta,
+    const RopeScalingParams& p,
+    const ttnn::distributed::TensorToMesh* mesh_mapper) {
+    return gen_freqs_at(head_dim, xt::arange<float>(static_cast<float>(sequence_length)), theta, p, mesh_mapper);
+}
+
 ttnn::Tensor gen_trans_mat() {
     xt::xarray<float> trans_mat = xt::zeros<float>({1, 1, ttnn::TILE_SIZE, ttnn::TILE_SIZE});
     for (int i = 0; i < ttnn::TILE_SIZE; i += 2) {
@@ -334,7 +347,11 @@ ttnn::Tensor gen_trans_mat() {
 }
 
 RotaryEmbeddingParams build_rope_params(
-    uint32_t sequence_length, uint32_t head_dim, float theta, RopeScalingParams scaling_params) {
+    uint32_t sequence_length,
+    uint32_t head_dim,
+    float theta,
+    RopeScalingParams scaling_params,
+    distributed::RingAttentionLayout cp_layout) {
     if (head_dim % 32U != 0U) {
         throw std::invalid_argument(fmt::format("RoPE head_dim must be divisible by 32, but is {}", head_dim));
     }
@@ -349,6 +366,9 @@ RotaryEmbeddingParams build_rope_params(
     // If ParallelismContext is initialized and CP is enabled, shard freqs across the CP axis.
     std::shared_ptr<ttnn::distributed::TensorToMesh> mapper;
     uint32_t local_seq_len = sequence_length;
+    // Token position of every row of the (unsharded) caches; sharding them over the CP axis gives each rank
+    // the positions of the tokens it holds.
+    xt::xarray<float> positions = xt::arange<float>(static_cast<float>(sequence_length));
 
     if (autograd::ctx().is_parallelism_context_initialized()) {
         auto& pctx = autograd::ctx().get_parallelism_context();
@@ -365,10 +385,21 @@ RotaryEmbeddingParams build_rope_params(
 
             auto* device = &autograd::ctx().get_device();
             mapper = ttnn::distributed::shard_tensor_to_mesh_mapper(*device, /*dim=*/2, cp_axis.value());
+            if (cp_layout == distributed::RingAttentionLayout::ZigZag) {
+                TT_FATAL(
+                    sequence_length % (2U * cp_size) == 0,
+                    "The zig-zag CP layout needs sequence_length ({}) divisible by 2 * cp_size ({})",
+                    sequence_length,
+                    2U * cp_size);
+                for (uint32_t i = 0; i < sequence_length; ++i) {
+                    positions(i) =
+                        static_cast<float>(distributed::zigzag_global_position(i, sequence_length, cp_size));
+                }
+            }
         }
     }
 
-    auto [sin_freqs, cos_freqs] = gen_freqs(head_dim, sequence_length, theta, scaling_params, mapper.get());
+    auto [sin_freqs, cos_freqs] = gen_freqs_at(head_dim, positions, theta, scaling_params, mapper.get());
     auto trans_mat = gen_trans_mat();
     auto to_table = [local_seq_len, head_dim](const ttnn::Tensor& freqs) {
         return ttnn::to_layout(ttnn::reshape(freqs, ttnn::Shape{local_seq_len, head_dim}), ttnn::Layout::ROW_MAJOR);

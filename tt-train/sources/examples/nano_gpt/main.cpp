@@ -565,8 +565,19 @@ int main(int argc, char **argv) {
     };
     CachedHostData cached_data;
 
+    // With the zig-zag CP layout every sample's tokens and targets are reordered so that sharding the sequence
+    // dim over the CP axis gives rank d the chunks [d | 2N-1-d] (the model's RoPE positions match this order).
+    uint32_t zigzag_cp_size = 0U;
+    if (const auto *llama_config = std::get_if<ttml::models::llama::LlamaConfig>(&model_config.transformer_config);
+        llama_config != nullptr && llama_config->cp_layout == ttml::ops::distributed::RingAttentionLayout::ZigZag) {
+        if (!is_pctx_initialized() || !ttml::autograd::ctx().get_parallelism_context().is_cp_enabled()) {
+            throw std::runtime_error("cp_layout: zigzag requires device_config.enable_cp");
+        }
+        zigzag_cp_size = ttml::autograd::ctx().get_parallelism_context().get_cp_size();
+    }
+
     std::function<BatchType(std::vector<DatasetSample> && samples)> collate_fn =
-        [sequence_length, device, &cached_data](std::vector<DatasetSample> &&samples) {
+        [sequence_length, device, &cached_data, zigzag_cp_size](std::vector<DatasetSample> &&samples) {
             auto start_timer = std::chrono::high_resolution_clock::now();
             const uint32_t batch_size = samples.size();
             std::vector<uint32_t> &data = cached_data.data;
@@ -578,6 +589,15 @@ int main(int argc, char **argv) {
             data.reserve((size_t)batch_size * sequence_length);
             targets.reserve((size_t)batch_size * sequence_length);
             for (auto &[features, target_span] : samples) {
+                if (zigzag_cp_size > 0U) {
+                    for (uint32_t pos = 0; pos < sequence_length; ++pos) {
+                        const uint32_t global =
+                            ttml::ops::distributed::zigzag_global_position(pos, sequence_length, zigzag_cp_size);
+                        data.push_back(features[global]);
+                        targets.push_back(target_span[global]);
+                    }
+                    continue;
+                }
                 std::copy(features.begin(), features.end(), std::back_inserter(data));
                 std::copy(target_span.begin(), target_span.end(), std::back_inserter(targets));
             }
