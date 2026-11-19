@@ -93,6 +93,9 @@ class KimiK3Adapter(MLAPrefillAdapter):
     # still reads ~0.999 while the pe half collapses to ~0.02 -- a broken comparison that looks
     # exactly like a broken model.
     kv_pe_interleave = False
+    # KDA state is recurrent and prefill samples no first token, so a migration handoff leaves the next prompt
+    # token for decode to run (tt-blaze kimi_k3/entry.py MIGRATION_RESUME_NEEDS_FIRST_TOKEN).
+    migration_handoff_tail_tokens = 1
     l1_small_size = KimiK3Config.L1_SMALL_SIZE
     # Kimi-K3's (and K3.1's) MoE layers run on the MoE block (moe_impl.py).
     moe_impl = "block"
