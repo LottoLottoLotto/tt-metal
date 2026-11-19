@@ -20,7 +20,7 @@ class IoWindow;
 
 namespace tt::tt_metal::distributed {
 
-// Host writes into one core's L1, for host-to-device rings and queues such as the H2D socket.
+// Host writes into one core's L1, for host-to-device rings and queues (H2D sockets, the host_rdma request service).
 //
 // Writes go through a TLB window of the writer's own where one reaches the range written: posted, write-only, on a
 // static write VC, so writes to the core arrive in issue order and each is a plain store (no driver call, no wait for
