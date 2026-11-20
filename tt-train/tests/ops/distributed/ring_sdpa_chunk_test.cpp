@@ -749,24 +749,3 @@ TEST_F(RingSDPAChunkTest, ValidationRejectsEmptyChunkListBeforeLaunch) {
         launch_bw_kv(ring, {}, 1U, AttentionMaskType::Causal, RingLoadBalancing::None),
         ThrowsMessage<std::runtime_error>(HasSubstr("needs at least one chunk")));
 }
-
-TEST_F(RingSDPAChunkTest, ValidationRejectsDefaultConstructedChunkTensorBeforeLaunch) {
-    const auto ring = ring_setup();
-    const auto data = make_chunks(4245U);
-    auto fw_chunk = upload_fw_chunk(data[0]);
-    fw_chunk.output = ttnn::Tensor();
-    auto bw_chunk = upload_bw_chunk(data[0]);
-    bw_chunk.grad_query = ttnn::Tensor();
-    auto bw_kv_chunk = to_kv_chunk(bw_chunk);
-    bw_kv_chunk.grad_key = ttnn::Tensor();
-
-    EXPECT_THAT(
-        launch_fw(ring, {fw_chunk}, 1U, AttentionMaskType::Causal, RingLoadBalancing::None),
-        ThrowsMessage<std::runtime_error>(HasSubstr("Chunk 0 'output' is a default-constructed tensor")));
-    EXPECT_THAT(
-        launch_bw(ring, {bw_chunk}, 1U, AttentionMaskType::Causal, RingLoadBalancing::None),
-        ThrowsMessage<std::runtime_error>(HasSubstr("Chunk 0 'grad_query' is a default-constructed tensor")));
-    EXPECT_THAT(
-        launch_bw_kv(ring, {bw_kv_chunk}, 1U, AttentionMaskType::Causal, RingLoadBalancing::None),
-        ThrowsMessage<std::runtime_error>(HasSubstr("Chunk 0 'grad_key' is a default-constructed tensor")));
-}

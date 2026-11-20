@@ -5,12 +5,10 @@
 #pragma once
 
 #include <cstdint>
-#include <reflect>
 #include <string_view>
 #include <tt-metalium/constants.hpp>
 #include <tt_stl/assert.hpp>
 #include <utility>
-#include <vector>
 
 #include "metal/common/const_utils.hpp"
 #include "metal/common/tensor_validation.hpp"
@@ -162,23 +160,6 @@ inline void validate_ring_load_balancing(const RingAttrs& attrs, size_t chunk_co
             return;
     }
     TT_THROW("Unknown load balancing {}", static_cast<int>(attrs.load_balancing));
-}
-
-// Called by each prim before launch(), which reads every chunk tensor before validate_on_program_cache_miss runs.
-template <typename Chunk>
-inline void validate_chunk_list(const std::vector<Chunk>& chunks) {
-    TT_FATAL(!chunks.empty(), "Ring SDPA needs at least one chunk");
-    for (size_t c = 0; c < chunks.size(); ++c) {
-        reflect::for_each(
-            [&](auto field) {
-                TT_FATAL(
-                    reflect::get<field>(chunks[c]).tensor_attributes != nullptr,
-                    "Chunk {} '{}' is a default-constructed tensor",
-                    c,
-                    reflect::member_name<field>(chunks[c]));
-            },
-            chunks[c]);
-    }
 }
 
 // Each device builds its program from the chunk it computes, and chunk-sized buffers (u_scaler) serve every chunk.

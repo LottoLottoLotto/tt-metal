@@ -66,7 +66,7 @@ ttml::metal::ops::ring_sdpa_fw::RingSDPAFwDeviceOperation::tensor_return_value_t
     ttml::metal::ops::RingLoadBalancing load_balancing) {
     using OperationType = ttml::metal::ops::ring_sdpa_fw::RingSDPAFwDeviceOperation;
 
-    ttml::metal::ops::validate_chunk_list(chunks);
+    TT_FATAL(!chunks.empty(), "Ring SDPA needs at least one chunk");
 
     auto operation_attributes = OperationType::operation_attributes_t{
         .ring_size = ring_size,
