@@ -6,6 +6,7 @@
 
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -200,6 +201,14 @@ private:
     std::optional<FinalizedMetadata> finalized_metadata_;
     // Per-device runtime args per program range (see PerDeviceRuntimeArgs); empty for almost every workload.
     std::unordered_map<MeshCoordinateRange, PerDeviceRuntimeArgs> per_device_runtime_args_;
+    // Program ranges whose device-specific runtime args (ProgramImpl::device_specific_runtime_args) are installed as
+    // framework-owned per-device runtime args.
+    std::unordered_set<MeshCoordinateRange> device_specific_runtime_args_installed_;
+    // Gives each device of `program_range` the runtime args of `program` that are specific to it, as framework-owned
+    // per-device runtime args.
+    // precondition: `program` is compiled, so its runtime args buffers exist.
+    void install_device_specific_runtime_args(
+        const MeshCoordinateRange& program_range, Program& program, MeshDevice& mesh_device);
     PerDeviceRuntimeArgsField& per_device_runtime_args_field(
         const MeshCoordinateRange& program_range,
         KernelHandle kernel,

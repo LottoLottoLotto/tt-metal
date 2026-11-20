@@ -742,6 +742,29 @@ void MeshWorkloadImpl::compile(MeshDevice* mesh_device) {
         mesh_device->wait_for_thread_pool();
     }
     finalize_offsets(mesh_device);
+    for (auto& [device_range, program] : programs_) {
+        if (device_specific_runtime_args_installed_.insert(device_range).second) {
+            install_device_specific_runtime_args(device_range, program, *mesh_device);
+        }
+    }
+}
+
+void MeshWorkloadImpl::install_device_specific_runtime_args(
+    const MeshCoordinateRange& program_range, Program& program, MeshDevice& mesh_device) {
+    const auto runs = program.impl().device_specific_runtime_args(program_range);
+    if (runs.empty()) {
+        return;
+    }
+    TT_FATAL(
+        ArePerDeviceRuntimeArgsSupported(mesh_device, program_range),
+        "The Program on range {} has runtime args that differ per device (for example fabric connection args), which "
+        "need per-device runtime args; the range does not support them (a wraparound range, light-metal capture or an "
+        "emulator). Hint: give each device its own Program (a 1x1 range)",
+        program_range);
+    for (const auto& run : runs) {
+        set_framework_per_device_runtime_args(
+            program_range, run.kernel, run.core, run.first_word, run.num_words, run.values_in_range_order);
+    }
 }
 
 void MeshWorkloadImpl::load_binaries(MeshCommandQueue& mesh_cq) {
