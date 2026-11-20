@@ -16,6 +16,9 @@
 
 namespace ttml::metal::ops {
 
+// ZigZag: with N = ring_size, device d holds global blocks [d | 2N-1-d]; chunks[0] = block d, chunks[1] = block 2N-1-d.
+// At step >= 1, with src = get_ring_source_device(d, step), the device computes chunk 0 if src < d, chunk 1 if src > d,
+// unmasked. The caller runs step 0 as one causal None call and the chunk-1 Q x chunk-0 K/V block at every step >= 1.
 enum class RingLoadBalancing : uint8_t { None = 0, ZigZag = 1 };
 
 inline uint32_t get_ring_chunk_count(RingLoadBalancing load_balancing) {
@@ -34,17 +37,13 @@ inline uint32_t get_ring_source_device(
     if (ring_direction == ttnn_fixed::distributed::RingShiftDirection::Backward) {
         return (device_ring_id + step) % ring_size;
     }
-    // Reduce step first: plain (d - s + ring_size) wraps mod 2^32 when s > d, wrong for non-power-of-2 rings.
     return (device_ring_id + ring_size - (step % ring_size)) % ring_size;
 }
 
 // Determine if a device should execute at this ring step and which mask type to use.
-// Shared by the ring_sdpa_fw and ring_sdpa_bw program factories, which must agree on
-// the schedule: the backward relies on skipping exactly the (device, step) pairs the
-// forward skipped.
 // Returns: (should_execute, mask_type_to_use)
 //
-// Causal logic on the source chunk:
+// Causal logic on the source chunk, src = get_ring_source_device(d, step):
 // - src == d: diagonal chunk, apply causal mask
 // - src < d:  earlier chunk, full attention (no mask)
 // - src > d:  later chunk, fully masked, skip
@@ -78,6 +77,7 @@ struct RingStepWork {
     bool operator==(const RingStepWork&) const = default;
 };
 
+// The only source of per-device work for fw, bw_q and bw_kv: bw_kv reads the u_scaler bw_q wrote for the same chunk.
 inline RingStepWork get_ring_step_work(
     uint32_t device_ring_id,
     uint32_t step,

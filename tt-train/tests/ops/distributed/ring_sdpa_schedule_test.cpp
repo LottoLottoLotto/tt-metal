@@ -3,12 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Host-side tests for the ring SDPA causal schedule (get_device_execution_info).
+ * Host-side tests for the ring SDPA schedule (get_device_execution_info, get_ring_step_work) under None and ZigZag.
  *
- * The function is pure, so these run without any device. They pin the schedule
- * both program factories share — in particular the Forward-direction source
- * computation for non-power-of-two ring sizes, where a mod-2^32 wraparound in the
- * source index is not equivalent to mod ring_size.
+ * The functions are pure, so these run without any device.
  */
 
 #include <gtest/gtest.h>

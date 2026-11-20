@@ -18,7 +18,7 @@ void ring_sdpa_fw(
     uint32_t ring_size,
     uint32_t ring_axis,
     uint32_t step,
-    AttentionMaskType mask_type = AttentionMaskType::None,
+    AttentionMaskType mask_type,
     ops::ring_sdpa_fw::RingDirection ring_direction = ops::ring_sdpa_fw::RingDirection::Backward,
     ops::RingLoadBalancing load_balancing = ops::RingLoadBalancing::None);
 

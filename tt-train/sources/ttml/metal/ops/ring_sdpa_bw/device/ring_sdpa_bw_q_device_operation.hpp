@@ -40,7 +40,7 @@ ttml::metal::ops::ring_sdpa_bw::q::RingSDPABwQDeviceOperation::tensor_return_val
     uint32_t ring_size,
     uint32_t ring_axis,
     uint32_t step,
-    ttml::metal::AttentionMaskType mask_type = ttml::metal::AttentionMaskType::None,
+    ttml::metal::AttentionMaskType mask_type,
     ttml::metal::ops::ring_sdpa_bw::RingDirection ring_direction =
         ttml::metal::ops::ring_sdpa_bw::RingDirection::Backward,
     ttml::metal::ops::RingLoadBalancing load_balancing = ttml::metal::ops::RingLoadBalancing::None);
