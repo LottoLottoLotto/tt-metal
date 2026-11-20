@@ -24,9 +24,7 @@ struct RingSDPAFwDeviceOperation {
     static tensor_return_value_t create_output_tensors(
         const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args);
 
-    // No custom compute_program_hash: the default hash covers the full tensor spec of every
-    // input, output and chunk-1 tensor, including the memory configs (DRAM vs L1) the SDPA
-    // reader/writer kernels are compiled for.
+    // No custom compute_program_hash: the default one hashes every tensor's memory config (DRAM vs L1).
 };
 
 }  // namespace ttml::metal::ops::ring_sdpa_fw

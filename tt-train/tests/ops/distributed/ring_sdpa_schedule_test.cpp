@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Host-side tests for the ring SDPA causal schedule (get_device_execution_info and the
- * chunk-aware get_ring_step_work used for zig-zag load balancing).
+ * Host-side tests for the ring SDPA causal schedule (get_device_execution_info).
  *
  * The function is pure, so these run without any device. They pin the schedule
  * both program factories share — in particular the Forward-direction source
@@ -137,7 +136,6 @@ TEST(RingSDPAScheduleTest, CausalScheduleInvariants) {
     }
 }
 
-// RingLoadBalancing::None is exactly the classic schedule on chunk 0.
 TEST(RingSDPAScheduleTest, LoadBalancingNoneMatchesExecutionInfo) {
     for (auto direction : {RingShiftDirection::Forward, RingShiftDirection::Backward}) {
         for (auto mask_type : {AttentionMaskType::None, AttentionMaskType::Causal}) {
@@ -158,9 +156,6 @@ TEST(RingSDPAScheduleTest, LoadBalancingNoneMatchesExecutionInfo) {
     }
 }
 
-// Zig-zag chunks on a ring of 4, Backward direction (src = (d + s) mod 4). Device d holds
-// chunks [d | 7-d]; chunk 0 is the first-half block (chunk d x chunk src), chunk 1 the
-// second-half block (chunk 7-d x chunk 7-src). Step 0 never runs a chunk (src == d).
 TEST(RingSDPAScheduleTest, ZigZagRing4BackwardTable) {
     struct Row {
         uint32_t device;
@@ -172,19 +167,19 @@ TEST(RingSDPAScheduleTest, ZigZagRing4BackwardTable) {
         {0, 0, false, 0},
         {0, 1, true, 1},
         {0, 2, true, 1},
-        {0, 3, true, 1},  // device 0: every src > 0
+        {0, 3, true, 1},
         {1, 0, false, 0},
         {1, 1, true, 1},
         {1, 2, true, 1},
-        {1, 3, true, 0},  // src 2, 3 > 1; src 0 < 1
+        {1, 3, true, 0},
         {2, 0, false, 0},
         {2, 1, true, 1},
         {2, 2, true, 0},
-        {2, 3, true, 0},  // src 3 > 2; src 0, 1 < 2
+        {2, 3, true, 0},
         {3, 0, false, 0},
         {3, 1, true, 0},
         {3, 2, true, 0},
-        {3, 3, true, 0},  // device 3: every src < 3
+        {3, 3, true, 0},
     };
     for (const auto& row : kRows) {
         const auto work = get_ring_step_work(
@@ -202,15 +197,6 @@ TEST(RingSDPAScheduleTest, ZigZagRing4BackwardTable) {
     }
 }
 
-// Exhaustive check of the full zig-zag ring attention schedule built on get_ring_step_work:
-// the sequence is cut into 2N chunks, device d holds chunks [d | 2N-1-d], and per step:
-//   step 0 (src == d): one causal call over the full local sequence
-//                      -> diagonal blocks (d,d), (2N-1-d,2N-1-d) and the full block (2N-1-d,d);
-//   step s >= 1:       the cross block X = (2N-1-d, src), unmasked, on every device,
-//                      plus the chunk block from get_ring_step_work.
-// Every causally visible block of the global (q chunk, k chunk) matrix must be computed
-// exactly once (diagonal blocks with a causal mask, all others unmasked), no masked block
-// may ever be computed, and every device must do the same amount of work at every step.
 TEST(RingSDPAScheduleTest, ZigZagCoversCausalTriangleExactlyOnceAndBalances) {
     for (auto direction : {RingShiftDirection::Forward, RingShiftDirection::Backward}) {
         for (uint32_t ring_size : {1U, 2U, 3U, 4U, 5U, 8U}) {
@@ -223,7 +209,6 @@ TEST(RingSDPAScheduleTest, ZigZagCoversCausalTriangleExactlyOnceAndBalances) {
             for (uint32_t step = 0; step < ring_size; ++step) {
                 for (uint32_t device = 0; device < ring_size; ++device) {
                     const uint32_t src = source_device(device, step, ring_size, direction);
-                    // Work in units of one fully computed C x C block; a causal diagonal block is half.
                     double work_units = 0.0;
                     if (step == 0) {
                         ASSERT_EQ(src, device);
@@ -232,7 +217,7 @@ TEST(RingSDPAScheduleTest, ZigZagCoversCausalTriangleExactlyOnceAndBalances) {
                         ++full_count[second_chunk(device)][first_chunk(device)];
                         work_units += 2.0;
                     } else {
-                        ++full_count[second_chunk(device)][first_chunk(src)];  // cross block X
+                        ++full_count[second_chunk(device)][first_chunk(src)];
                         work_units += 1.0;
                     }
                     const auto work = get_ring_step_work(

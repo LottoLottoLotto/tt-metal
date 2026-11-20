@@ -19,9 +19,6 @@ namespace ttml::metal::ops {
 
 enum class RingLoadBalancing : uint8_t { None = 0, ZigZag = 1 };
 
-// Source device of the K/V a device holds at a ring step:
-// - Backward ring direction: src = (d + s) mod ring_size
-// - Forward ring direction:  src = (d - s) mod ring_size
 inline uint32_t get_ring_source_device(
     uint32_t device_ring_id,
     uint32_t step,
@@ -30,9 +27,7 @@ inline uint32_t get_ring_source_device(
     if (ring_direction == ttnn_fixed::distributed::RingShiftDirection::Backward) {
         return (device_ring_id + step) % ring_size;
     }
-    // Reduce step mod ring_size before subtracting so the uint32 expression cannot
-    // underflow: plain (d - s + ring_size) wraps mod 2^32 when s > d, which is only
-    // correct for power-of-2 ring sizes.
+    // Reduce step first: plain (d - s + ring_size) wraps mod 2^32 when s > d, wrong for non-power-of-2 rings.
     return (device_ring_id + ring_size - (step % ring_size)) % ring_size;
 }
 
@@ -42,7 +37,7 @@ inline uint32_t get_ring_source_device(
 // forward skipped.
 // Returns: (should_execute, mask_type_to_use)
 //
-// Causal logic on the source chunk (contiguous sharding):
+// Causal logic on the source chunk:
 // - src == d: diagonal chunk, apply causal mask
 // - src < d:  earlier chunk, full attention (no mask)
 // - src > d:  later chunk, fully masked, skip
@@ -68,19 +63,14 @@ inline std::pair<bool, AttentionMaskType> get_device_execution_info(
     }
 }
 
-// Work of one device at one ring step: whether it runs, with which mask, on which chunk.
 struct RingStepWork {
     bool execute = false;
     AttentionMaskType mask_type = AttentionMaskType::None;
-    uint32_t chunk = 0;  // 0: primary tensors, 1: the op's second-chunk tensors
+    uint32_t chunk = 0;
 
     bool operator==(const RingStepWork&) const = default;
 };
 
-// Schedule used by the ring program factories. RingLoadBalancing::None is exactly
-// get_device_execution_info on chunk 0. RingLoadBalancing::ZigZag (causal only) returns
-// the unmasked same-chunk block visible at this step: chunk 0 when src < d,
-// chunk 1 when src > d, and no work when src == d.
 inline RingStepWork get_ring_step_work(
     uint32_t device_ring_id,
     uint32_t step,
@@ -137,10 +127,6 @@ inline void validate_ring_attributes(const RingAttrs& attrs, const ttnn::Tensor&
         attrs.ring_axis);
 }
 
-// Load-balancing contract shared by the ring ops: the second chunk is supplied exactly
-// when zig-zag load balancing is requested, and zig-zag is only defined for causal
-// steps other than the diagonal step (step 0), which the caller runs as one full causal
-// call over the whole local sequence.
 template <typename RingAttrs>
 inline void validate_ring_load_balancing(const RingAttrs& attrs, bool has_second_chunk) {
     if (attrs.load_balancing == RingLoadBalancing::None) {
@@ -158,10 +144,7 @@ inline void validate_ring_load_balancing(const RingAttrs& attrs, bool has_second
         "causal call over the full local sequence");
 }
 
-// With zig-zag load balancing the devices that compute chunk 1 at a step never write the
-// chunk-0 outputs, so a chunk-0 output the op allocated itself would hold uninitialized memory
-// on those devices. The caller must supply (and pre-fill) every chunk-0 output, exactly as it
-// supplies the chunk-1 outputs.
+// Devices computing chunk 1 never write chunk 0, so an op-allocated chunk-0 output would stay uninitialized.
 template <typename RingAttrs>
 inline void validate_chunk0_output_given(
     const RingAttrs& attrs, const std::optional<ttnn::Tensor>& preallocated, std::string_view name) {
@@ -172,10 +155,7 @@ inline void validate_chunk0_output_given(
         name);
 }
 
-// Every second-chunk tensor must have exactly the tensor spec (logical and padded shape, dtype,
-// layout, memory config) and device of its first-chunk counterpart: the two chunks are halves of
-// one local sequence, each device's program is built from whichever chunk it computes, and
-// buffers sized from chunk 0 (the backward u_scaler) serve both chunks.
+// Each device builds its program from the chunk it computes, and chunk-0-sized buffers (u_scaler) serve both.
 inline void validate_same_spec(const ttnn::Tensor& chunk1, const ttnn::Tensor& chunk0, std::string_view name) {
     TT_FATAL(chunk1.device() == chunk0.device(), "Second-chunk tensor '{}' must be on the same mesh device", name);
     TT_FATAL(

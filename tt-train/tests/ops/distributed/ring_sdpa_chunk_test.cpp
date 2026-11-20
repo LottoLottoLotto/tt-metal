@@ -2,24 +2,6 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-/**
- * Device tests for RingLoadBalancing::ZigZag in the ring SDPA ops.
- *
- * With zig-zag load balancing one ring_sdpa_fw / ring_sdpa_bw call carries two sets of
- * tensors ("chunks"), and the ring program factory binds each device's program to the chunk
- * the schedule assigns it (chunk 0 when src < d, chunk 1 when src > d, nothing on the
- * diagonal step). These tests replicate distinct random inputs per chunk to every device,
- * run every ring step in both ring directions, and check on each device that
- *   - the assigned chunk's outputs match an unmasked SDPA reference of that chunk's inputs,
- *   - the other chunk's outputs are left untouched (pre-filled sentinels survive).
- * Every step runs twice: a program-cache miss (create_mesh_workload) and then a hit with
- * fresh inputs and outputs at new buffer addresses (override_runtime_arguments), so both
- * paths that bind chunks are exercised.
- * They use the whole system mesh with the ring along its longest axis, so they run on a
- * LoudBox (1x8, TT_MESH_GRAPH_DESC_PATH=bh_lb_1x8_line_graph_descriptor) as well as a
- * Galaxy (8x4) and skip on single-device systems.
- */
-
 #include <fmt/format.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -51,12 +33,8 @@ using ttml::ttnn_fixed::distributed::RingShiftDirection;
 
 constexpr float kSentinel = 7.0F;
 constexpr float kNegInf = -std::numeric_limits<float>::infinity();
-// B, Q heads, KV heads (GQA), chunk sequence length C (4 tiles), head dim.
 constexpr size_t kB = 1, kH = 4, kG = 2, kC = 128, kD = 64;
-// Q is drawn from U(-kQScale, kQScale) so the scaled scores have std ~1: a near-uniform softmax would
-// make the gradients too insensitive to the chunk's K and u = rowsum(dO * O) to catch a wrong binding.
 constexpr float kQScale = 3.0F;
-// Relative L2 error accepted against the FP32 host reference (bf16 inputs and outputs).
 constexpr double kForwardRelTol = 2e-2;
 constexpr double kBackwardRelTol = 5e-2;
 
@@ -64,7 +42,6 @@ tt::tt_metal::distributed::MeshShape system_mesh_shape() {
     return tt::tt_metal::distributed::SystemMesh::instance().shape();
 }
 
-// Ring along the longest mesh axis (LoudBox 1x8 -> axis 1, Galaxy 8x4 -> axis 0).
 uint32_t ring_axis_of(const tt::tt_metal::distributed::MeshShape& shape) {
     uint32_t axis = 0;
     for (uint32_t i = 1; i < shape.dims(); ++i) {
@@ -108,11 +85,10 @@ xt::xarray<float> uniform(const std::array<size_t, 4>& shape, float bound, uint3
     return to_bf16(ttml::test_utils::make_uniform_xarray<float>(shape, -bound, bound, seed));
 }
 
-// Host reference: unmasked GQA SDPA on (B, H, S, D) queries and (B, G, S, D) keys/values.
 struct ForwardReference {
-    xt::xarray<float> output;         // (B, H, S, D)
-    xt::xarray<float> lse;            // (B, H, S): log sum_j exp(scale * q.k_j)
-    xt::xarray<float> probabilities;  // (B, H, S, S)
+    xt::xarray<float> output;
+    xt::xarray<float> lse;
+    xt::xarray<float> probabilities;
 };
 
 ForwardReference reference_forward(const xt::xarray<float>& q, const xt::xarray<float>& k, const xt::xarray<float>& v) {
@@ -158,8 +134,6 @@ struct Gradients {
     xt::xarray<float> dv;
 };
 
-// SDPA backward with the softmax correction u = rowsum(dO * O) taken from the supplied O,
-// exactly as the device kernels do with the attention output they are given.
 Gradients reference_backward(
     const xt::xarray<float>& q,
     const xt::xarray<float>& k,
@@ -210,19 +184,14 @@ double rel_l2(const xt::xarray<float>& actual, const xt::xarray<float>& expected
     return std::sqrt(diff / std::max(norm, 1e-30));
 }
 
-// Host data of one chunk: bf16-rounded inputs and FP32 references.
 struct Chunk {
     xt::xarray<float> q, k, v;
-    xt::xarray<float> o;    // attention output fed to backward (independent of the forward, see make_chunks)
-    xt::xarray<float> d_o;  // upstream gradient
+    xt::xarray<float> o;
+    xt::xarray<float> d_o;
     ForwardReference fw;
     Gradients bw;
 };
 
-// Two chunks with independent random data. For backward each chunk gets an independent random
-// attention output O, so u = rowsum(dO * O) is O(1) and dominates dS: a device that read the
-// other chunk's O (or a stale u_scaler) produces gradients far outside the tolerance, which the
-// test asserts explicitly via the cross-chunk reference.
 std::array<Chunk, 2> make_chunks(uint32_t seed) {
     std::array<Chunk, 2> chunks;
     for (uint32_t i = 0; i < 2; ++i) {
@@ -239,7 +208,6 @@ std::array<Chunk, 2> make_chunks(uint32_t seed) {
     return chunks;
 }
 
-// LSE in the (B, H, S, 32) FP32 intermediates layout the SDPA kernels use (column 0).
 xt::xarray<float> lse_to_intermediates(const xt::xarray<float>& lse) {
     const size_t B = lse.shape()[0], H = lse.shape()[1], S = lse.shape()[2];
     xt::xarray<float> out = xt::zeros<float>({B, H, S, size_t{32}});
@@ -280,7 +248,6 @@ std::vector<xt::xarray<float>> per_device(const ttnn::Tensor& tensor) {
     return ttml::core::to_xtensor<float>(tensor, ttml::core::IdentityComposer{});
 }
 
-// Ring position of the device at a row-major mesh index (the order get_device_tensors returns).
 uint32_t ring_id_of(uint32_t device_index, const tt::tt_metal::distributed::MeshShape& shape, uint32_t ring_axis) {
     uint32_t stride = 1;
     for (uint32_t i = shape.dims(); i-- > ring_axis + 1;) {
@@ -306,7 +273,6 @@ RingSetup ring_setup() {
     return RingSetup{mesh_shape, ring_axis, mesh_shape[ring_axis], static_cast<uint32_t>(mesh_shape.mesh_size())};
 }
 
-// Chunk the schedule assigns to a device; every device runs a chunk at steps 1..N-1.
 uint32_t active_chunk(uint32_t ring_id, uint32_t step, const RingSetup& ring, RingShiftDirection direction) {
     const auto work = get_ring_step_work(
         ring_id, step, ring.ring_size, AttentionMaskType::Causal, direction, RingLoadBalancing::ZigZag);
@@ -315,8 +281,7 @@ uint32_t active_chunk(uint32_t ring_id, uint32_t step, const RingSetup& ring, Ri
     return work.chunk;
 }
 
-// Runs `launch` for every (direction, step) twice: a program-cache miss, then a hit with fresh data at
-// new buffer addresses (tensors of the first pass stay alive, so the allocator cannot reuse them).
+// keep_alive holds the first pass's tensors so the cache-hit pass binds new buffer addresses.
 template <typename Launch>
 void for_each_direction_step_and_pass(const RingSetup& ring, Launch&& launch) {
     auto& device = ttml::autograd::ctx().get_device();
@@ -346,9 +311,6 @@ void for_each_direction_step_and_pass(const RingSetup& ring, Launch&& launch) {
     }
 }
 
-// One zig-zag forward call at (direction, step) with sentinel-filled outputs of both chunks in
-// `output_memory`, checked on every device: the assigned chunk matches its reference, the idle
-// chunk's outputs are untouched.
 void run_zigzag_forward_and_check(
     const RingSetup& ring,
     RingShiftDirection direction,
@@ -395,7 +357,6 @@ void run_zigzag_forward_and_check(
 
         EXPECT_LT(rel_l2(out_host[active][dev], chunks[active].fw.output), kForwardRelTol);
         EXPECT_LT(rel_l2(lse_column(inter_host[active][dev]), chunks[active].fw.lse), kForwardRelTol);
-        // The other chunk's reference must be far off, so a swapped binding cannot pass.
         EXPECT_GT(rel_l2(out_host[active][dev], chunks[idle].fw.output), 10 * kForwardRelTol);
 
         EXPECT_TRUE(all_equal(out_host[idle][dev], kSentinel)) << "wrote into the idle chunk's output";
@@ -414,9 +375,6 @@ TEST_F(RingSDPAChunkTest, ZigZagForwardBindsAssignedChunkPerDevice) {
         });
 }
 
-// The SDPA writer kernel is compiled for its output buffers' type (DRAM or L1), so the outputs'
-// memory config must be part of the program-cache key: the same step with L1 outputs must build
-// new programs instead of reusing the DRAM-output ones, and still write the right chunk.
 TEST_F(RingSDPAChunkTest, ZigZagForwardOutputMemoryConfigIsPartOfProgramCacheKey) {
     const auto ring = ring_setup();
     auto& device = ttml::autograd::ctx().get_device();
@@ -436,8 +394,6 @@ TEST_F(RingSDPAChunkTest, ZigZagBackwardBindsAssignedChunkPerDevice) {
     for_each_direction_step_and_pass(
         ring, [&](RingShiftDirection direction, uint32_t step, uint32_t seed, std::vector<ttnn::Tensor>& keep_alive) {
             const auto chunks = make_chunks(seed);
-            // Sanity check of the test's sensitivity: gradients computed with the other chunk's O
-            // (i.e. a wrong u = rowsum(dO * O)) must be far outside the tolerance.
             for (uint32_t chunk = 0; chunk < 2; ++chunk) {
                 const auto& l = chunks[chunk];
                 const auto wrong_u = reference_backward(l.q, l.k, l.v, chunks[1U - chunk].o, l.fw.probabilities, l.d_o);
@@ -509,7 +465,6 @@ TEST_F(RingSDPAChunkTest, ZigZagBackwardBindsAssignedChunkPerDevice) {
         });
 }
 
-// Load balancing is validated before any program is built, with a specific reason.
 TEST_F(RingSDPAChunkTest, ZigZagValidationRejectsInconsistentChunkArguments) {
     const auto ring = ring_setup();
     const auto chunks = make_chunks(4242U);
@@ -538,7 +493,6 @@ TEST_F(RingSDPAChunkTest, ZigZagValidationRejectsInconsistentChunkArguments) {
         .grad_key = filled(k.logical_shape(), 0.0F, ttnn::DataType::BFLOAT16),
         .grad_value = filled(v.logical_shape(), 0.0F, ttnn::DataType::BFLOAT16)};
 
-    // Second chunk with a different sequence length.
     const auto short_chunks = [] {
         auto q_short = uniform({kB, kH, kC / 2, kD}, kQScale, 7U);
         auto kv_short = uniform({kB, kG, kC / 2, kD}, 1.0F, 8U);
@@ -551,14 +505,12 @@ TEST_F(RingSDPAChunkTest, ZigZagValidationRejectsInconsistentChunkArguments) {
         .output = filled(short_chunks.first.logical_shape(), 0.0F, ttnn::DataType::BFLOAT16),
         .intermediates = filled(ttnn::Shape{kB, kH, kC / 2, 32}, 0.0F, ttnn::DataType::FLOAT32)};
 
-    // Chunk-0 outputs, required under zig-zag (devices that compute chunk 1 never write them).
     const auto out0 = filled(out_shape, 0.0F, ttnn::DataType::BFLOAT16);
     const auto inter0 = filled(inter_shape, 0.0F, ttnn::DataType::FLOAT32);
     const auto dq0 = filled(q.logical_shape(), 0.0F, ttnn::DataType::BFLOAT16);
     const auto dk0 = filled(k.logical_shape(), 0.0F, ttnn::DataType::BFLOAT16);
     const auto dv0 = filled(v.logical_shape(), 0.0F, ttnn::DataType::BFLOAT16);
 
-    // Second chunk whose output lives in L1 while chunk 0's is in DRAM.
     auto fw_l1_output_chunk = fw_chunk;
     fw_l1_output_chunk.output = filled(out_shape, 0.0F, ttnn::DataType::BFLOAT16, ttnn::L1_MEMORY_CONFIG);
     auto bw_l1_attn_output_chunk = bw_chunk;

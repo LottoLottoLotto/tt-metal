@@ -10,11 +10,7 @@
 
 namespace ttml::metal {
 
-// Returns [output, intermediates] of chunk 0. With RingLoadBalancing::ZigZag the devices
-// assigned chunk 1 at this step write into chunk1->output / chunk1->intermediates instead
-// and leave chunk 0's untouched, so preallocated_output and preallocated_intermediates are
-// required and every chunk-1 tensor must have its chunk-0 counterpart's spec
-// (see RingLoadBalancing in metal/ops/common/ring_sdpa_utils.hpp).
+// Returns [output, intermediates]
 std::tuple<ttnn::Tensor, ttnn::Tensor> ring_sdpa_fw(
     const ttnn::Tensor& query,
     const ttnn::Tensor& key,

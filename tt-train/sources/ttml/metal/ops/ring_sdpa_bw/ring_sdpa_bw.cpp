@@ -65,8 +65,7 @@ std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor> ring_sdpa_bw(
         load_balancing,
         q_chunk1);
 
-    // KV kernel: uses precomputed u_scaler (shared by both chunks: each device fills it for the
-    // one chunk it computes at this step)
+    // KV kernel: uses precomputed u_scaler, which each device filled for the chunk it computes
     auto [grad_K, grad_V] = ttnn::prim::ttml_ring_sdpa_bw_kv(
         grad_output,
         u_scaler,

@@ -17,9 +17,6 @@ namespace ttml::metal::ops::ring_sdpa_bw::kv {
 
 namespace {
 
-// SDPA backward-KV inputs/outputs of one device at one ring step: chunk 0 is the op's primary
-// tensors, chunk 1 the second-chunk tensors (RingLoadBalancing::ZigZag only). The u_scaler
-// input is shared by both chunks (the Q op filled it for the chunk this device computes).
 struct KVChunkRefs {
     const ttnn::Tensor& grad_output;
     const ttnn::Tensor& query;

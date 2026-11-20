@@ -22,13 +22,10 @@ struct RingSDPABwKVParams {
     uint32_t step = 0;
     ttml::metal::AttentionMaskType mask_type = ttml::metal::AttentionMaskType::None;
     RingDirection ring_direction =
-        ttnn_fixed::distributed::RingShiftDirection::Backward;   // Direction K/V is shifting in the ring
-    RingLoadBalancing load_balancing = RingLoadBalancing::None;  // See RingLoadBalancing in ring_sdpa_utils.hpp
+        ttnn_fixed::distributed::RingShiftDirection::Backward;  // Direction K/V is shifting in the ring
+    RingLoadBalancing load_balancing = RingLoadBalancing::None;
 };
 
-// Second-chunk tensors for RingLoadBalancing::ZigZag. Devices assigned chunk 1 at a step read
-// these and write grad_key / grad_value in place; u_scaler is the shared tensor produced
-// by the Q op for the chunk each device computes.
 struct RingSDPABwKVChunk {
     ttnn::Tensor grad_output;
     ttnn::Tensor query;
@@ -48,7 +45,7 @@ struct RingSDPABwKVInputs {
     ttnn::Tensor intermediates;
     std::optional<ttnn::Tensor> preallocated_grad_key;    // Preallocated output buffer
     std::optional<ttnn::Tensor> preallocated_grad_value;  // Preallocated output buffer
-    std::optional<RingSDPABwKVChunk> chunk1;              // Required iff load_balancing == ZigZag
+    std::optional<RingSDPABwKVChunk> chunk1;
 };
 
 using operation_attributes_t = RingSDPABwKVParams;

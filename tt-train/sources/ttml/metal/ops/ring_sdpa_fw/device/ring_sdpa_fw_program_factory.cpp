@@ -17,12 +17,9 @@ namespace ttml::metal::ops::ring_sdpa_fw {
 
 namespace {
 
-// SDPAForwardInputs holds the mask and gate as const references, so the "absent" value they
-// bind to must outlive the ChunkBinding returned below (a temporary std::nullopt would dangle).
+// SDPAForwardInputs holds mask and gate by const reference: a temporary std::nullopt would dangle.
 const std::optional<ttnn::Tensor> kNoTensor = std::nullopt;
 
-// SDPA forward inputs and outputs of one device at one ring step: chunk 0 is the op's
-// primary tensors, chunk 1 the second-chunk tensors (RingLoadBalancing::ZigZag only).
 struct ChunkBinding {
     ttml::metal::ops::sdpa_fw::device::tensor_args_t tensor_args;
     ttml::metal::ops::sdpa_fw::device::tensor_return_value_t return_value;
@@ -37,7 +34,7 @@ ChunkBinding bind_chunk(uint32_t chunk, const tensor_args_t& tensor_args, tensor
                 {.query = tensor_args.query,
                  .key = tensor_args.key,
                  .value = tensor_args.value,
-                 .mask = kNoTensor,  // No explicit mask - SDPA kernel generates causal mask internally
+                 .mask = kNoTensor,
                  .preallocated_intermediate = intermediates,
                  .preallocated_output = output,
                  .gate = kNoTensor},
@@ -86,7 +83,6 @@ RingSDPAFwProgramFactory::cached_mesh_workload_t RingSDPAFwProgramFactory::creat
     for (const auto& mesh_coord : ttnn::MeshCoordinateRange(mesh_shape)) {
         uint32_t device_ring_id = mesh_coord[ring_axis];
 
-        // Check if this device should execute at this step, with which mask and on which chunk
         const auto work =
             get_ring_step_work(device_ring_id, step, ring_size, mask_type, ring_direction, load_balancing);
 
@@ -146,7 +142,6 @@ void RingSDPAFwProgramFactory::override_runtime_arguments(
         // Get the mesh coordinate for this program (single coord range)
         const auto& start_coord = coord_range.start_coord();
 
-        // Determine this device's mask and chunk (only executing devices have a cached program)
         uint32_t device_ring_id = start_coord[ring_axis];
         const auto work =
             get_ring_step_work(device_ring_id, step, ring_size, mask_type, ring_direction, load_balancing);
