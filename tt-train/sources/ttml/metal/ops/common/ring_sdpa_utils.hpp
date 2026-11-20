@@ -129,19 +129,23 @@ inline void validate_ring_attributes(const RingAttrs& attrs, const ttnn::Tensor&
 
 template <typename RingAttrs>
 inline void validate_ring_load_balancing(const RingAttrs& attrs, bool has_second_chunk) {
-    if (attrs.load_balancing == RingLoadBalancing::None) {
-        TT_FATAL(!has_second_chunk, "Second-chunk tensors were given but load balancing is None");
-        return;
+    switch (attrs.load_balancing) {
+        case RingLoadBalancing::None:
+            TT_FATAL(!has_second_chunk, "Second-chunk tensors were given but load balancing is None");
+            return;
+        case RingLoadBalancing::ZigZag:
+            TT_FATAL(has_second_chunk, "Zig-zag load balancing requires the second-chunk tensors");
+            TT_FATAL(
+                attrs.mask_type == AttentionMaskType::Causal,
+                "Zig-zag load balancing requires a causal mask, got mask type {}",
+                static_cast<int>(attrs.mask_type));
+            TT_FATAL(
+                attrs.step != 0U,
+                "Zig-zag load balancing is not defined for step 0 (every device holds its own K/V); run step 0 as "
+                "one causal call over the full local sequence");
+            return;
     }
-    TT_FATAL(has_second_chunk, "Zig-zag load balancing requires the second-chunk tensors");
-    TT_FATAL(
-        attrs.mask_type == AttentionMaskType::Causal,
-        "Zig-zag load balancing requires a causal mask, got mask type {}",
-        static_cast<int>(attrs.mask_type));
-    TT_FATAL(
-        attrs.step != 0U,
-        "Zig-zag load balancing is not defined for step 0 (every device holds its own K/V); run step 0 as one "
-        "causal call over the full local sequence");
+    TT_THROW("Unknown load balancing {}", static_cast<int>(attrs.load_balancing));
 }
 
 // Devices computing chunk 1 never write chunk 0, so an op-allocated chunk-0 output would stay uninitialized.
