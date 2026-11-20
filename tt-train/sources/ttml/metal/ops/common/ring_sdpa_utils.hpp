@@ -17,17 +17,6 @@
 
 namespace ttml::metal::ops {
 
-// Causal load balancing of the ring ops: which tensors each device computes on at a ring step.
-// - None:   every executing device uses the single set of Q/K/V/output tensors.
-// - ZigZag: load-balanced causal layout. The sequence is cut into 2N global chunks and
-//           device d holds global chunks [d | 2N-1-d], so its local Q/K/V are two chunks:
-//           local chunk 0 (global chunk d for Q, global chunk src for the K/V it holds) and
-//           local chunk 1 (global chunk 2N-1-d for Q, 2N-1-src for K/V). The ring op computes
-//           the one same-chunk block that is visible at this step: (Q0, K0, V0) when src < d,
-//           (Q1, K1, V1) when src > d, both unmasked. The cross block (Q1, K0) is always
-//           fully visible and is computed by a separate mask-None call; (Q0, K1) is never
-//           visible; the src == d step is a plain causal call over the full local sequence
-//           (local order is monotone).
 enum class RingLoadBalancing : uint8_t { None = 0, ZigZag = 1 };
 
 // Source device of the K/V a device holds at a ring step:
@@ -90,7 +79,7 @@ struct RingStepWork {
 
 // Schedule used by the ring program factories. RingLoadBalancing::None is exactly
 // get_device_execution_info on chunk 0. RingLoadBalancing::ZigZag (causal only) returns
-// the unmasked same-chunk block described at RingLoadBalancing: chunk 0 when src < d,
+// the unmasked same-chunk block visible at this step: chunk 0 when src < d,
 // chunk 1 when src > d, and no work when src == d.
 inline RingStepWork get_ring_step_work(
     uint32_t device_ring_id,
