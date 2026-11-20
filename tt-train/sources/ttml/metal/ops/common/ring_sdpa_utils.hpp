@@ -168,28 +168,28 @@ inline void validate_ring_load_balancing(const RingAttrs& attrs, size_t chunk_co
 template <typename Chunk>
 inline void validate_chunk_list(const std::vector<Chunk>& chunks) {
     TT_FATAL(!chunks.empty(), "Ring SDPA needs at least one chunk");
-    for (size_t chunk = 0; chunk < chunks.size(); ++chunk) {
+    for (size_t c = 0; c < chunks.size(); ++c) {
         reflect::for_each(
             [&](auto field) {
                 TT_FATAL(
-                    reflect::get<field>(chunks[chunk]).tensor_attributes != nullptr,
+                    reflect::get<field>(chunks[c]).tensor_attributes != nullptr,
                     "Chunk {} '{}' is a default-constructed tensor",
-                    chunk,
-                    reflect::member_name<field>(chunks[chunk]));
+                    c,
+                    reflect::member_name<field>(chunks[c]));
             },
-            chunks[chunk]);
+            chunks[c]);
     }
 }
 
 // Each device builds its program from the chunk it computes, and chunk-sized buffers (u_scaler) serve every chunk.
 inline void validate_same_spec(
-    const ttnn::Tensor& tensor, const ttnn::Tensor& reference, std::string_view name, size_t chunk) {
+    const ttnn::Tensor& tensor, const ttnn::Tensor& reference, std::string_view name, size_t c) {
     TT_FATAL(
-        tensor.device() == reference.device(), "Chunk {} '{}' must be on the same mesh device as chunk 0", chunk, name);
+        tensor.device() == reference.device(), "Chunk {} '{}' must be on the same mesh device as chunk 0", c, name);
     TT_FATAL(
         tensor.tensor_spec() == reference.tensor_spec(),
         "Chunk {} '{}' spec {} must match chunk 0's spec {}",
-        chunk,
+        c,
         name,
         tensor.tensor_spec(),
         reference.tensor_spec());

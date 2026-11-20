@@ -16,6 +16,36 @@
 
 namespace ttml::metal::ops::ring_sdpa_bw::q {
 
+namespace {
+
+// SDPABackwardQInputs holds attn_mask and gate by const reference: a temporary std::nullopt would dangle.
+const std::optional<ttnn::Tensor> kNoTensor = std::nullopt;
+
+// SDPA backward Q args and outputs of the chunk a device computes.
+struct ChunkBinding {
+    ttml::metal::ops::sdpa_bw::device::q::tensor_args_t tensor_args;
+    ttml::metal::ops::sdpa_bw::device::q::tensor_return_value_t return_value;
+};
+
+ChunkBinding bind_chunk(const RingSDPABwQChunk& chunk, const ttnn::Tensor& u_scaler) {
+    return ChunkBinding{
+        .tensor_args =
+            {.grad_output = chunk.grad_output,
+             .attn_output = chunk.attn_output,
+             .query = chunk.query,
+             .key = chunk.key,
+             .value = chunk.value,
+             .attn_mask = kNoTensor,
+             .intermediates = chunk.intermediates,
+             .preallocated_grad_query = chunk.grad_query,
+             .preallocated_u_scaler = u_scaler,
+             .gate = kNoTensor,
+             .preallocated_grad_gate = std::nullopt},
+        .return_value = {chunk.grad_query, u_scaler, std::nullopt, std::nullopt}};
+}
+
+}  // namespace
+
 // ============== Backward Q Program Factory ==============
 
 RingSDPABwQProgramFactory::cached_mesh_workload_t RingSDPABwQProgramFactory::create_mesh_workload(
@@ -34,6 +64,7 @@ RingSDPABwQProgramFactory::cached_mesh_workload_t RingSDPABwQProgramFactory::cre
     const uint32_t step = operation_attributes.step;
     const auto mask_type = operation_attributes.mask_type;
     const auto ring_direction = operation_attributes.ring_direction;
+    const auto load_balancing = operation_attributes.load_balancing;
 
     tt::tt_metal::distributed::MeshWorkload mesh_workload;
     std::unordered_map<tt::tt_metal::distributed::MeshCoordinateRange, shared_variables_t> shared_vars;
@@ -41,37 +72,19 @@ RingSDPABwQProgramFactory::cached_mesh_workload_t RingSDPABwQProgramFactory::cre
     for (const auto& mesh_coord : ttnn::MeshCoordinateRange(mesh_shape)) {
         uint32_t device_ring_id = mesh_coord[ring_axis];
 
-        const auto work = get_ring_step_work(
-            device_ring_id, step, ring_size, mask_type, ring_direction, operation_attributes.load_balancing);
-        const auto effective_mask_type = work.mask_type;
+        const auto work =
+            get_ring_step_work(device_ring_id, step, ring_size, mask_type, ring_direction, load_balancing);
 
         if (!work.execute) {
             continue;
         }
-        const auto& chunk = tensor_args.chunks[work.chunk];
 
         // Create SDPA backward Q with mask_type (no explicit mask tensor needed)
-        sdpa_q::operation_attributes_t sdpa_attrs{.mask_type = effective_mask_type, .dropout_probability = 0.0F};
-
-        auto& u_scaler = tensor_return_value.u_scaler;
-
-        sdpa_q::tensor_args_t sdpa_tensor_args{
-            .grad_output = chunk.grad_output,
-            .attn_output = chunk.attn_output,
-            .query = chunk.query,
-            .key = chunk.key,
-            .value = chunk.value,
-            .attn_mask = std::nullopt,
-            .intermediates = chunk.intermediates,
-            .preallocated_grad_query = chunk.grad_query,
-            .preallocated_u_scaler = u_scaler,
-            .gate = std::nullopt,
-            .preallocated_grad_gate = std::nullopt};
-
-        sdpa_q::tensor_return_value_t sdpa_return_value{chunk.grad_query, u_scaler, std::nullopt, std::nullopt};
+        sdpa_q::operation_attributes_t sdpa_attrs{.mask_type = work.mask_type, .dropout_probability = 0.0F};
+        auto binding = bind_chunk(tensor_args.chunks[work.chunk], tensor_return_value.u_scaler);
 
         auto cached_program =
-            sdpa_bw::device::SDPABackwardQProgramFactory::create(sdpa_attrs, sdpa_tensor_args, sdpa_return_value);
+            sdpa_bw::device::SDPABackwardQProgramFactory::create(sdpa_attrs, binding.tensor_args, binding.return_value);
 
         // Store SDPA shared variables for runtime argument override
         const auto& sdpa_vars = cached_program.shared_variables;
@@ -109,6 +122,7 @@ void RingSDPABwQProgramFactory::override_runtime_arguments(
     const uint32_t step = operation_attributes.step;
     const auto mask_type = operation_attributes.mask_type;
     const auto ring_direction = operation_attributes.ring_direction;
+    const auto load_balancing = operation_attributes.load_balancing;
 
     for (auto& [coord_range, program] : cached_workload.workload.get_programs()) {
         auto& shared_vars = cached_workload.shared_variables.at(coord_range);
@@ -116,29 +130,13 @@ void RingSDPABwQProgramFactory::override_runtime_arguments(
 
         // Determine effective mask type for this device
         uint32_t device_ring_id = start_coord[ring_axis];
-        const auto work = get_ring_step_work(
-            device_ring_id, step, ring_size, mask_type, ring_direction, operation_attributes.load_balancing);
-        const auto effective_mask_type = work.mask_type;
+        const auto work =
+            get_ring_step_work(device_ring_id, step, ring_size, mask_type, ring_direction, load_balancing);
         TT_FATAL(work.execute, "Cached ring SDPA backward program found for a device that does not execute");
-        const auto& chunk = tensor_args.chunks[work.chunk];
 
         // Create SDPA attributes and tensor args
-        sdpa_q::operation_attributes_t sdpa_attrs{.mask_type = effective_mask_type, .dropout_probability = 0.0F};
-
-        sdpa_q::tensor_args_t sdpa_tensor_args{
-            .grad_output = chunk.grad_output,
-            .attn_output = chunk.attn_output,
-            .query = chunk.query,
-            .key = chunk.key,
-            .value = chunk.value,
-            .attn_mask = std::nullopt,
-            .intermediates = chunk.intermediates,
-            .preallocated_grad_query = chunk.grad_query,
-            .preallocated_u_scaler = u_scaler,
-            .gate = std::nullopt,
-            .preallocated_grad_gate = std::nullopt};
-
-        sdpa_q::tensor_return_value_t sdpa_return_value{chunk.grad_query, u_scaler, std::nullopt, std::nullopt};
+        sdpa_q::operation_attributes_t sdpa_attrs{.mask_type = work.mask_type, .dropout_probability = 0.0F};
+        auto binding = bind_chunk(tensor_args.chunks[work.chunk], u_scaler);
 
         // Convert our shared_variables to SDPA's shared_variables type
         sdpa_bw::device::SDPABackwardQProgramFactory::shared_variables_t sdpa_shared_vars{
@@ -156,7 +154,7 @@ void RingSDPABwQProgramFactory::override_runtime_arguments(
             sdpa_bw::device::SDPABackwardQProgramFactory::cached_program_t::proxy(program, sdpa_shared_vars);
 
         sdpa_bw::device::SDPABackwardQProgramFactory::override_runtime_arguments(
-            cached_program, sdpa_attrs, sdpa_tensor_args, sdpa_return_value);
+            cached_program, sdpa_attrs, binding.tensor_args, binding.return_value);
     }
 }
 

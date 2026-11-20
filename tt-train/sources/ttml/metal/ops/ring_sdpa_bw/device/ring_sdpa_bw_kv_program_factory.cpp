@@ -14,6 +14,35 @@
 #include "ring_sdpa_bw_kv_device_operation_types.hpp"
 
 namespace ttml::metal::ops::ring_sdpa_bw::kv {
+
+namespace {
+
+// SDPABackwardKVInputs holds attn_mask by const reference: a temporary std::nullopt would dangle.
+const std::optional<ttnn::Tensor> kNoTensor = std::nullopt;
+
+// SDPA backward KV args and outputs of the chunk a device computes.
+struct ChunkBinding {
+    ttml::metal::ops::sdpa_bw::device::kv::tensor_args_t tensor_args;
+    ttml::metal::ops::sdpa_bw::device::kv::tensor_return_value_t return_value;
+};
+
+ChunkBinding bind_chunk(const RingSDPABwKVChunk& chunk, const ttnn::Tensor& u_scaler) {
+    return ChunkBinding{
+        .tensor_args =
+            {.grad_output = chunk.grad_output,
+             .query = chunk.query,
+             .key = chunk.key,
+             .value = chunk.value,
+             .attn_mask = kNoTensor,
+             .intermediates = chunk.intermediates,
+             .u_scaler = u_scaler,
+             .preallocated_grad_key = chunk.grad_key,
+             .preallocated_grad_value = chunk.grad_value},
+        .return_value = {chunk.grad_key, chunk.grad_value}};
+}
+
+}  // namespace
+
 // ============== Backward KV Program Factory ==============
 
 RingSDPABwKVProgramFactory::cached_mesh_workload_t RingSDPABwKVProgramFactory::create_mesh_workload(
@@ -34,6 +63,7 @@ RingSDPABwKVProgramFactory::cached_mesh_workload_t RingSDPABwKVProgramFactory::c
     const uint32_t step = operation_attributes.step;
     const auto mask_type = operation_attributes.mask_type;
     const auto ring_direction = operation_attributes.ring_direction;
+    const auto load_balancing = operation_attributes.load_balancing;
 
     tt::tt_metal::distributed::MeshWorkload mesh_workload;
     std::unordered_map<tt::tt_metal::distributed::MeshCoordinateRange, shared_variables_t> shared_vars;
@@ -41,32 +71,18 @@ RingSDPABwKVProgramFactory::cached_mesh_workload_t RingSDPABwKVProgramFactory::c
     for (const auto& mesh_coord : ttnn::MeshCoordinateRange(mesh_shape)) {
         uint32_t device_ring_id = mesh_coord[ring_axis];
 
-        const auto work = get_ring_step_work(
-            device_ring_id, step, ring_size, mask_type, ring_direction, operation_attributes.load_balancing);
-        const auto effective_mask_type = work.mask_type;
+        const auto work =
+            get_ring_step_work(device_ring_id, step, ring_size, mask_type, ring_direction, load_balancing);
 
         if (!work.execute) {
             continue;
         }
-        const auto& chunk = tensor_args.chunks[work.chunk];
 
-        sdpa_kv::operation_attributes_t sdpa_attrs{.mask_type = effective_mask_type, .dropout_probability = 0.0F};
+        sdpa_kv::operation_attributes_t sdpa_attrs{.mask_type = work.mask_type, .dropout_probability = 0.0F};
+        auto binding = bind_chunk(tensor_args.chunks[work.chunk], u_scaler);
 
-        sdpa_kv::tensor_args_t sdpa_tensor_args{
-            .grad_output = chunk.grad_output,
-            .query = chunk.query,
-            .key = chunk.key,
-            .value = chunk.value,
-            .attn_mask = std::nullopt,
-            .intermediates = chunk.intermediates,
-            .u_scaler = u_scaler,
-            .preallocated_grad_key = chunk.grad_key,
-            .preallocated_grad_value = chunk.grad_value};
-
-        sdpa_kv::tensor_return_value_t sdpa_return_value{chunk.grad_key, chunk.grad_value};
-
-        auto cached_program =
-            sdpa_bw::device::SDPABackwardKVProgramFactory::create(sdpa_attrs, sdpa_tensor_args, sdpa_return_value);
+        auto cached_program = sdpa_bw::device::SDPABackwardKVProgramFactory::create(
+            sdpa_attrs, binding.tensor_args, binding.return_value);
 
         // Store SDPA shared variables for runtime argument override
         const auto& sdpa_vars = cached_program.shared_variables;
@@ -104,32 +120,19 @@ void RingSDPABwKVProgramFactory::override_runtime_arguments(
     const uint32_t step = operation_attributes.step;
     const auto mask_type = operation_attributes.mask_type;
     const auto ring_direction = operation_attributes.ring_direction;
+    const auto load_balancing = operation_attributes.load_balancing;
 
     for (auto& [coord_range, program] : cached_workload.workload.get_programs()) {
         auto& shared_vars = cached_workload.shared_variables.at(coord_range);
         const auto& start_coord = coord_range.start_coord();
 
         uint32_t device_ring_id = start_coord[ring_axis];
-        const auto work = get_ring_step_work(
-            device_ring_id, step, ring_size, mask_type, ring_direction, operation_attributes.load_balancing);
-        const auto effective_mask_type = work.mask_type;
+        const auto work =
+            get_ring_step_work(device_ring_id, step, ring_size, mask_type, ring_direction, load_balancing);
         TT_FATAL(work.execute, "Cached ring SDPA backward program found for a device that does not execute");
-        const auto& chunk = tensor_args.chunks[work.chunk];
 
-        sdpa_kv::operation_attributes_t sdpa_attrs{.mask_type = effective_mask_type, .dropout_probability = 0.0F};
-
-        sdpa_kv::tensor_args_t sdpa_tensor_args{
-            .grad_output = chunk.grad_output,
-            .query = chunk.query,
-            .key = chunk.key,
-            .value = chunk.value,
-            .attn_mask = std::nullopt,
-            .intermediates = chunk.intermediates,
-            .u_scaler = u_scaler,
-            .preallocated_grad_key = chunk.grad_key,
-            .preallocated_grad_value = chunk.grad_value};
-
-        sdpa_kv::tensor_return_value_t sdpa_return_value{chunk.grad_key, chunk.grad_value};
+        sdpa_kv::operation_attributes_t sdpa_attrs{.mask_type = work.mask_type, .dropout_probability = 0.0F};
+        auto binding = bind_chunk(tensor_args.chunks[work.chunk], u_scaler);
 
         // Convert our shared_variables to SDPA's shared_variables type
         sdpa_bw::device::SDPABackwardKVProgramFactory::shared_variables_t sdpa_shared_vars{
@@ -147,7 +150,7 @@ void RingSDPABwKVProgramFactory::override_runtime_arguments(
             sdpa_bw::device::SDPABackwardKVProgramFactory::cached_program_t::proxy(program, sdpa_shared_vars);
 
         sdpa_bw::device::SDPABackwardKVProgramFactory::override_runtime_arguments(
-            cached_program, sdpa_attrs, sdpa_tensor_args, sdpa_return_value);
+            cached_program, sdpa_attrs, binding.tensor_args, binding.return_value);
     }
 }
 

@@ -30,6 +30,7 @@ using ::testing::ThrowsMessage;
 using ttml::metal::AttentionMaskType;
 using ttml::metal::ops::get_ring_step_work;
 using ttml::metal::ops::RingLoadBalancing;
+using ttml::metal::ops::ring_sdpa_bw::kv::RingSDPABwKVChunk;
 using ttml::ttnn_fixed::distributed::RingShiftDirection;
 
 constexpr float kSentinel = 7.0F;
@@ -335,6 +336,17 @@ ttml::metal::RingSDPABwChunk upload_bw_chunk(const Chunk& chunk) {
         .grad_value = filled(ttnn::Shape{kB, kG, kC, kD}, kSentinel, ttnn::DataType::BFLOAT16)};
 }
 
+RingSDPABwKVChunk to_kv_chunk(const ttml::metal::RingSDPABwChunk& chunk) {
+    return {
+        .grad_output = chunk.grad_output,
+        .query = chunk.query,
+        .key = chunk.key,
+        .value = chunk.value,
+        .intermediates = chunk.intermediates,
+        .grad_key = chunk.grad_key,
+        .grad_value = chunk.grad_value};
+}
+
 void keep(std::vector<ttnn::Tensor>& keep_alive, const ttml::metal::RingSDPAFwChunk& chunk) {
     keep_alive.insert(keep_alive.end(), {chunk.query, chunk.key, chunk.value, chunk.output, chunk.intermediates});
 }
@@ -417,11 +429,9 @@ void run_zigzag_forward_and_check(
     RingShiftDirection direction,
     uint32_t step,
     uint32_t seed,
-    std::vector<ttnn::Tensor>& keep_alive,
-    const ttnn::MemoryConfig& output_memory = ttnn::DRAM_MEMORY_CONFIG) {
+    std::vector<ttnn::Tensor>& keep_alive) {
     const auto data = make_chunks(seed);
-    const std::vector<ttml::metal::RingSDPAFwChunk> fw_chunks{
-        upload_fw_chunk(data[0], output_memory), upload_fw_chunk(data[1], output_memory)};
+    const std::vector<ttml::metal::RingSDPAFwChunk> fw_chunks{upload_fw_chunk(data[0]), upload_fw_chunk(data[1])};
     for (const auto& chunk : fw_chunks) {
         keep(keep_alive, chunk);
     }
@@ -462,6 +472,26 @@ auto launch_bw(
     };
 }
 
+auto launch_bw_kv(
+    const RingSetup& ring,
+    std::vector<RingSDPABwKVChunk> chunks,
+    uint32_t step,
+    AttentionMaskType mask_type,
+    RingLoadBalancing load_balancing) {
+    const auto u_scaler = filled(ttnn::Shape{1, 1, kB * kH * kC, 32}, 0.0F, ttnn::DataType::FLOAT32);
+    return [ring, chunks = std::move(chunks), u_scaler, step, mask_type, load_balancing] {
+        ttnn::prim::ttml_ring_sdpa_bw_kv(
+            chunks,
+            u_scaler,
+            ring.ring_size,
+            ring.ring_axis,
+            step,
+            mask_type,
+            RingShiftDirection::Backward,
+            load_balancing);
+    };
+}
+
 }  // namespace
 
 TEST_F(RingSDPAChunkTest, ZigZagForwardBindsAssignedChunkPerDevice) {
@@ -472,17 +502,17 @@ TEST_F(RingSDPAChunkTest, ZigZagForwardBindsAssignedChunkPerDevice) {
         });
 }
 
-TEST_F(RingSDPAChunkTest, ZigZagForwardOutputMemoryConfigIsPartOfProgramCacheKey) {
+TEST_F(RingSDPAChunkTest, ContiguousAndZigZagCallsGetSeparateProgramCacheEntries) {
     const auto ring = ring_setup();
     auto& device = ttml::autograd::ctx().get_device();
-    std::vector<ttnn::Tensor> keep_alive;
+    const auto data = make_chunks(11U);
+    const std::vector<ttml::metal::RingSDPAFwChunk> fw_chunks{upload_fw_chunk(data[0]), upload_fw_chunk(data[1])};
 
-    run_zigzag_forward_and_check(ring, RingShiftDirection::Backward, /*step=*/1U, /*seed=*/11U, keep_alive);
-    const auto entries_after_dram = device.num_program_cache_entries();
-    run_zigzag_forward_and_check(
-        ring, RingShiftDirection::Backward, /*step=*/1U, /*seed=*/12U, keep_alive, ttnn::L1_MEMORY_CONFIG);
-    EXPECT_GT(device.num_program_cache_entries(), entries_after_dram)
-        << "L1 outputs must not reuse the programs built for DRAM outputs";
+    launch_fw(ring, {fw_chunks[0]}, 1U, AttentionMaskType::Causal, RingLoadBalancing::None)();
+    const auto entries_after_contiguous = device.num_program_cache_entries();
+    launch_fw(ring, fw_chunks, 1U, AttentionMaskType::Causal, RingLoadBalancing::ZigZag)();
+    EXPECT_GT(device.num_program_cache_entries(), entries_after_contiguous)
+        << "a zig-zag call must not reuse the programs built for a contiguous call";
 }
 
 TEST_F(RingSDPAChunkTest, ZigZagBackwardBindsAssignedChunkPerDevice) {
@@ -492,10 +522,11 @@ TEST_F(RingSDPAChunkTest, ZigZagBackwardBindsAssignedChunkPerDevice) {
         ring, [&](RingShiftDirection direction, uint32_t step, uint32_t seed, std::vector<ttnn::Tensor>& keep_alive) {
             const auto data = make_chunks(seed);
             for (uint32_t chunk = 0; chunk < 2; ++chunk) {
-                const auto& l = data[chunk];
-                const auto wrong_u = reference_backward(l.q, l.k, l.v, data[1U - chunk].o, l.fw.probabilities, l.d_o);
-                ASSERT_GT(rel_l2(wrong_u.dq, l.bw.dq), 4 * kBackwardRelTol);
-                ASSERT_GT(rel_l2(wrong_u.dk, l.bw.dk), 4 * kBackwardRelTol);
+                const auto& own = data[chunk];
+                const auto wrong_u =
+                    reference_backward(own.q, own.k, own.v, data[1U - chunk].o, own.fw.probabilities, own.d_o);
+                ASSERT_GT(rel_l2(wrong_u.dq, own.bw.dq), 4 * kBackwardRelTol);
+                ASSERT_GT(rel_l2(wrong_u.dk, own.bw.dk), 4 * kBackwardRelTol);
             }
 
             const std::vector<ttml::metal::RingSDPABwChunk> bw_chunks{
@@ -683,6 +714,8 @@ TEST_F(RingSDPAChunkTest, ValidationRejectsChunksWhoseSpecsDifferFromChunkZero) 
     auto bw_l1_attn_output_chunk = upload_bw_chunk(data[1]);
     bw_l1_attn_output_chunk.attn_output =
         ttnn::to_memory_config(bw_l1_attn_output_chunk.attn_output, ttnn::L1_MEMORY_CONFIG);
+    auto bw_kv_l1_grad_key_chunk = to_kv_chunk(upload_bw_chunk(data[1]));
+    bw_kv_l1_grad_key_chunk.grad_key = ttnn::to_memory_config(bw_kv_l1_grad_key_chunk.grad_key, ttnn::L1_MEMORY_CONFIG);
 
     EXPECT_THAT(
         launch_fw(ring, {fw_chunk, fw_short_chunk}, 1U, AttentionMaskType::Causal, RingLoadBalancing::ZigZag),
@@ -691,14 +724,20 @@ TEST_F(RingSDPAChunkTest, ValidationRejectsChunksWhoseSpecsDifferFromChunkZero) 
         launch_fw(ring, {fw_chunk, fw_l1_output_chunk}, 1U, AttentionMaskType::Causal, RingLoadBalancing::ZigZag),
         ThrowsMessage<std::runtime_error>(HasSubstr("Chunk 1 'output'")));
     EXPECT_THAT(
-        launch_bw(
-            ring, {bw_chunk, bw_l1_attn_output_chunk}, 1U, AttentionMaskType::Causal, RingLoadBalancing::ZigZag),
+        launch_bw(ring, {bw_chunk, bw_l1_attn_output_chunk}, 1U, AttentionMaskType::Causal, RingLoadBalancing::ZigZag),
         ThrowsMessage<std::runtime_error>(HasSubstr("Chunk 1 'attn_output'")));
+    EXPECT_THAT(
+        launch_bw_kv(
+            ring,
+            {to_kv_chunk(bw_chunk), bw_kv_l1_grad_key_chunk},
+            1U,
+            AttentionMaskType::Causal,
+            RingLoadBalancing::ZigZag),
+        ThrowsMessage<std::runtime_error>(HasSubstr("Chunk 1 'grad_key'")));
 }
 
 TEST_F(RingSDPAChunkTest, ValidationRejectsEmptyChunkListBeforeLaunch) {
     const auto ring = ring_setup();
-    const auto u_scaler = filled(ttnn::Shape{1, 1, kB * kH * kC, 32}, 0.0F, ttnn::DataType::FLOAT32);
 
     EXPECT_THAT(
         launch_fw(ring, {}, 1U, AttentionMaskType::Causal, RingLoadBalancing::None),
@@ -707,10 +746,7 @@ TEST_F(RingSDPAChunkTest, ValidationRejectsEmptyChunkListBeforeLaunch) {
         [&] { ttnn::prim::ttml_ring_sdpa_bw_q({}, ring.ring_size, ring.ring_axis, 1U, AttentionMaskType::Causal); },
         ThrowsMessage<std::runtime_error>(HasSubstr("needs at least one chunk")));
     EXPECT_THAT(
-        [&] {
-            ttnn::prim::ttml_ring_sdpa_bw_kv(
-                {}, u_scaler, ring.ring_size, ring.ring_axis, 1U, AttentionMaskType::Causal);
-        },
+        launch_bw_kv(ring, {}, 1U, AttentionMaskType::Causal, RingLoadBalancing::None),
         ThrowsMessage<std::runtime_error>(HasSubstr("needs at least one chunk")));
 }
 
@@ -721,6 +757,8 @@ TEST_F(RingSDPAChunkTest, ValidationRejectsDefaultConstructedChunkTensorBeforeLa
     fw_chunk.output = ttnn::Tensor();
     auto bw_chunk = upload_bw_chunk(data[0]);
     bw_chunk.grad_query = ttnn::Tensor();
+    auto bw_kv_chunk = to_kv_chunk(bw_chunk);
+    bw_kv_chunk.grad_key = ttnn::Tensor();
 
     EXPECT_THAT(
         launch_fw(ring, {fw_chunk}, 1U, AttentionMaskType::Causal, RingLoadBalancing::None),
@@ -728,4 +766,7 @@ TEST_F(RingSDPAChunkTest, ValidationRejectsDefaultConstructedChunkTensorBeforeLa
     EXPECT_THAT(
         launch_bw(ring, {bw_chunk}, 1U, AttentionMaskType::Causal, RingLoadBalancing::None),
         ThrowsMessage<std::runtime_error>(HasSubstr("Chunk 0 'grad_query' is a default-constructed tensor")));
+    EXPECT_THAT(
+        launch_bw_kv(ring, {bw_kv_chunk}, 1U, AttentionMaskType::Causal, RingLoadBalancing::None),
+        ThrowsMessage<std::runtime_error>(HasSubstr("Chunk 0 'grad_key' is a default-constructed tensor")));
 }
