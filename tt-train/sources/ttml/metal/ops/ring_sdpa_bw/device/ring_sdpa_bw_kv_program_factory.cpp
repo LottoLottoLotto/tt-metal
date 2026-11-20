@@ -18,7 +18,7 @@ namespace ttml::metal::ops::ring_sdpa_bw::kv {
 namespace {
 
 // SDPA backward-KV inputs/outputs of one device at one ring step: chunk 0 is the op's primary
-// tensors, chunk 1 the second-chunk tensors (RingChunkSelection::ZigZag only). The u_scaler
+// tensors, chunk 1 the second-chunk tensors (RingLoadBalancing::ZigZag only). The u_scaler
 // input is shared by both chunks (the Q op filled it for the chunk this device computes).
 struct KVChunkRefs {
     const ttnn::Tensor& grad_output;
@@ -86,7 +86,7 @@ RingSDPABwKVProgramFactory::cached_mesh_workload_t RingSDPABwKVProgramFactory::c
         uint32_t device_ring_id = mesh_coord[ring_axis];
 
         const auto work = get_ring_step_work(
-            device_ring_id, step, ring_size, mask_type, ring_direction, operation_attributes.chunk_selection);
+            device_ring_id, step, ring_size, mask_type, ring_direction, operation_attributes.load_balancing);
         const auto effective_mask_type = work.mask_type;
 
         if (!work.execute) {
@@ -155,7 +155,7 @@ void RingSDPABwKVProgramFactory::override_runtime_arguments(
 
         uint32_t device_ring_id = start_coord[ring_axis];
         const auto work = get_ring_step_work(
-            device_ring_id, step, ring_size, mask_type, ring_direction, operation_attributes.chunk_selection);
+            device_ring_id, step, ring_size, mask_type, ring_direction, operation_attributes.load_balancing);
         const auto effective_mask_type = work.mask_type;
         TT_FATAL(work.execute, "Cached ring SDPA backward program found for a device that does not execute");
         const auto chunk = select_chunk(work.chunk, tensor_args, tensor_return_value);

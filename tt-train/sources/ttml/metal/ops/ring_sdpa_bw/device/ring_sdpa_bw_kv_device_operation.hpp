@@ -50,7 +50,7 @@ ttml::metal::ops::ring_sdpa_bw::kv::RingSDPABwKVDeviceOperation::tensor_return_v
         ttml::metal::ops::ring_sdpa_bw::RingDirection::Backward,
     const std::optional<ttnn::Tensor>& preallocated_grad_key = std::nullopt,
     const std::optional<ttnn::Tensor>& preallocated_grad_value = std::nullopt,
-    ttml::metal::ops::RingChunkSelection chunk_selection = ttml::metal::ops::RingChunkSelection::None,
+    ttml::metal::ops::RingLoadBalancing load_balancing = ttml::metal::ops::RingLoadBalancing::None,
     const std::optional<ttml::metal::ops::ring_sdpa_bw::kv::RingSDPABwKVChunk>& chunk1 = std::nullopt);
 
 }  // namespace ttnn::prim

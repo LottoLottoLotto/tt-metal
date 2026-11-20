@@ -25,7 +25,7 @@ std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor> ring_sdpa_bw(
     const std::optional<ttnn::Tensor>& preallocated_grad_query,
     const std::optional<ttnn::Tensor>& preallocated_grad_key,
     const std::optional<ttnn::Tensor>& preallocated_grad_value,
-    ops::RingChunkSelection chunk_selection,
+    ops::RingLoadBalancing load_balancing,
     const std::optional<RingSDPABwChunk>& chunk1) {
     std::optional<ops::ring_sdpa_bw::q::RingSDPABwQChunk> q_chunk1;
     std::optional<ops::ring_sdpa_bw::kv::RingSDPABwKVChunk> kv_chunk1;
@@ -62,7 +62,7 @@ std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor> ring_sdpa_bw(
         mask_type,
         ring_direction,
         preallocated_grad_query,
-        chunk_selection,
+        load_balancing,
         q_chunk1);
 
     // KV kernel: uses precomputed u_scaler (shared by both chunks: each device fills it for the
@@ -81,7 +81,7 @@ std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor> ring_sdpa_bw(
         ring_direction,
         preallocated_grad_key,
         preallocated_grad_value,
-        chunk_selection,
+        load_balancing,
         kv_chunk1);
 
     return {grad_Q, grad_K, grad_V};

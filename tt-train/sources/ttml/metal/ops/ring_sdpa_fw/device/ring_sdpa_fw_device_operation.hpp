@@ -45,7 +45,7 @@ ttml::metal::ops::ring_sdpa_fw::RingSDPAFwDeviceOperation::tensor_return_value_t
         ttml::metal::ops::ring_sdpa_fw::RingDirection::Backward,
     const std::optional<ttnn::Tensor>& preallocated_output = std::nullopt,
     const std::optional<ttnn::Tensor>& preallocated_intermediates = std::nullopt,
-    ttml::metal::ops::RingChunkSelection chunk_selection = ttml::metal::ops::RingChunkSelection::None,
+    ttml::metal::ops::RingLoadBalancing load_balancing = ttml::metal::ops::RingLoadBalancing::None,
     const std::optional<ttml::metal::ops::ring_sdpa_fw::RingSDPAFwChunk>& chunk1 = std::nullopt);
 
 }  // namespace ttnn::prim

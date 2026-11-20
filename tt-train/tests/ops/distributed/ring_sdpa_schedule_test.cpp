@@ -24,7 +24,7 @@ namespace {
 using ttml::metal::AttentionMaskType;
 using ttml::metal::ops::get_device_execution_info;
 using ttml::metal::ops::get_ring_step_work;
-using ttml::metal::ops::RingChunkSelection;
+using ttml::metal::ops::RingLoadBalancing;
 using ttml::metal::ops::RingStepWork;
 using ttml::ttnn_fixed::distributed::RingShiftDirection;
 
@@ -137,8 +137,8 @@ TEST(RingSDPAScheduleTest, CausalScheduleInvariants) {
     }
 }
 
-// RingChunkSelection::None is exactly the classic schedule on chunk 0.
-TEST(RingSDPAScheduleTest, ChunkSelectionNoneMatchesExecutionInfo) {
+// RingLoadBalancing::None is exactly the classic schedule on chunk 0.
+TEST(RingSDPAScheduleTest, LoadBalancingNoneMatchesExecutionInfo) {
     for (auto direction : {RingShiftDirection::Forward, RingShiftDirection::Backward}) {
         for (auto mask_type : {AttentionMaskType::None, AttentionMaskType::Causal}) {
             for (uint32_t ring_size : {1U, 2U, 3U, 8U}) {
@@ -148,7 +148,7 @@ TEST(RingSDPAScheduleTest, ChunkSelectionNoneMatchesExecutionInfo) {
                             get_device_execution_info(device, step, ring_size, mask_type, direction);
                         const RingStepWork expected{.execute = execute, .mask_type = mask, .chunk = 0U};
                         EXPECT_EQ(
-                            get_ring_step_work(device, step, ring_size, mask_type, direction, RingChunkSelection::None),
+                            get_ring_step_work(device, step, ring_size, mask_type, direction, RingLoadBalancing::None),
                             expected)
                             << "ring " << ring_size << " device " << device << " step " << step;
                     }
@@ -193,7 +193,7 @@ TEST(RingSDPAScheduleTest, ZigZagRing4BackwardTable) {
             4U,
             AttentionMaskType::Causal,
             RingShiftDirection::Backward,
-            RingChunkSelection::ZigZag);
+            RingLoadBalancing::ZigZag);
         EXPECT_EQ(work.execute, row.execute) << "device " << row.device << " step " << row.step;
         EXPECT_EQ(work.mask_type, AttentionMaskType::None) << "device " << row.device << " step " << row.step;
         if (row.execute) {
@@ -236,7 +236,7 @@ TEST(RingSDPAScheduleTest, ZigZagCoversCausalTriangleExactlyOnceAndBalances) {
                         work_units += 1.0;
                     }
                     const auto work = get_ring_step_work(
-                        device, step, ring_size, AttentionMaskType::Causal, direction, RingChunkSelection::ZigZag);
+                        device, step, ring_size, AttentionMaskType::Causal, direction, RingLoadBalancing::ZigZag);
                     EXPECT_EQ(work.execute, step != 0)
                         << "ring " << ring_size << " device " << device << " step " << step;
                     if (work.execute) {
@@ -270,5 +270,5 @@ TEST(RingSDPAScheduleTest, ZigZagCoversCausalTriangleExactlyOnceAndBalances) {
 
 TEST(RingSDPAScheduleTest, ZigZagRequiresCausalMask) {
     EXPECT_ANY_THROW(get_ring_step_work(
-        1U, 1U, 4U, AttentionMaskType::None, RingShiftDirection::Backward, RingChunkSelection::ZigZag));
+        1U, 1U, 4U, AttentionMaskType::None, RingShiftDirection::Backward, RingLoadBalancing::ZigZag));
 }

@@ -19,7 +19,7 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> ring_sdpa_fw(
     ops::ring_sdpa_fw::RingDirection ring_direction,
     const std::optional<ttnn::Tensor>& preallocated_output,
     const std::optional<ttnn::Tensor>& preallocated_intermediates,
-    ops::RingChunkSelection chunk_selection,
+    ops::RingLoadBalancing load_balancing,
     const std::optional<ops::ring_sdpa_fw::RingSDPAFwChunk>& chunk1) {
     return ttnn::prim::ttml_ring_sdpa_fw(
         query,
@@ -32,7 +32,7 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> ring_sdpa_fw(
         ring_direction,
         preallocated_output,
         preallocated_intermediates,
-        chunk_selection,
+        load_balancing,
         chunk1);
 }
 

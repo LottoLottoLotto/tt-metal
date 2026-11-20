@@ -22,7 +22,7 @@ namespace {
 const std::optional<ttnn::Tensor> kNoTensor = std::nullopt;
 
 // SDPA forward inputs and outputs of one device at one ring step: chunk 0 is the op's
-// primary tensors, chunk 1 the second-chunk tensors (RingChunkSelection::ZigZag only).
+// primary tensors, chunk 1 the second-chunk tensors (RingLoadBalancing::ZigZag only).
 struct ChunkBinding {
     ttml::metal::ops::sdpa_fw::device::tensor_args_t tensor_args;
     ttml::metal::ops::sdpa_fw::device::tensor_return_value_t return_value;
@@ -75,7 +75,7 @@ RingSDPAFwProgramFactory::cached_mesh_workload_t RingSDPAFwProgramFactory::creat
     const uint32_t step = operation_attributes.step;
     const auto mask_type = operation_attributes.mask_type;
     const auto ring_direction = operation_attributes.ring_direction;
-    const auto chunk_selection = operation_attributes.chunk_selection;
+    const auto load_balancing = operation_attributes.load_balancing;
 
     TT_FATAL(ring_axis < mesh_shape.dims(), "Ring axis {} must be < mesh dimensions {}", ring_axis, mesh_shape.dims());
 
@@ -88,7 +88,7 @@ RingSDPAFwProgramFactory::cached_mesh_workload_t RingSDPAFwProgramFactory::creat
 
         // Check if this device should execute at this step, with which mask and on which chunk
         const auto work =
-            get_ring_step_work(device_ring_id, step, ring_size, mask_type, ring_direction, chunk_selection);
+            get_ring_step_work(device_ring_id, step, ring_size, mask_type, ring_direction, load_balancing);
 
         if (!work.execute) {
             continue;
@@ -137,7 +137,7 @@ void RingSDPAFwProgramFactory::override_runtime_arguments(
     const uint32_t step = operation_attributes.step;
     const auto mask_type = operation_attributes.mask_type;
     const auto ring_direction = operation_attributes.ring_direction;
-    const auto chunk_selection = operation_attributes.chunk_selection;
+    const auto load_balancing = operation_attributes.load_balancing;
 
     // Iterate over cached programs and update runtime arguments
     for (auto& [coord_range, program] : cached_workload.workload.get_programs()) {
@@ -149,7 +149,7 @@ void RingSDPAFwProgramFactory::override_runtime_arguments(
         // Determine this device's mask and chunk (only executing devices have a cached program)
         uint32_t device_ring_id = start_coord[ring_axis];
         const auto work =
-            get_ring_step_work(device_ring_id, step, ring_size, mask_type, ring_direction, chunk_selection);
+            get_ring_step_work(device_ring_id, step, ring_size, mask_type, ring_direction, load_balancing);
         TT_FATAL(work.execute, "Cached ring SDPA forward program found for a device that does not execute");
 
         sdpa_fw::operation_attributes_t sdpa_attrs{

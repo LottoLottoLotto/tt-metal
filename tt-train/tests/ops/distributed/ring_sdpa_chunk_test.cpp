@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Device tests for RingChunkSelection::ZigZag in the ring SDPA ops.
+ * Device tests for RingLoadBalancing::ZigZag in the ring SDPA ops.
  *
- * With zig-zag chunk selection one ring_sdpa_fw / ring_sdpa_bw call carries two sets of
+ * With zig-zag load balancing one ring_sdpa_fw / ring_sdpa_bw call carries two sets of
  * tensors ("chunks"), and the ring program factory binds each device's program to the chunk
  * the schedule assigns it (chunk 0 when src < d, chunk 1 when src > d, nothing on the
  * diagonal step). These tests replicate distinct random inputs per chunk to every device,
@@ -46,7 +46,7 @@ using ::testing::HasSubstr;
 using ::testing::ThrowsMessage;
 using ttml::metal::AttentionMaskType;
 using ttml::metal::ops::get_ring_step_work;
-using ttml::metal::ops::RingChunkSelection;
+using ttml::metal::ops::RingLoadBalancing;
 using ttml::ttnn_fixed::distributed::RingShiftDirection;
 
 constexpr float kSentinel = 7.0F;
@@ -309,7 +309,7 @@ RingSetup ring_setup() {
 // Chunk the schedule assigns to a device; every device runs a chunk at steps 1..N-1.
 uint32_t active_chunk(uint32_t ring_id, uint32_t step, const RingSetup& ring, RingShiftDirection direction) {
     const auto work = get_ring_step_work(
-        ring_id, step, ring.ring_size, AttentionMaskType::Causal, direction, RingChunkSelection::ZigZag);
+        ring_id, step, ring.ring_size, AttentionMaskType::Causal, direction, RingLoadBalancing::ZigZag);
     EXPECT_TRUE(work.execute);
     EXPECT_EQ(work.mask_type, AttentionMaskType::None);
     return work.chunk;
@@ -380,7 +380,7 @@ void run_zigzag_forward_and_check(
         direction,
         out[0],
         inter[0],
-        RingChunkSelection::ZigZag,
+        RingLoadBalancing::ZigZag,
         ttml::metal::ops::ring_sdpa_fw::RingSDPAFwChunk{
             .query = q[1], .key = k[1], .value = v[1], .output = out[1], .intermediates = inter[1]});
 
@@ -475,7 +475,7 @@ TEST_F(RingSDPAChunkTest, ZigZagBackwardBindsAssignedChunkPerDevice) {
                 dq[0],
                 dk[0],
                 dv[0],
-                RingChunkSelection::ZigZag,
+                RingLoadBalancing::ZigZag,
                 ttml::metal::RingSDPABwChunk{
                     .grad_output = d_o[1],
                     .attn_output = o[1],
@@ -509,7 +509,7 @@ TEST_F(RingSDPAChunkTest, ZigZagBackwardBindsAssignedChunkPerDevice) {
         });
 }
 
-// Chunk selection is validated before any program is built, with a specific reason.
+// Load balancing is validated before any program is built, with a specific reason.
 TEST_F(RingSDPAChunkTest, ZigZagValidationRejectsInconsistentChunkArguments) {
     const auto ring = ring_setup();
     const auto chunks = make_chunks(4242U);
@@ -566,7 +566,7 @@ TEST_F(RingSDPAChunkTest, ZigZagValidationRejectsInconsistentChunkArguments) {
 
     using FwChunkOpt = std::optional<ttml::metal::ops::ring_sdpa_fw::RingSDPAFwChunk>;
     using BwChunkOpt = std::optional<ttml::metal::RingSDPABwChunk>;
-    auto fw = [&](uint32_t step, RingChunkSelection selection, const FwChunkOpt& chunk1, bool give_chunk0 = true) {
+    auto fw = [&](uint32_t step, RingLoadBalancing selection, const FwChunkOpt& chunk1, bool give_chunk0 = true) {
         return [&, step, selection, chunk1, give_chunk0] {
             ttml::metal::ring_sdpa_fw(
                 q,
@@ -583,7 +583,7 @@ TEST_F(RingSDPAChunkTest, ZigZagValidationRejectsInconsistentChunkArguments) {
                 chunk1);
         };
     };
-    auto bw = [&](uint32_t step, RingChunkSelection selection, const BwChunkOpt& chunk1, bool give_chunk0 = true) {
+    auto bw = [&](uint32_t step, RingLoadBalancing selection, const BwChunkOpt& chunk1, bool give_chunk0 = true) {
         return [&, step, selection, chunk1, give_chunk0] {
             ttml::metal::ring_sdpa_bw(
                 d_o,
@@ -606,37 +606,37 @@ TEST_F(RingSDPAChunkTest, ZigZagValidationRejectsInconsistentChunkArguments) {
     };
 
     EXPECT_THAT(
-        fw(1U, RingChunkSelection::ZigZag, FwChunkOpt{}),
+        fw(1U, RingLoadBalancing::ZigZag, FwChunkOpt{}),
         ThrowsMessage<std::runtime_error>(HasSubstr("requires the second-chunk tensors")));
     EXPECT_THAT(
-        fw(0U, RingChunkSelection::ZigZag, FwChunkOpt{fw_chunk}),
+        fw(0U, RingLoadBalancing::ZigZag, FwChunkOpt{fw_chunk}),
         ThrowsMessage<std::runtime_error>(HasSubstr("not defined for step 0")));
     EXPECT_THAT(
-        fw(1U, RingChunkSelection::None, FwChunkOpt{fw_chunk}),
-        ThrowsMessage<std::runtime_error>(HasSubstr("chunk selection is None")));
+        fw(1U, RingLoadBalancing::None, FwChunkOpt{fw_chunk}),
+        ThrowsMessage<std::runtime_error>(HasSubstr("load balancing is None")));
     EXPECT_THAT(
-        fw(1U, RingChunkSelection::ZigZag, FwChunkOpt{fw_chunk}, /*give_chunk0=*/false),
+        fw(1U, RingLoadBalancing::ZigZag, FwChunkOpt{fw_chunk}, /*give_chunk0=*/false),
         ThrowsMessage<std::runtime_error>(HasSubstr("requires a preallocated chunk-0 'output'")));
     EXPECT_THAT(
-        fw(1U, RingChunkSelection::ZigZag, FwChunkOpt{fw_short_chunk}),
+        fw(1U, RingLoadBalancing::ZigZag, FwChunkOpt{fw_short_chunk}),
         ThrowsMessage<std::runtime_error>(HasSubstr("Second-chunk tensor 'query'")));
     EXPECT_THAT(
-        fw(1U, RingChunkSelection::ZigZag, FwChunkOpt{fw_l1_output_chunk}),
+        fw(1U, RingLoadBalancing::ZigZag, FwChunkOpt{fw_l1_output_chunk}),
         ThrowsMessage<std::runtime_error>(HasSubstr("Second-chunk tensor 'output'")));
 
     EXPECT_THAT(
-        bw(1U, RingChunkSelection::ZigZag, BwChunkOpt{}),
+        bw(1U, RingLoadBalancing::ZigZag, BwChunkOpt{}),
         ThrowsMessage<std::runtime_error>(HasSubstr("requires the second-chunk tensors")));
     EXPECT_THAT(
-        bw(0U, RingChunkSelection::ZigZag, BwChunkOpt{bw_chunk}),
+        bw(0U, RingLoadBalancing::ZigZag, BwChunkOpt{bw_chunk}),
         ThrowsMessage<std::runtime_error>(HasSubstr("not defined for step 0")));
     EXPECT_THAT(
-        bw(1U, RingChunkSelection::None, BwChunkOpt{bw_chunk}),
-        ThrowsMessage<std::runtime_error>(HasSubstr("chunk selection is None")));
+        bw(1U, RingLoadBalancing::None, BwChunkOpt{bw_chunk}),
+        ThrowsMessage<std::runtime_error>(HasSubstr("load balancing is None")));
     EXPECT_THAT(
-        bw(1U, RingChunkSelection::ZigZag, BwChunkOpt{bw_chunk}, /*give_chunk0=*/false),
+        bw(1U, RingLoadBalancing::ZigZag, BwChunkOpt{bw_chunk}, /*give_chunk0=*/false),
         ThrowsMessage<std::runtime_error>(HasSubstr("requires a preallocated chunk-0 'grad query'")));
     EXPECT_THAT(
-        bw(1U, RingChunkSelection::ZigZag, BwChunkOpt{bw_l1_attn_output_chunk}),
+        bw(1U, RingLoadBalancing::ZigZag, BwChunkOpt{bw_l1_attn_output_chunk}),
         ThrowsMessage<std::runtime_error>(HasSubstr("Second-chunk tensor 'attention output'")));
 }

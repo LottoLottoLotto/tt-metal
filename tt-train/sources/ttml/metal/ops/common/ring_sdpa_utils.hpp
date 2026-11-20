@@ -17,7 +17,7 @@
 
 namespace ttml::metal::ops {
 
-// How the ring ops pick the tensors each device computes on at a ring step.
+// Causal load balancing of the ring ops: which tensors each device computes on at a ring step.
 // - None:   every executing device uses the single set of Q/K/V/output tensors.
 // - ZigZag: load-balanced causal layout. The sequence is cut into 2N global chunks and
 //           device d holds global chunks [d | 2N-1-d], so its local Q/K/V are two chunks:
@@ -28,7 +28,7 @@ namespace ttml::metal::ops {
 //           fully visible and is computed by a separate mask-None call; (Q0, K1) is never
 //           visible; the src == d step is a plain causal call over the full local sequence
 //           (local order is monotone).
-enum class RingChunkSelection : uint8_t { None = 0, ZigZag = 1 };
+enum class RingLoadBalancing : uint8_t { None = 0, ZigZag = 1 };
 
 // Source device of the K/V a device holds at a ring step:
 // - Backward ring direction: src = (d + s) mod ring_size
@@ -88,9 +88,9 @@ struct RingStepWork {
     bool operator==(const RingStepWork&) const = default;
 };
 
-// Schedule used by the ring program factories. RingChunkSelection::None is exactly
-// get_device_execution_info on chunk 0. RingChunkSelection::ZigZag (causal only) returns
-// the unmasked same-chunk block described at RingChunkSelection: chunk 0 when src < d,
+// Schedule used by the ring program factories. RingLoadBalancing::None is exactly
+// get_device_execution_info on chunk 0. RingLoadBalancing::ZigZag (causal only) returns
+// the unmasked same-chunk block described at RingLoadBalancing: chunk 0 when src < d,
 // chunk 1 when src > d, and no work when src == d.
 inline RingStepWork get_ring_step_work(
     uint32_t device_ring_id,
@@ -98,8 +98,8 @@ inline RingStepWork get_ring_step_work(
     uint32_t ring_size,
     AttentionMaskType mask_type,
     ttnn_fixed::distributed::RingShiftDirection ring_direction,
-    RingChunkSelection chunk_selection) {
-    if (chunk_selection == RingChunkSelection::None) {
+    RingLoadBalancing load_balancing) {
+    if (load_balancing == RingLoadBalancing::None) {
         const auto [execute, effective_mask] =
             get_device_execution_info(device_ring_id, step, ring_size, mask_type, ring_direction);
         return {.execute = execute, .mask_type = effective_mask, .chunk = 0U};
@@ -107,7 +107,7 @@ inline RingStepWork get_ring_step_work(
 
     TT_FATAL(
         mask_type == AttentionMaskType::Causal,
-        "Zig-zag chunk selection is only defined for causal attention, got mask type {}",
+        "Zig-zag load balancing is only defined for causal attention, got mask type {}",
         static_cast<int>(mask_type));
     const uint32_t src_device = get_ring_source_device(device_ring_id, step, ring_size, ring_direction);
     if (src_device == device_ring_id) {
@@ -148,28 +148,28 @@ inline void validate_ring_attributes(const RingAttrs& attrs, const ttnn::Tensor&
         attrs.ring_axis);
 }
 
-// Chunk-selection contract shared by the ring ops: the second chunk is supplied exactly
-// when zig-zag chunk selection is requested, and zig-zag is only defined for causal
+// Load-balancing contract shared by the ring ops: the second chunk is supplied exactly
+// when zig-zag load balancing is requested, and zig-zag is only defined for causal
 // steps other than the diagonal step (step 0), which the caller runs as one full causal
 // call over the whole local sequence.
 template <typename RingAttrs>
-inline void validate_ring_chunk_selection(const RingAttrs& attrs, bool has_second_chunk) {
-    if (attrs.chunk_selection == RingChunkSelection::None) {
-        TT_FATAL(!has_second_chunk, "Second-chunk tensors were given but chunk selection is None");
+inline void validate_ring_load_balancing(const RingAttrs& attrs, bool has_second_chunk) {
+    if (attrs.load_balancing == RingLoadBalancing::None) {
+        TT_FATAL(!has_second_chunk, "Second-chunk tensors were given but load balancing is None");
         return;
     }
-    TT_FATAL(has_second_chunk, "Zig-zag chunk selection requires the second-chunk tensors");
+    TT_FATAL(has_second_chunk, "Zig-zag load balancing requires the second-chunk tensors");
     TT_FATAL(
         attrs.mask_type == AttentionMaskType::Causal,
-        "Zig-zag chunk selection requires a causal mask, got mask type {}",
+        "Zig-zag load balancing requires a causal mask, got mask type {}",
         static_cast<int>(attrs.mask_type));
     TT_FATAL(
         attrs.step != 0U,
-        "Zig-zag chunk selection is not defined for step 0 (every device holds its own K/V); run step 0 as one "
+        "Zig-zag load balancing is not defined for step 0 (every device holds its own K/V); run step 0 as one "
         "causal call over the full local sequence");
 }
 
-// With zig-zag chunk selection the devices that compute chunk 1 at a step never write the
+// With zig-zag load balancing the devices that compute chunk 1 at a step never write the
 // chunk-0 outputs, so a chunk-0 output the op allocated itself would hold uninitialized memory
 // on those devices. The caller must supply (and pre-fill) every chunk-0 output, exactly as it
 // supplies the chunk-1 outputs.
@@ -177,8 +177,8 @@ template <typename RingAttrs>
 inline void validate_chunk0_output_given(
     const RingAttrs& attrs, const std::optional<ttnn::Tensor>& preallocated, std::string_view name) {
     TT_FATAL(
-        attrs.chunk_selection == RingChunkSelection::None || preallocated.has_value(),
-        "Zig-zag chunk selection requires a preallocated chunk-0 '{}': devices that compute chunk 1 at this step "
+        attrs.load_balancing == RingLoadBalancing::None || preallocated.has_value(),
+        "Zig-zag load balancing requires a preallocated chunk-0 '{}': devices that compute chunk 1 at this step "
         "never write it",
         name);
 }

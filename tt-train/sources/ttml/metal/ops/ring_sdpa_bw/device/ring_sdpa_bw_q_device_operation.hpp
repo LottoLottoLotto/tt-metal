@@ -49,7 +49,7 @@ ttml::metal::ops::ring_sdpa_bw::q::RingSDPABwQDeviceOperation::tensor_return_val
     ttml::metal::ops::ring_sdpa_bw::RingDirection ring_direction =
         ttml::metal::ops::ring_sdpa_bw::RingDirection::Backward,
     const std::optional<ttnn::Tensor>& preallocated_grad_query = std::nullopt,
-    ttml::metal::ops::RingChunkSelection chunk_selection = ttml::metal::ops::RingChunkSelection::None,
+    ttml::metal::ops::RingLoadBalancing load_balancing = ttml::metal::ops::RingLoadBalancing::None,
     const std::optional<ttml::metal::ops::ring_sdpa_bw::q::RingSDPABwQChunk>& chunk1 = std::nullopt);
 
 }  // namespace ttnn::prim

@@ -32,7 +32,7 @@ void RingSDPABwQDeviceOperation::validate_on_program_cache_miss(
             tensor_args.query);
     }
 
-    validate_ring_chunk_selection(attrs, tensor_args.chunk1.has_value());
+    validate_ring_load_balancing(attrs, tensor_args.chunk1.has_value());
     validate_chunk0_output_given(attrs, tensor_args.preallocated_grad_query, "grad query");
     if (tensor_args.chunk1.has_value()) {
         const auto& chunk1 = tensor_args.chunk1.value();
@@ -105,7 +105,7 @@ ttml::metal::ops::ring_sdpa_bw::q::RingSDPABwQDeviceOperation::tensor_return_val
     ttml::metal::AttentionMaskType mask_type,
     ttml::metal::ops::ring_sdpa_bw::RingDirection ring_direction,
     const std::optional<ttnn::Tensor>& preallocated_grad_query,
-    ttml::metal::ops::RingChunkSelection chunk_selection,
+    ttml::metal::ops::RingLoadBalancing load_balancing,
     const std::optional<ttml::metal::ops::ring_sdpa_bw::q::RingSDPABwQChunk>& chunk1) {
     using OperationType = ttml::metal::ops::ring_sdpa_bw::q::RingSDPABwQDeviceOperation;
 
@@ -115,7 +115,7 @@ ttml::metal::ops::ring_sdpa_bw::q::RingSDPABwQDeviceOperation::tensor_return_val
         .step = step,
         .mask_type = mask_type,
         .ring_direction = ring_direction,
-        .chunk_selection = chunk_selection};
+        .load_balancing = load_balancing};
 
     auto tensor_args = OperationType::tensor_args_t{
         .grad_output = grad_output,

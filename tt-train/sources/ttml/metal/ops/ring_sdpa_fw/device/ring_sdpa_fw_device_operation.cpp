@@ -25,7 +25,7 @@ void RingSDPAFwDeviceOperation::validate_on_program_cache_miss(
         validate_intermediates_tensor(tensor_args.preallocated_intermediates.value(), tensor_args.query);
     }
 
-    validate_ring_chunk_selection(attrs, tensor_args.chunk1.has_value());
+    validate_ring_load_balancing(attrs, tensor_args.chunk1.has_value());
     validate_chunk0_output_given(attrs, tensor_args.preallocated_output, "output");
     validate_chunk0_output_given(attrs, tensor_args.preallocated_intermediates, "intermediates");
     if (tensor_args.chunk1.has_value()) {
@@ -98,7 +98,7 @@ ttml::metal::ops::ring_sdpa_fw::RingSDPAFwDeviceOperation::tensor_return_value_t
     ttml::metal::ops::ring_sdpa_fw::RingDirection ring_direction,
     const std::optional<ttnn::Tensor>& preallocated_output,
     const std::optional<ttnn::Tensor>& preallocated_intermediates,
-    ttml::metal::ops::RingChunkSelection chunk_selection,
+    ttml::metal::ops::RingLoadBalancing load_balancing,
     const std::optional<ttml::metal::ops::ring_sdpa_fw::RingSDPAFwChunk>& chunk1) {
     using OperationType = ttml::metal::ops::ring_sdpa_fw::RingSDPAFwDeviceOperation;
 
@@ -108,7 +108,7 @@ ttml::metal::ops::ring_sdpa_fw::RingSDPAFwDeviceOperation::tensor_return_value_t
         .step = step,
         .mask_type = mask_type,
         .ring_direction = ring_direction,
-        .chunk_selection = chunk_selection};
+        .load_balancing = load_balancing};
 
     auto tensor_args = OperationType::tensor_args_t{
         .query = query,
