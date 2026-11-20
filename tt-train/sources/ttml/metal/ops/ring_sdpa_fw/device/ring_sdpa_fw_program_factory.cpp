@@ -20,6 +20,7 @@ namespace {
 // SDPAForwardInputs holds mask and gate by const reference: a temporary std::nullopt would dangle.
 const std::optional<ttnn::Tensor> kNoTensor = std::nullopt;
 
+// SDPA forward args and outputs of the chunk a device computes.
 struct ChunkBinding {
     ttml::metal::ops::sdpa_fw::device::tensor_args_t tensor_args;
     ttml::metal::ops::sdpa_fw::device::tensor_return_value_t return_value;
