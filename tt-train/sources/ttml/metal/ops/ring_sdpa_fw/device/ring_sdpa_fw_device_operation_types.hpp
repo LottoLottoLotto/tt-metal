@@ -35,19 +35,24 @@ struct RingSDPAFwChunk {
 };
 
 struct RingSDPAFwInputs {
-    ttnn::Tensor query;
-    ttnn::Tensor key;
-    ttnn::Tensor value;
-    std::optional<ttnn::Tensor> preallocated_output;         // Preallocated output buffer
-    std::optional<ttnn::Tensor> preallocated_intermediates;  // Preallocated intermediates buffer
-    std::optional<RingSDPAFwChunk> chunk1;
+    std::vector<RingSDPAFwChunk> chunks;
+};
+
+struct RingSDPAFwChunkOutputs {
+    ttnn::Tensor output;
+    ttnn::Tensor intermediates;
+};
+
+struct RingSDPAFwChunkOutputSpecs {
+    tt::tt_metal::TensorSpec output;
+    tt::tt_metal::TensorSpec intermediates;
 };
 
 using operation_attributes_t = RingSDPAFwParams;
 using tensor_args_t = RingSDPAFwInputs;
 
-using tensor_return_value_t = std::tuple<ttnn::Tensor, ttnn::Tensor>;  // output, intermediates
+using tensor_return_value_t = std::vector<RingSDPAFwChunkOutputs>;
 
-using spec_return_value_t = std::tuple<tt::tt_metal::TensorSpec, tt::tt_metal::TensorSpec>;
+using spec_return_value_t = std::vector<RingSDPAFwChunkOutputSpecs>;
 
 }  // namespace ttml::metal::ops::ring_sdpa_fw

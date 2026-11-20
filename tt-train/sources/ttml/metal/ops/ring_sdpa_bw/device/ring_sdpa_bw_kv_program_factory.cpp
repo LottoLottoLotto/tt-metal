@@ -14,59 +14,18 @@
 #include "ring_sdpa_bw_kv_device_operation_types.hpp"
 
 namespace ttml::metal::ops::ring_sdpa_bw::kv {
-
-namespace {
-
-struct KVChunkRefs {
-    const ttnn::Tensor& grad_output;
-    const ttnn::Tensor& query;
-    const ttnn::Tensor& key;
-    const ttnn::Tensor& value;
-    const ttnn::Tensor& intermediates;
-    const ttnn::Tensor& grad_key;
-    const ttnn::Tensor& grad_value;
-};
-
-KVChunkRefs select_chunk(
-    uint32_t chunk,
-    const tensor_args_t& tensor_args,
-    const std::tuple<ttnn::Tensor, ttnn::Tensor>& tensor_return_value) {
-    if (chunk == 0U) {
-        return {
-            tensor_args.grad_output,
-            tensor_args.query,
-            tensor_args.key,
-            tensor_args.value,
-            tensor_args.intermediates,
-            std::get<0>(tensor_return_value),
-            std::get<1>(tensor_return_value)};
-    }
-    TT_FATAL(tensor_args.chunk1.has_value(), "Device was assigned chunk 1 but no second-chunk tensors were given");
-    const auto& chunk1 = tensor_args.chunk1.value();
-    return {
-        chunk1.grad_output,
-        chunk1.query,
-        chunk1.key,
-        chunk1.value,
-        chunk1.intermediates,
-        chunk1.grad_key,
-        chunk1.grad_value};
-}
-
-}  // namespace
-
 // ============== Backward KV Program Factory ==============
 
 RingSDPABwKVProgramFactory::cached_mesh_workload_t RingSDPABwKVProgramFactory::create_mesh_workload(
     const operation_attributes_t& operation_attributes,
     const ttnn::MeshCoordinateRangeSet& tensor_coords,
     const tensor_args_t& tensor_args,
-    std::tuple<ttnn::Tensor, ttnn::Tensor>& tensor_return_value) {
+    tensor_return_value_t& tensor_return_value) {
     namespace sdpa_kv = ttml::metal::ops::sdpa_bw::device::kv;
 
     const auto& u_scaler = tensor_args.u_scaler;
 
-    auto* mesh_device = tensor_args.query.device();
+    auto* mesh_device = tensor_args.chunks.front().query.device();
     TT_FATAL(mesh_device != nullptr, "Query tensor must be on a mesh device");
 
     const auto mesh_shape = mesh_device->shape();
@@ -89,7 +48,7 @@ RingSDPABwKVProgramFactory::cached_mesh_workload_t RingSDPABwKVProgramFactory::c
         if (!work.execute) {
             continue;
         }
-        const auto chunk = select_chunk(work.chunk, tensor_args, tensor_return_value);
+        const auto& chunk = tensor_args.chunks[work.chunk];
 
         sdpa_kv::operation_attributes_t sdpa_attrs{.mask_type = effective_mask_type, .dropout_probability = 0.0F};
 
@@ -133,12 +92,12 @@ void RingSDPABwKVProgramFactory::override_runtime_arguments(
     cached_mesh_workload_t& cached_workload,
     const operation_attributes_t& operation_attributes,
     const tensor_args_t& tensor_args,
-    std::tuple<ttnn::Tensor, ttnn::Tensor>& tensor_return_value) {
+    tensor_return_value_t& tensor_return_value) {
     namespace sdpa_kv = ttml::metal::ops::sdpa_bw::device::kv;
 
     const auto& u_scaler = tensor_args.u_scaler;
 
-    auto* mesh_device = tensor_args.query.device();
+    auto* mesh_device = tensor_args.chunks.front().query.device();
     const auto mesh_shape = mesh_device->shape();
     const uint32_t ring_axis = operation_attributes.ring_axis;
     const uint32_t ring_size = operation_attributes.ring_size;
@@ -155,7 +114,7 @@ void RingSDPABwKVProgramFactory::override_runtime_arguments(
             device_ring_id, step, ring_size, mask_type, ring_direction, operation_attributes.load_balancing);
         const auto effective_mask_type = work.mask_type;
         TT_FATAL(work.execute, "Cached ring SDPA backward program found for a device that does not execute");
-        const auto chunk = select_chunk(work.chunk, tensor_args, tensor_return_value);
+        const auto& chunk = tensor_args.chunks[work.chunk];
 
         sdpa_kv::operation_attributes_t sdpa_attrs{.mask_type = effective_mask_type, .dropout_probability = 0.0F};
 

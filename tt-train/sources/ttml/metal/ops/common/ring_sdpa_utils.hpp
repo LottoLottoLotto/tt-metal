@@ -5,11 +5,12 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
+#include <reflect>
 #include <string_view>
 #include <tt-metalium/constants.hpp>
 #include <tt_stl/assert.hpp>
 #include <utility>
+#include <vector>
 
 #include "metal/common/const_utils.hpp"
 #include "metal/common/tensor_validation.hpp"
@@ -18,6 +19,14 @@
 namespace ttml::metal::ops {
 
 enum class RingLoadBalancing : uint8_t { None = 0, ZigZag = 1 };
+
+inline uint32_t get_ring_chunk_count(RingLoadBalancing load_balancing) {
+    switch (load_balancing) {
+        case RingLoadBalancing::None: return 1U;
+        case RingLoadBalancing::ZigZag: return 2U;
+    }
+    TT_THROW("Unknown load balancing {}", static_cast<int>(load_balancing));
+}
 
 inline uint32_t get_ring_source_device(
     uint32_t device_ring_id,
@@ -78,25 +87,29 @@ inline RingStepWork get_ring_step_work(
     AttentionMaskType mask_type,
     ttnn_fixed::distributed::RingShiftDirection ring_direction,
     RingLoadBalancing load_balancing) {
-    if (load_balancing == RingLoadBalancing::None) {
-        const auto [execute, effective_mask] =
-            get_device_execution_info(device_ring_id, step, ring_size, mask_type, ring_direction);
-        return {.execute = execute, .mask_type = effective_mask, .chunk = 0U};
+    switch (load_balancing) {
+        case RingLoadBalancing::None: {
+            const auto [execute, effective_mask] =
+                get_device_execution_info(device_ring_id, step, ring_size, mask_type, ring_direction);
+            return {.execute = execute, .mask_type = effective_mask, .chunk = 0U};
+        }
+        case RingLoadBalancing::ZigZag: {
+            TT_FATAL(
+                mask_type == AttentionMaskType::Causal,
+                "Zig-zag load balancing is only defined for causal attention, got mask type {}",
+                static_cast<int>(mask_type));
+            const uint32_t src_device = get_ring_source_device(device_ring_id, step, ring_size, ring_direction);
+            if (src_device == device_ring_id) {
+                return {.execute = false, .mask_type = AttentionMaskType::None, .chunk = 0U};
+            }
+            return {
+                .execute = true,
+                .mask_type = AttentionMaskType::None,
+                .chunk = src_device < device_ring_id ? 0U : 1U,
+            };
+        }
     }
-
-    TT_FATAL(
-        mask_type == AttentionMaskType::Causal,
-        "Zig-zag load balancing is only defined for causal attention, got mask type {}",
-        static_cast<int>(mask_type));
-    const uint32_t src_device = get_ring_source_device(device_ring_id, step, ring_size, ring_direction);
-    if (src_device == device_ring_id) {
-        return {.execute = false, .mask_type = AttentionMaskType::None, .chunk = 0U};
-    }
-    return {
-        .execute = true,
-        .mask_type = AttentionMaskType::None,
-        .chunk = src_device < device_ring_id ? 0U : 1U,
-    };
+    TT_THROW("Unknown load balancing {}", static_cast<int>(load_balancing));
 }
 
 // Common attribute validation for the ring SDPA device operations. The ring factories
@@ -128,13 +141,16 @@ inline void validate_ring_attributes(const RingAttrs& attrs, const ttnn::Tensor&
 }
 
 template <typename RingAttrs>
-inline void validate_ring_load_balancing(const RingAttrs& attrs, bool has_second_chunk) {
+inline void validate_ring_load_balancing(const RingAttrs& attrs, size_t chunk_count) {
+    TT_FATAL(
+        chunk_count == get_ring_chunk_count(attrs.load_balancing),
+        "Load balancing {} expects {} chunks, got {}",
+        static_cast<int>(attrs.load_balancing),
+        get_ring_chunk_count(attrs.load_balancing),
+        chunk_count);
     switch (attrs.load_balancing) {
-        case RingLoadBalancing::None:
-            TT_FATAL(!has_second_chunk, "Second-chunk tensors were given but load balancing is None");
-            return;
+        case RingLoadBalancing::None: return;
         case RingLoadBalancing::ZigZag:
-            TT_FATAL(has_second_chunk, "Zig-zag load balancing requires the second-chunk tensors");
             TT_FATAL(
                 attrs.mask_type == AttentionMaskType::Causal,
                 "Zig-zag load balancing requires a causal mask, got mask type {}",
@@ -148,26 +164,35 @@ inline void validate_ring_load_balancing(const RingAttrs& attrs, bool has_second
     TT_THROW("Unknown load balancing {}", static_cast<int>(attrs.load_balancing));
 }
 
-// Devices computing chunk 1 never write chunk 0, so an op-allocated chunk-0 output would stay uninitialized.
-template <typename RingAttrs>
-inline void validate_chunk0_output_given(
-    const RingAttrs& attrs, const std::optional<ttnn::Tensor>& preallocated, std::string_view name) {
-    TT_FATAL(
-        attrs.load_balancing == RingLoadBalancing::None || preallocated.has_value(),
-        "Zig-zag load balancing requires a preallocated chunk-0 '{}': devices that compute chunk 1 at this step "
-        "never write it",
-        name);
+// Called by each prim before launch(), which reads every chunk tensor before validate_on_program_cache_miss runs.
+template <typename Chunk>
+inline void validate_chunk_list(const std::vector<Chunk>& chunks) {
+    TT_FATAL(!chunks.empty(), "Ring SDPA needs at least one chunk");
+    for (size_t chunk = 0; chunk < chunks.size(); ++chunk) {
+        reflect::for_each(
+            [&](auto field) {
+                TT_FATAL(
+                    reflect::get<field>(chunks[chunk]).tensor_attributes != nullptr,
+                    "Chunk {} '{}' is a default-constructed tensor",
+                    chunk,
+                    reflect::member_name<field>(chunks[chunk]));
+            },
+            chunks[chunk]);
+    }
 }
 
-// Each device builds its program from the chunk it computes, and chunk-0-sized buffers (u_scaler) serve both.
-inline void validate_same_spec(const ttnn::Tensor& chunk1, const ttnn::Tensor& chunk0, std::string_view name) {
-    TT_FATAL(chunk1.device() == chunk0.device(), "Second-chunk tensor '{}' must be on the same mesh device", name);
+// Each device builds its program from the chunk it computes, and chunk-sized buffers (u_scaler) serve every chunk.
+inline void validate_same_spec(
+    const ttnn::Tensor& tensor, const ttnn::Tensor& reference, std::string_view name, size_t chunk) {
     TT_FATAL(
-        chunk1.tensor_spec() == chunk0.tensor_spec(),
-        "Second-chunk tensor '{}' spec {} must match its first-chunk counterpart's spec {}",
+        tensor.device() == reference.device(), "Chunk {} '{}' must be on the same mesh device as chunk 0", chunk, name);
+    TT_FATAL(
+        tensor.tensor_spec() == reference.tensor_spec(),
+        "Chunk {} '{}' spec {} must match chunk 0's spec {}",
+        chunk,
         name,
-        chunk1.tensor_spec(),
-        chunk0.tensor_spec());
+        tensor.tensor_spec(),
+        reference.tensor_spec());
 }
 
 // Per-tensor device contract of the reused SDPA kernels: on device, allocated,

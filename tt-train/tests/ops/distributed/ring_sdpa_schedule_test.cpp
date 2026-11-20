@@ -22,6 +22,7 @@ namespace {
 
 using ttml::metal::AttentionMaskType;
 using ttml::metal::ops::get_device_execution_info;
+using ttml::metal::ops::get_ring_chunk_count;
 using ttml::metal::ops::get_ring_step_work;
 using ttml::metal::ops::RingLoadBalancing;
 using ttml::metal::ops::RingStepWork;
@@ -256,4 +257,32 @@ TEST(RingSDPAScheduleTest, ZigZagCoversCausalTriangleExactlyOnceAndBalances) {
 TEST(RingSDPAScheduleTest, ZigZagRequiresCausalMask) {
     EXPECT_ANY_THROW(get_ring_step_work(
         1U, 1U, 4U, AttentionMaskType::None, RingShiftDirection::Backward, RingLoadBalancing::ZigZag));
+}
+
+TEST(RingSDPAScheduleTest, AssignedChunkIndexIsBelowChunkCountOfLoadBalancing) {
+    struct Mode {
+        RingLoadBalancing load_balancing;
+        AttentionMaskType mask_type;
+        uint32_t first_step;
+    };
+    static constexpr Mode kModes[] = {
+        {RingLoadBalancing::None, AttentionMaskType::None, 0U},
+        {RingLoadBalancing::None, AttentionMaskType::Causal, 0U},
+        {RingLoadBalancing::ZigZag, AttentionMaskType::Causal, 1U},
+    };
+    for (const auto& mode : kModes) {
+        for (auto direction : {RingShiftDirection::Forward, RingShiftDirection::Backward}) {
+            for (uint32_t ring_size : {2U, 3U, 4U, 8U}) {
+                for (uint32_t device = 0; device < ring_size; ++device) {
+                    for (uint32_t step = mode.first_step; step < ring_size; ++step) {
+                        const auto work =
+                            get_ring_step_work(device, step, ring_size, mode.mask_type, direction, mode.load_balancing);
+                        EXPECT_LT(work.chunk, get_ring_chunk_count(mode.load_balancing))
+                            << "load balancing " << static_cast<int>(mode.load_balancing) << " ring " << ring_size
+                            << " device " << device << " step " << step;
+                    }
+                }
+            }
+        }
+    }
 }

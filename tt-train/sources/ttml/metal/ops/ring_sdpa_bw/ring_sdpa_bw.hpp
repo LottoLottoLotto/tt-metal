@@ -25,23 +25,14 @@ struct RingSDPABwChunk {
     ttnn::Tensor grad_value;
 };
 
-// Returns [grad_Q, grad_K, grad_V]
-std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor> ring_sdpa_bw(
-    const ttnn::Tensor& grad_output,    // Gradient w.r.t. output
-    const ttnn::Tensor& attn_output,    // sdpa forward output (needed for gradients)
-    const ttnn::Tensor& query,          // input Q (needed for gradients)
-    const ttnn::Tensor& key,            // input K (needed for gradients)
-    const ttnn::Tensor& value,          // input V (needed for gradients)
-    const ttnn::Tensor& intermediates,  // From forward pass (FP32 logsumexp per row)
+// Each device writes only the grads of the chunk get_ring_step_work assigns it; other grads keep their contents.
+void ring_sdpa_bw(
+    std::vector<RingSDPABwChunk> chunks,
     uint32_t ring_size,
     uint32_t ring_axis,
     uint32_t step,
     AttentionMaskType mask_type = AttentionMaskType::None,
     RingDirection ring_direction = RingDirection::Backward,
-    const std::optional<ttnn::Tensor>& preallocated_grad_query = std::nullopt,
-    const std::optional<ttnn::Tensor>& preallocated_grad_key = std::nullopt,
-    const std::optional<ttnn::Tensor>& preallocated_grad_value = std::nullopt,
-    ops::RingLoadBalancing load_balancing = ops::RingLoadBalancing::None,
-    const std::optional<RingSDPABwChunk>& chunk1 = std::nullopt);
+    ops::RingLoadBalancing load_balancing = ops::RingLoadBalancing::None);
 
 }  // namespace ttml::metal

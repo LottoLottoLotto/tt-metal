@@ -26,33 +26,17 @@ struct ChunkBinding {
     ttml::metal::ops::sdpa_fw::device::tensor_return_value_t return_value;
 };
 
-ChunkBinding bind_chunk(uint32_t chunk, const tensor_args_t& tensor_args, tensor_return_value_t& tensor_return_value) {
-    if (chunk == 0U) {
-        auto& output = std::get<0>(tensor_return_value);
-        auto& intermediates = std::get<1>(tensor_return_value);
-        return ChunkBinding{
-            .tensor_args =
-                {.query = tensor_args.query,
-                 .key = tensor_args.key,
-                 .value = tensor_args.value,
-                 .mask = kNoTensor,
-                 .preallocated_intermediate = intermediates,
-                 .preallocated_output = output,
-                 .gate = kNoTensor},
-            .return_value = {output, intermediates}};
-    }
-    TT_FATAL(tensor_args.chunk1.has_value(), "Device was assigned chunk 1 but no second-chunk tensors were given");
-    const auto& chunk1 = tensor_args.chunk1.value();
+ChunkBinding bind_chunk(const RingSDPAFwChunk& chunk) {
     return ChunkBinding{
         .tensor_args =
-            {.query = chunk1.query,
-             .key = chunk1.key,
-             .value = chunk1.value,
+            {.query = chunk.query,
+             .key = chunk.key,
+             .value = chunk.value,
              .mask = kNoTensor,
-             .preallocated_intermediate = chunk1.intermediates,
-             .preallocated_output = chunk1.output,
+             .preallocated_intermediate = chunk.intermediates,
+             .preallocated_output = chunk.output,
              .gate = kNoTensor},
-        .return_value = {chunk1.output, chunk1.intermediates}};
+        .return_value = {chunk.output, chunk.intermediates}};
 }
 
 }  // namespace
@@ -64,7 +48,7 @@ RingSDPAFwProgramFactory::cached_mesh_workload_t RingSDPAFwProgramFactory::creat
     tensor_return_value_t& tensor_return_value) {
     namespace sdpa_fw = ttml::metal::ops::sdpa_fw;
 
-    auto* mesh_device = tensor_args.query.device();
+    auto* mesh_device = tensor_args.chunks.front().query.device();
     TT_FATAL(mesh_device != nullptr, "Query tensor must be on a mesh device");
 
     const auto mesh_shape = mesh_device->shape();
@@ -93,7 +77,7 @@ RingSDPAFwProgramFactory::cached_mesh_workload_t RingSDPAFwProgramFactory::creat
 
         sdpa_fw::device::operation_attributes_t sdpa_attrs{
             .return_intermediates = true, .mask_type = work.mask_type, .dropout_probability = 0.0F};
-        auto binding = bind_chunk(work.chunk, tensor_args, tensor_return_value);
+        auto binding = bind_chunk(tensor_args.chunks[work.chunk]);
 
         // Create the program
         auto cached_program =
@@ -127,7 +111,7 @@ void RingSDPAFwProgramFactory::override_runtime_arguments(
     tensor_return_value_t& tensor_return_value) {
     namespace sdpa_fw = ttml::metal::ops::sdpa_fw::device;
 
-    auto* mesh_device = tensor_args.query.device();
+    auto* mesh_device = tensor_args.chunks.front().query.device();
     const auto mesh_shape = mesh_device->shape();
     const uint32_t ring_axis = operation_attributes.ring_axis;
     const uint32_t ring_size = operation_attributes.ring_size;
@@ -150,7 +134,7 @@ void RingSDPAFwProgramFactory::override_runtime_arguments(
 
         sdpa_fw::operation_attributes_t sdpa_attrs{
             .return_intermediates = true, .mask_type = work.mask_type, .dropout_probability = 0.0F};
-        auto binding = bind_chunk(work.chunk, tensor_args, tensor_return_value);
+        auto binding = bind_chunk(tensor_args.chunks[work.chunk]);
 
         // Convert our shared_variables to SDPA's shared_variables type
         sdpa_fw::SDPAForwardProgramFactory::shared_variables_t sdpa_shared_vars{

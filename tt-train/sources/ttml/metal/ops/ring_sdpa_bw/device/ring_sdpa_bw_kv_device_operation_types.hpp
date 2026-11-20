@@ -37,22 +37,25 @@ struct RingSDPABwKVChunk {
 };
 
 struct RingSDPABwKVInputs {
-    ttnn::Tensor grad_output;
+    std::vector<RingSDPABwKVChunk> chunks;
     ttnn::Tensor u_scaler;  // Precomputed rowsum(dO * O) from Q kernel
-    ttnn::Tensor query;
-    ttnn::Tensor key;
-    ttnn::Tensor value;
-    ttnn::Tensor intermediates;
-    std::optional<ttnn::Tensor> preallocated_grad_key;    // Preallocated output buffer
-    std::optional<ttnn::Tensor> preallocated_grad_value;  // Preallocated output buffer
-    std::optional<RingSDPABwKVChunk> chunk1;
+};
+
+struct RingSDPABwKVChunkOutputs {
+    ttnn::Tensor grad_key;
+    ttnn::Tensor grad_value;
+};
+
+struct RingSDPABwKVChunkOutputSpecs {
+    tt::tt_metal::TensorSpec grad_key;
+    tt::tt_metal::TensorSpec grad_value;
 };
 
 using operation_attributes_t = RingSDPABwKVParams;
 using tensor_args_t = RingSDPABwKVInputs;
 
-using tensor_return_value_t = std::tuple<ttnn::Tensor, ttnn::Tensor>;  // [grad_K, grad_V]
+using tensor_return_value_t = std::vector<RingSDPABwKVChunkOutputs>;
 
-using spec_return_value_t = std::tuple<tt::tt_metal::TensorSpec, tt::tt_metal::TensorSpec>;
+using spec_return_value_t = std::vector<RingSDPABwKVChunkOutputSpecs>;
 
 }  // namespace ttml::metal::ops::ring_sdpa_bw::kv

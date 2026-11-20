@@ -30,18 +30,13 @@ struct RingSDPAFwDeviceOperation {
 namespace ttnn::prim {
 
 ttml::metal::ops::ring_sdpa_fw::RingSDPAFwDeviceOperation::tensor_return_value_t ttml_ring_sdpa_fw(
-    const ttnn::Tensor& query,
-    const ttnn::Tensor& key,
-    const ttnn::Tensor& value,
+    std::vector<ttml::metal::ops::ring_sdpa_fw::RingSDPAFwChunk> chunks,
     uint32_t ring_size,
     uint32_t ring_axis,
     uint32_t step,
     ttml::metal::AttentionMaskType mask_type = ttml::metal::AttentionMaskType::None,
     ttml::metal::ops::ring_sdpa_fw::RingDirection ring_direction =
         ttml::metal::ops::ring_sdpa_fw::RingDirection::Backward,
-    const std::optional<ttnn::Tensor>& preallocated_output = std::nullopt,
-    const std::optional<ttnn::Tensor>& preallocated_intermediates = std::nullopt,
-    ttml::metal::ops::RingLoadBalancing load_balancing = ttml::metal::ops::RingLoadBalancing::None,
-    const std::optional<ttml::metal::ops::ring_sdpa_fw::RingSDPAFwChunk>& chunk1 = std::nullopt);
+    ttml::metal::ops::RingLoadBalancing load_balancing = ttml::metal::ops::RingLoadBalancing::None);
 
 }  // namespace ttnn::prim

@@ -10,19 +10,16 @@
 
 namespace ttml::metal {
 
-// Returns [output, intermediates]
-std::tuple<ttnn::Tensor, ttnn::Tensor> ring_sdpa_fw(
-    const ttnn::Tensor& query,
-    const ttnn::Tensor& key,
-    const ttnn::Tensor& value,
+using RingSDPAFwChunk = ops::ring_sdpa_fw::RingSDPAFwChunk;
+
+// Each device writes only the outputs of the chunk get_ring_step_work assigns it; other outputs keep their contents.
+void ring_sdpa_fw(
+    std::vector<RingSDPAFwChunk> chunks,
     uint32_t ring_size,
     uint32_t ring_axis,
     uint32_t step,
     AttentionMaskType mask_type = AttentionMaskType::None,
     ops::ring_sdpa_fw::RingDirection ring_direction = ops::ring_sdpa_fw::RingDirection::Backward,
-    const std::optional<ttnn::Tensor>& preallocated_output = std::nullopt,
-    const std::optional<ttnn::Tensor>& preallocated_intermediates = std::nullopt,
-    ops::RingLoadBalancing load_balancing = ops::RingLoadBalancing::None,
-    const std::optional<ops::ring_sdpa_fw::RingSDPAFwChunk>& chunk1 = std::nullopt);
+    ops::RingLoadBalancing load_balancing = ops::RingLoadBalancing::None);
 
 }  // namespace ttml::metal
