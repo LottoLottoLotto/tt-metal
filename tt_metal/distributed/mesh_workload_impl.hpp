@@ -40,6 +40,9 @@ struct PerDeviceRuntimeArgsField {
     uint32_t num_words = 0;
     std::vector<uint32_t> values;  // [coordinate index in the program's range][num_words]
     std::vector<uint8_t> present;  // [coordinate index in the program's range]
+    // Set by the runtime, not by the user (see MeshWorkloadImpl::set_framework_per_device_runtime_args): a
+    // program-level Program::set_program_run_args / Program::update_program_run_args does not drop it.
+    bool framework_owned = false;
     // values / present as of the last values_version bump: setting the same values again (for example after a
     // program-level update dropped them) leaves values_version, and so the per-device command images, as they are.
     std::vector<uint32_t> committed_values;
@@ -55,6 +58,7 @@ struct PerDeviceRuntimeArgsField {
         copy.num_words = num_words;
         copy.values = values;
         copy.present = present;
+        copy.framework_owned = framework_owned;
         return copy;
     }
 };
@@ -249,6 +253,16 @@ public:
         uint32_t first_word,
         ttsl::Span<const uint32_t> values);
     void set_per_device_runtime_args(
+        const MeshCoordinateRange& program_range,
+        KernelHandle kernel,
+        const std::optional<CoreCoord>& core,
+        uint32_t first_word,
+        uint32_t num_words,
+        ttsl::Span<const uint32_t> values_in_range_order);
+    // Metal 2.0 (ProgramSpec) programs: words of a kernel's runtime args that the runtime itself sets per device, in
+    // range order (for example the connection args of a fabric connection, which differ per device). Unlike the user's
+    // per-device args, a program-level set or update of the program's run args keeps them.
+    void set_framework_per_device_runtime_args(
         const MeshCoordinateRange& program_range,
         KernelHandle kernel,
         const std::optional<CoreCoord>& core,

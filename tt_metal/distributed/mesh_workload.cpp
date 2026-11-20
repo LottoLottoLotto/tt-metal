@@ -464,6 +464,34 @@ void MeshWorkloadImpl::set_per_device_runtime_args(
     per_device_runtime_args_.at(program_range).dirty = true;
 }
 
+void MeshWorkloadImpl::set_framework_per_device_runtime_args(
+    const MeshCoordinateRange& program_range,
+    KernelHandle kernel,
+    const std::optional<CoreCoord>& core,
+    uint32_t first_word,
+    uint32_t num_words,
+    ttsl::Span<const uint32_t> values_in_range_order) {
+    TT_FATAL(
+        values_in_range_order.size() == program_range.shape().mesh_size() * num_words,
+        "Per-device runtime args: expected {} values ({} devices x {} words), got {}",
+        program_range.shape().mesh_size() * num_words,
+        program_range.shape().mesh_size(),
+        num_words,
+        values_in_range_order.size());
+    auto* field =
+        find_per_device_runtime_args_field(program_range, kernel, core, first_word, num_words, /*metal2=*/true);
+    if (field == nullptr) {
+        // Added without metal2 tracking, so that no program-level drop is recorded for it.
+        field = &add_per_device_runtime_args_field(
+            programs_.at(program_range), program_range, kernel, core, first_word, num_words, /*metal2=*/false);
+    }
+    field->framework_owned = true;
+    std::copy(values_in_range_order.begin(), values_in_range_order.end(), field->values.begin());
+    std::fill(field->present.begin(), field->present.end(), 1);
+    field->dirty = true;
+    per_device_runtime_args_.at(program_range).dirty = true;
+}
+
 void MeshWorkloadImpl::clear_per_device_runtime_args(
     const MeshCoordinateRange& program_range,
     const MeshCoordinate& device,
@@ -500,6 +528,9 @@ void apply_run_arg_drops(PerDeviceRuntimeArgs& per_device, Program& program) {
         return;
     }
     for (auto& field : per_device.fields) {
+        if (field->framework_owned) {
+            continue;
+        }
         if (drops.drop_all || drops.pending.contains({field->kernel, field->core, field->first_word})) {
             std::fill(field->present.begin(), field->present.end(), 0);
             field->dirty = true;
