@@ -5,9 +5,8 @@
 """Multi-rank coordination for save and load.
 
 One communicator, the MPI world ``tt-run`` launches as seen through ttnn's distributed context, gives every rank its
-rank and the group size. So save and load always span every rank of the world: a world where some ranks never call
-them (the rollout ranks of a GRPO run, say) waits for those ranks at the first collective. Saving from a subset of the
-ranks is #65436; a communicator of the coordinator's own, in place of the world and its reserved tag, is #65666.
+rank and the group size, so save and load span every rank of the world. The rules callers follow are in the package
+docstring.
 
 Save and load each run as a fixed sequence of phases. A phase is one named step of local work that every rank reaches at
 the same point (collecting its live tensors, writing its shards or, on rank 0 alone, merging the ranks' plan parts),
@@ -16,24 +15,25 @@ rank so learns whether any rank's step failed, and either all of them go on to t
 that class (``IncompleteCheckpointError``, ``MissingKeyError``, ...) and a message naming the phase and the ranks that
 failed. Between phases the ranks only move bytes, rank 0 gathering the ranks' parts or broadcasting its own; those
 transfers do no local work that could fail on one rank alone. A single process is the group of one, a ``Group`` on a
-``LoopbackTransport``: its phases just run, letting their errors propagate as raised, and its transfers return their
-input, so save and load take the same path on one process and on many.
+``LoopbackTransport``: its phases just run, and its transfers return their input, so save and load take the same path
+on one process and on many. On any number of ranks a failure surfaces as a ``CheckpointError``: the class a failing
+rank reported, or ``CheckpointError`` itself for an error from outside this package (an ``OSError``, a ``TypeError``
+for a bad argument), which is then the ``__cause__`` on the rank where it was raised.
 
 An error raised by a collective itself, a peer that died under ULFM, is fatal: ``CheckpointFatalError`` propagates and
 the transport, one per process, records it, so neither this save or load nor any later one attempts another exchange.
 MPI pairs collectives by order, so another exchange could hang or be paired with an unrelated one on a rank that moved
-on. Metadata travels over MPI point-to-point (gathered to rank 0, broadcast from rank 0) under the tag ``DCP_TAG``; no
-other point-to-point traffic between the ranks may be outstanding when save or load is called. Every payload is
-serialized and size-checked inside a phase, so a payload the transport cannot carry fails on every rank. Data files go
-through the shared filesystem and are only ever opened by exact name.
+on. Metadata travels over MPI point-to-point (gathered to rank 0, broadcast from rank 0) under the tag ``DCP_TAG``.
+Every payload is serialized and size-checked inside a phase, so a payload the transport cannot carry fails on every
+rank. Data files go through the shared filesystem and are only ever opened by exact name.
 
 Save. Every rank describes its tensors and the mesh coordinates it holds (its plan part); rank 0 merges the parts,
 checking that the ranks describe every key they share alike and together hold every box, and elects one owner per box,
 so a box held by several ranks (a replica across hosts, or the same key on several meshes) is written by exactly one of
-them, the hash of the key choosing among them in rank order; rank 0 broadcasts the election; every rank writes the boxes
+them, chosen to even out the bytes each rank and device writes; rank 0 broadcasts the election; every rank writes the boxes
 it owns into its own files; the result parts (files, chunk records, checksums, this rank's generators) are gathered;
 rank 0 merges them into ``index.json`` and ``header.json``, checking that the ranks report one chunk per elected box,
-checks every data file's size through the shared filesystem, and finalizes the directory. Its phases: collecting the
+and finalizes the directory. Its phases: collecting the
 live tensors, checking the target directory, merging the plan parts, writing the shards, merging the index and
 finalizing.
 
@@ -47,24 +47,26 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections import defaultdict
 from dataclasses import dataclass, field
+from math import prod
 from typing import Any, Callable, Protocol
 
 import ttnn
 
 from . import _errors
 from ._errors import CheckpointError, CheckpointFatalError
-from ._index import FORMAT, VERSION, Entry, FileRecord, Index, _entry_from_json, _entry_to_json
+from ._index import FORMAT, VERSION, Entry, FileRecord, Index, _entry_from_json, _entry_to_json, _gc_paused
 from ._layouts import transform_from_json
 from ._planner import TensorInfo, _checked_groups
 from ._state_dict import is_structural_scalar
-from ._topology import Chunk, Label, crc31, owner
-from ._train_state import RNG_FORMAT, this_world_rank
+from ._topology import Chunk, Label, crc31
+from ._train_state import DATALOADER_RANKS, RNG_FORMAT, this_world_rank
 
 # The MPI tag of every coordinator transfer. It is reserved: the coordinator shares the world communicator with every
 # other user of ttnn's point-to-point calls (tag 0 by default; tt-train's GRPO rollout uses 22010-22013 and
 # 22101-22106), so no other protocol may use this tag while a save or load runs. A communicator of the coordinator's
-# own (MPI_Comm_dup of the world) would make the reservation unnecessary: #65666.
+# own (MPI_Comm_dup of the world) would make the reservation unnecessary.
 DCP_TAG = 0x7DC0
 # The largest payload one transfer can carry: its length travels through distributed_context_allgather_int, a C int,
 # and MPI_Send / MPI_Recv take an int count (ttnn's MPI context throws past INT_MAX).
@@ -91,6 +93,21 @@ def error_status(err: BaseException) -> int:
         if isinstance(err, cls):
             return index
     return 1
+
+
+def describe_error(err: BaseException) -> str:
+    """``"<class>: <message>"``; never raises: an exception whose ``__str__`` raises is named by its class alone."""
+    try:
+        return f"{type(err).__name__}: {err}"
+    except Exception:  # noqa: BLE001
+        return f"{type(err).__name__} (its message could not be rendered)"
+
+
+def failure_message(rank: int, err: BaseException) -> bytes:
+    """What a failing rank tells the others: UTF-8, at most ``MESSAGE_LIMIT`` bytes. It is built between the status
+    exchange and the gather every rank then waits in, so it must not raise: a message that cannot be rendered is
+    replaced, and a lone surrogate (a non-UTF-8 file name from ``os.fsdecode``) is escaped."""
+    return f"rank {rank}: {describe_error(err)}".encode("utf-8", errors="backslashreplace")[:MESSAGE_LIMIT]
 
 
 def checked_payload(payload: bytes, what: str) -> bytes:
@@ -210,12 +227,19 @@ class Group:
 
     def phase(self, name: str, fn: Callable[[], Any]) -> Any:
         """Run ``fn`` on this rank, then exchange its outcome: every rank raises when any rank failed. The group of
-        one has no other rank to tell, so its phases run ``fn`` and let its errors propagate as raised.
+        one has no other rank to tell, so its phases run ``fn``; a ``CheckpointError`` propagates as raised, and any
+        other error is raised as a ``CheckpointError`` naming the phase, with the error as its cause, as it would be on
+        many ranks, so one handler serves both.
 
         An interrupt (``KeyboardInterrupt``, ``SystemExit``) is exchanged like any failure, so the other ranks raise
         instead of waiting for this one in the next collective, and is then re-raised here as it was."""
         if self.size == 1:
-            return fn()
+            try:
+                return fn()
+            except CheckpointError:
+                raise
+            except Exception as err:  # noqa: BLE001
+                raise CheckpointError(f"{name} failed: {describe_error(err)}") from err
         status, err = 0, None
         try:
             result = fn()
@@ -228,8 +252,7 @@ class Group:
             # the failing ranks' own messages: one gather and one broadcast, on the failure path only.
             code = statuses[failed[0]]
             cls = ERROR_CLASSES[code - 1] if 0 < code <= len(ERROR_CLASSES) else CheckpointError
-            mine = f"rank {self.rank}: {type(err).__name__}: {err}" if err is not None else ""
-            parts = self.gather(mine.encode("utf-8")[:MESSAGE_LIMIT])
+            parts = self.gather(failure_message(self.rank, err) if err is not None else b"")
             joined = b"\n".join(part for part in parts if part) if self.is_coordinator else None
             messages = self.broadcast(joined).decode("utf-8", errors="replace")
             if err is not None and not isinstance(err, Exception):
@@ -237,8 +260,12 @@ class Group:
             raise cls(f"{name} failed on rank(s) {failed} of {self.size}: {messages}") from err
         return result
 
-    def gather(self, payload: bytes) -> list[bytes] | None:
-        """Every rank's payload at rank 0 (in rank order); ``None`` elsewhere. Pure transfer: it cannot desync."""
+    def gather(self, payload: Any) -> list[Any] | None:
+        """Every rank's payload at rank 0 (in rank order); ``None`` elsewhere. Pure transfer: it cannot desync. The
+        group of one returns its own payload, whatever it is, so a part ``outgoing`` kept as an object passes through.
+        """
+        if self.size == 1:
+            return [payload]
         sizes = self.allgather(len(payload))
         try:
             if self.rank == 0:
@@ -248,8 +275,10 @@ class Group:
         except Exception as err:  # noqa: BLE001
             raise self._fatal(f"point-to-point transfer failed ({err})") from err
 
-    def broadcast(self, payload: bytes | None) -> bytes:
-        """Rank 0's payload on every rank. Pure transfer."""
+    def broadcast(self, payload: Any) -> Any:
+        """Rank 0's payload on every rank. Pure transfer. The group of one returns its payload as it is."""
+        if self.size == 1:
+            return payload
         size = self.allgather(len(payload) if self.rank == 0 else 0)[0]
         try:
             if self.rank == 0:
@@ -260,6 +289,17 @@ class Group:
             return self.transport.recv_bytes(size, 0)
         except Exception as err:  # noqa: BLE001
             raise self._fatal(f"point-to-point transfer failed ({err})") from err
+
+    def outgoing(self, part: Any, what: str) -> Any:
+        """What this rank sends of ``part`` (a plan part, the election or a result part). On several ranks its bytes,
+        size-checked, so call it inside a phase: a part too large to send then fails every rank. The group of one sends
+        nothing and keeps the object, since encoding and decoding it would only cost time and a second copy of every
+        tensor's description."""
+        return part if self.size == 1 else checked_payload(part.to_bytes(), what)
+
+    def incoming(self, data: Any, cls: type) -> Any:
+        """A part ``outgoing`` sent, as a ``cls``: decoded on several ranks, the object itself on the group of one."""
+        return data if self.size == 1 else cls.from_bytes(data)
 
     def agree(self, name: str, value: int, shown: Any = None) -> list[int]:
         """Every rank's ``value``; raises when they differ, naming what this rank has: ``shown``, the thing ``value``
@@ -286,13 +326,14 @@ def state_hash(value: Any) -> int:
 # --- plan parts ------------------------------------------------------------------------------------------------------
 
 
-def info_to_json(info: TensorInfo) -> dict:
+def info_to_json(info: TensorInfo, label_id: int) -> dict:
+    """``info`` as JSON, its label named by ``label_id``, its position in the part's label table."""
     return {
         "key": info.key,
         "role": info.role,
         "dtype": info.dtype,
         "layout": info.layout,
-        "label": info.label.to_json(),
+        "label": label_id,
         "local_shape": list(info.local_shape),
         "transform": info.transform.to_json(),
         "live_keys": list(info.live_keys),
@@ -302,13 +343,13 @@ def info_to_json(info: TensorInfo) -> dict:
     }
 
 
-def info_from_json(value: dict) -> TensorInfo:
+def info_from_json(value: dict, labels: list[Label]) -> TensorInfo:
     return TensorInfo(
         key=value["key"],
         role=value["role"],
         dtype=value["dtype"],
         layout=value["layout"],
-        label=Label.from_json(value["label"]),
+        label=labels[value["label"]],
         local_shape=tuple(int(n) for n in value["local_shape"]),
         transform=transform_from_json(value["transform"]),
         live_keys=tuple(value["live_keys"]),
@@ -353,30 +394,41 @@ class RankRecord:
 
 @dataclass
 class PlanPart:
-    """One rank's contribution to the save plan: its rank record, the tensors it holds, and a hash of its scheduler
-    and dataloader state (the checkpoint stores one copy of those, which every rank restores, so they must agree)."""
+    """One rank's contribution to the save plan: its rank record, the tensors it holds, a hash of its scheduler state
+    (the checkpoint stores one copy, which every rank restores, so the ranks must agree) and one of its dataloader
+    state (stored once when the ranks agree, per rank when they differ)."""
 
     record: RankRecord
     infos: list[TensorInfo]
-    train_state_hash: int = 0
+    scheduler_hash: int = 0
+    dataloader_hash: int = 0
 
     def to_bytes(self) -> bytes:
+        # Infos name their labels by position in a table, as result parts and index.json do: many keys share one.
+        label_ids: dict[Label, int] = {}
+        infos = [info_to_json(i, label_ids.setdefault(i.label, len(label_ids))) for i in self.infos]
         return json.dumps(
             {
                 "record": self.record.to_json(),
-                "infos": [info_to_json(i) for i in self.infos],
-                "train_state_hash": self.train_state_hash,
+                "labels": [label.to_json() for label in label_ids],
+                "infos": infos,
+                "scheduler_hash": self.scheduler_hash,
+                "dataloader_hash": self.dataloader_hash,
             }
         ).encode()
 
     @staticmethod
     def from_bytes(data: bytes) -> "PlanPart":
-        value = json.loads(data.decode("utf-8"))
-        return PlanPart(
-            RankRecord.from_json(value["record"]),
-            [info_from_json(i) for i in value["infos"]],
-            int(value["train_state_hash"]),
-        )
+        # The cyclic GC paused: decoding allocates objects per key that all survive, which it would only rescan.
+        with _gc_paused():
+            value = json.loads(data.decode("utf-8"))
+            labels = [Label.from_json(label) for label in value["labels"]]
+            return PlanPart(
+                RankRecord.from_json(value["record"]),
+                [info_from_json(i, labels) for i in value["infos"]],
+                int(value["scheduler_hash"]),
+                int(value["dataloader_hash"]),
+            )
 
 
 Owner = tuple[int, tuple[int, ...]]  # (rank, mesh coordinate)
@@ -384,14 +436,15 @@ Owner = tuple[int, tuple[int, ...]]  # (rank, mesh coordinate)
 
 @dataclass
 class Election:
-    """Who writes each box of every key, how many keys the checkpoint holds, and every live name any rank holds each
-    key under. Rank 0 elects it over the ranks' plan parts and broadcasts it; every rank writes the boxes it owns, and
-    rank 0 counts the result parts' chunks against it and records the names, which a rank that writes none of a key's
-    boxes reports only here."""
+    """Who writes each box of every key, how many keys the checkpoint holds, every live name any rank holds each key
+    under, and whether the dataloader states are stored per rank (the ranks' differ). Rank 0 elects it over the
+    ranks' plan parts and broadcasts it; every rank writes the boxes it owns, and rank 0 counts the result parts'
+    chunks against it and records the names, which a rank that writes none of a key's boxes reports only here."""
 
     owners: dict[str, dict[tuple[int, ...], Owner]]
     keys: int
     live_keys: dict[str, tuple[str, ...]]
+    dataloader_per_rank: bool = False
 
     def to_bytes(self) -> bytes:
         return json.dumps(
@@ -401,18 +454,20 @@ class Election:
                     k: [[list(g), o[0], list(o[1])] for g, o in groups.items()] for k, groups in self.owners.items()
                 },
                 "live_keys": {k: list(v) for k, v in self.live_keys.items()},
+                "dataloader_per_rank": self.dataloader_per_rank,
             }
         ).encode()
 
     @staticmethod
     def from_bytes(data: bytes) -> "Election":
-        value = json.loads(data.decode("utf-8"))
-        owners = {
-            k: {tuple(g): (int(rank), tuple(int(x) for x in coord)) for g, rank, coord in groups}
-            for k, groups in value["owners"].items()
-        }
-        live_keys = {k: tuple(v) for k, v in value["live_keys"].items()}
-        return Election(owners, int(value["keys"]), live_keys)
+        with _gc_paused():
+            value = json.loads(data.decode("utf-8"))
+            owners = {
+                k: {tuple(g): (int(rank), tuple(int(x) for x in coord)) for g, rank, coord in groups}
+                for k, groups in value["owners"].items()
+            }
+            live_keys = {k: tuple(v) for k, v in value["live_keys"].items()}
+            return Election(owners, int(value["keys"]), live_keys, bool(value["dataloader_per_rank"]))
 
     def owner_of(self, rank: int) -> Callable[[str, list[Chunk]], Chunk | None]:
         """The ``owner_of`` callback for ``create_save_plan`` on ``rank``: the group's chunk when this rank writes
@@ -454,19 +509,24 @@ def merge_plan_parts(parts: list[PlanPart]) -> Election:
     """The owner election over the ranks' plan parts.
 
     A key held by several ranks must be described identically by all of them (label, per-device shape, dtype,
-    transform), and the ranks' scheduler and dataloader states must agree, since the checkpoint stores one copy that
-    every rank restores. A key's label splits it into boxes (its replica groups); each box is held by one or more
-    (rank, mesh coordinate) pairs, at least one of which must exist. The box's owner, the one pair that writes it, is
-    picked by ``_topology.owner``, a hash of the key over the pairs in order, so different keys pick different pairs
-    and the writes of replicated tensors spread over the ranks and devices.
+    transform), and the ranks' scheduler states must agree, since the checkpoint stores one copy that every rank
+    restores. Their dataloader states are stored once when they agree, and per rank when they differ (data-parallel
+    loaders that keep a seed or a shard of their own). A key's label splits it into boxes (its replica groups); each box is held by one or more
+    (rank, mesh coordinate) pairs, at least one of which must exist. The box's owner is the one pair that writes it.
+
+    The owners even out the bytes written, since the slowest rank ends the write: a box with one holder is that
+    holder's, and the others, largest first, go to the rank among their holders with the fewest bytes so far and to
+    that rank's device with the fewest. A few large keys (a vocab matrix and its moments) would otherwise decide where
+    most of the bytes land. Ties go to the lower rank and coordinate, so the same parts always elect the same owners.
     """
     parts = sorted(parts, key=lambda p: p.record.rank)
-    differing = [p.record.rank for p in parts if p.train_state_hash != parts[0].train_state_hash]
+    differing = [p.record.rank for p in parts if p.scheduler_hash != parts[0].scheduler_hash]
     if differing:
         raise CheckpointError(
-            f"the scheduler or dataloader state of rank(s) {differing} differs from rank {parts[0].record.rank}'s; a "
-            f"checkpoint stores one copy of that state, which every rank restores"
+            f"the scheduler state of rank(s) {differing} differs from rank {parts[0].record.rank}'s; a checkpoint "
+            f"stores one copy of it, which every rank restores"
         )
+    dataloader_per_rank = any(p.dataloader_hash != parts[0].dataloader_hash for p in parts)
     infos: dict[str, TensorInfo] = {}
     first_rank: dict[str, int] = {}
     members: dict[str, dict[tuple[int, ...], list[Owner]]] = {}
@@ -501,10 +561,11 @@ def merge_plan_parts(parts: list[PlanPart]) -> Election:
                 group_key = by_coord.get(tuple(coord))
                 if group_key is not None:
                     members[info.key].setdefault(group_key, []).append((part.record.rank, tuple(coord)))
-    owners: dict[str, dict[tuple[int, ...], Owner]] = {}
+    owners: dict[str, dict[tuple[int, ...], Owner]] = {key: {} for key in infos}
+    boxes: list[tuple[int, str, tuple[int, ...], list[Owner]]] = []  # (bytes, key, group, holders)
     for key, info in infos.items():
         groups, _ = _groups_of(info)
-        chosen: dict[tuple[int, ...], Owner] = {}
+        nbytes = prod(info.local_shape) * info.itemsize
         for group_key in groups:
             holders = sorted(members[key].get(group_key, []))
             if not holders:
@@ -512,9 +573,19 @@ def merge_plan_parts(parts: list[PlanPart]) -> Election:
                     f"{key}: no rank holds the box of replica group {group_key}; the ranks' local coordinates do not "
                     f"cover the label's mesh coordinates"
                 )
-            chosen[group_key] = owner(key, holders)
-        owners[key] = chosen
-    return Election(owners, len(infos), {key: tuple(sorted(names)) for key, names in aliases.items()})
+            boxes.append((nbytes, key, group_key, holders))
+    rank_bytes: dict[int, int] = defaultdict(int)
+    device_bytes: dict[Owner, int] = defaultdict(int)
+    forced = [box for box in boxes if len(box[3]) == 1]
+    free = sorted((box for box in boxes if len(box[3]) > 1), key=lambda box: (-box[0], box[1], box[2]))
+    for nbytes, key, group_key, holders in forced + free:
+        rank = min({r for r, _ in holders}, key=lambda r: (rank_bytes[r], r))
+        chosen = min((h for h in holders if h[0] == rank), key=lambda h: (device_bytes[h], h))
+        owners[key][group_key] = chosen
+        rank_bytes[chosen[0]] += nbytes
+        device_bytes[chosen] += nbytes
+    live_keys = {key: tuple(sorted(names)) for key, names in aliases.items()}
+    return Election(owners, len(infos), live_keys, dataloader_per_rank)
 
 
 # --- result parts ----------------------------------------------------------------------------------------------------
@@ -522,8 +593,9 @@ def merge_plan_parts(parts: list[PlanPart]) -> Election:
 
 @dataclass
 class ResultPart:
-    """What one rank wrote: its files, its chunk records per key, its generators and its optimizer scalars; on rank 0
-    also the user header and the scheduler and dataloader state, the one copy stored."""
+    """What one rank wrote: its files, its chunk records per key, its generators, its optimizer scalars and, when the
+    election stores dataloader states per rank, its own (``{world rank: state}``, empty without a dataloader); on rank
+    0 also the user header and the train state stored once (the scheduler, and the dataloader when the ranks agree)."""
 
     record: RankRecord
     files: list[FileRecord]
@@ -532,6 +604,7 @@ class ResultPart:
     scalars: dict = field(default_factory=dict)
     header: dict = field(default_factory=dict)
     train_state: dict = field(default_factory=dict)
+    dataloader: dict = field(default_factory=dict)
 
     def to_bytes(self) -> bytes:
         # Entries name their labels by position in a table, as in index.json.
@@ -547,33 +620,38 @@ class ResultPart:
                 "scalars": self.scalars,
                 "header": self.header,
                 "train_state": self.train_state,
+                "dataloader": self.dataloader,
             }
         ).encode()
 
     @staticmethod
     def from_bytes(data: bytes) -> "ResultPart":
-        value = json.loads(data.decode("utf-8"))
-        record = RankRecord.from_json(value["record"])
-        files = [
-            FileRecord(f["path"], int(f["nbytes"]), record.world_rank, record.mesh_id, tuple(f["coord"]))
-            for f in value["files"]
-        ]
-        labels = [Label.from_json(label) for label in value["labels"]]
-        entries = {k: _entry_from_json(k, e, labels) for k, e in value["entries"].items()}
-        return ResultPart(
-            record,
-            files,
-            entries,
-            dict(value["rng"]),
-            dict(value["scalars"]),
-            dict(value["header"]),
-            dict(value["train_state"]),
-        )
+        with _gc_paused():
+            value = json.loads(data.decode("utf-8"))
+            record = RankRecord.from_json(value["record"])
+            files = [
+                FileRecord(f["path"], int(f["nbytes"]), record.world_rank, record.mesh_id, tuple(f["coord"]))
+                for f in value["files"]
+            ]
+            labels = [Label.from_json(label) for label in value["labels"]]
+            entries = {k: _entry_from_json(k, e, labels) for k, e in value["entries"].items()}
+            return ResultPart(
+                record,
+                files,
+                entries,
+                dict(value["rng"]),
+                dict(value["scalars"]),
+                dict(value["header"]),
+                dict(value["train_state"]),
+                dict(value["dataloader"]),
+            )
 
 
 def merge_results(parts: list[ResultPart], election: Election, checkpoint_id: str) -> tuple[Index, dict]:
     """Rank 0's merge: one file table, one entry per key with every rank's chunks (exactly one per elected box), the
-    world record, and the header (rank 0's user header and scheduler/dataloader state, every rank's generators)."""
+    world record, and the header (rank 0's user header and the train state stored once, every rank's generators and,
+    when the election says so, every rank's dataloader state). The parts are left as they were: the index holds
+    entries of its own."""
     parts = sorted(parts, key=lambda p: p.record.rank)
     files: list[FileRecord] = []
     entries: dict[str, Entry] = {}
@@ -597,8 +675,7 @@ def merge_results(parts: list[ResultPart], election: Election, checkpoint_id: st
                     )
                 have.chunks.extend(chunks)
             else:
-                entry.chunks = chunks
-                entries[key] = entry
+                entries[key] = dataclasses.replace(entry, chunks=chunks)
     for key, entry in entries.items():
         # The writers' parts carry only their own names for a key; the election has every rank's.
         entry.live_keys = tuple(sorted(set(entry.live_keys) | set(election.live_keys.get(key, ()))))
@@ -616,6 +693,8 @@ def merge_results(parts: list[ResultPart], election: Election, checkpoint_id: st
     train_state = dict(rank0.train_state)
     if rng_ranks:
         train_state["rng"] = {"format": RNG_FORMAT, "ranks": rng_ranks}
+    if election.dataloader_per_rank:
+        train_state[DATALOADER_RANKS] = {k: v for part in parts for k, v in part.dataloader.items()}
     world = {"group_size": len(parts), "ranks": [p.record.to_json() for p in parts]}
     scalars = dict(rank0.scalars)
     # A param group's member list is per rank (each rank's optimizer holds the parameters of its own mesh); the index

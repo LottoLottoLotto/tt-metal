@@ -14,11 +14,13 @@ Launch on one Blackhole host with two chips per rank (the ttnn dual-rank descrip
 Every rank writes only the shards of the two coordinates it holds; rank 0 merges the parts into one index; a load
 on the same world restores every rank's shards bit for bit and each rank's own generators. Both ranks must see the
 same checkpoint directory: ``DCP_SHARED_TMP`` names it (a shared filesystem when the ranks run on two hosts), the
-system temporary directory otherwise. Without ``tt-run`` the module skips.
+system temporary directory otherwise. Without ``tt-run`` the module skips; ``test_dcp_cross_world`` runs it whole
+under tt-run, which is how CI runs it.
 """
 
 import os
 import random
+import shutil
 
 import numpy as np
 import pytest
@@ -32,7 +34,7 @@ from tp_block import TPBlock, fresh_tp, train_step
 import ttml
 import ttml.distributed_checkpointing as dcp
 from ttml.common.schedulers import CosineAnnealingScheduler
-from ttml.distributed_checkpointing import _save
+from ttml.distributed_checkpointing import _load, _save
 
 pytestmark = [pytest.mark.requires_device, pytest.mark.timeout(1800)]
 
@@ -150,8 +152,8 @@ def test_rank_failing_mid_save_stops_every_rank(two_ranks, expect_error):
 
 
 def test_a_rank_called_with_a_bad_argument_stops_every_rank(two_ranks, expect_error):
-    """A rank whose find_latest saw no checkpoint passes None. The arguments are checked inside the first phase, so
-    every rank raises, where the other rank used to wait in the first collective forever."""
+    """A rank whose find_latest saw no checkpoint passes None: every rank raises, naming that rank, in the first
+    phase of save and of load, and nothing is created."""
     rank, local, root = two_ranks
     model, params, opt = fresh_tp(DIM)
     path = os.path.join(root, "bad_argument") if rank == 0 else None
@@ -166,7 +168,7 @@ def test_a_rank_called_with_a_bad_argument_stops_every_rank(two_ranks, expect_er
 
 def test_ranks_whose_optimizers_differ_are_refused(two_ranks, expect_error):
     """The index holds one copy of the optimizer's scalars, rank 0's. Ranks whose learning rates differ, or of which
-    one passes no optimizer, are refused on every rank, where each rank used to load rank 0's values silently."""
+    one passes no optimizer, are refused on every rank, and nothing is written."""
     rank, local, root = two_ranks
     model, params, opt = fresh_tp(DIM)
     path = os.path.join(root, "optimizers_differ")
@@ -183,8 +185,8 @@ def test_ranks_whose_optimizers_differ_are_refused(two_ranks, expect_error):
 
 def test_truncated_file_on_one_rank_stops_all(two_ranks, expect_error):
     """Every rank opens and checks its data files while the load is planned, so a truncated file of rank 1's stops
-    every rank before any rank places anything. Rank 0 may read the file too (the election spreads replicated boxes
-    over both ranks' files) or not; either way it used to restore its tensors first."""
+    every rank before any rank places anything, whether or not rank 0 reads that file too (the election spreads
+    replicated boxes over both ranks' files)."""
     rank, local, root = two_ranks
     model, params, opt = fresh_tp(DIM)
     train_step(model, opt, DIM)
@@ -202,6 +204,118 @@ def test_truncated_file_on_one_rank_stops_all(two_ranks, expect_error):
     ):
         dcp.load(path, model=fresh)
     assert_same_shards(model_shards(fresh_params, local), before, "no rank placed anything")
+    ttnn.distributed_context_barrier()
+
+
+def test_a_directory_the_ranks_do_not_share_is_refused_before_any_write(two_ranks, monkeypatch, expect_error):
+    """A checkpoint directory on each host's own disk: rank 1 does not see the staging directory rank 0 created, and
+    must not make one of its own. Every rank raises before anything is written, and rank 1's disk is left as it was.
+    Rank 1 stands in for the other host by resolving the staging directory under a directory of its own."""
+    rank, local, root = two_ranks
+    model, params, opt = fresh_tp(DIM)
+    path = os.path.join(root, "not_shared")
+    own_disk = os.path.join(root, "rank1_disk")
+    if rank == 1:
+        os.makedirs(own_disk)
+        real_staging_dir = _save.staging_dir
+        monkeypatch.setattr(
+            _save, "staging_dir", lambda d, nonce: os.path.join(own_disk, os.path.basename(real_staging_dir(d, nonce)))
+        )
+    with expect_error(
+        dcp.CheckpointError,
+        r"creating the staging directory failed on rank\(s\) \[1\] of 2: rank 1: CheckpointError: .*, which rank 0 "
+        r"created, does not exist on rank 1: the checkpoint directory must be on a filesystem every rank shares",
+    ):
+        dcp.save(path, model=model, optimizer=opt)
+    monkeypatch.undo()
+    ttnn.distributed_context_barrier()
+    assert not os.path.exists(path) and not any(n.startswith("not_shared.partial-") for n in os.listdir(root))
+    assert os.listdir(own_disk) == [], "rank 1 made no staging directory of its own"
+    ttnn.distributed_context_barrier()
+    if rank == 0:
+        shutil.rmtree(own_disk)
+    ttnn.distributed_context_barrier()
+
+
+def test_ranks_reading_different_checkpoints_at_one_path_are_refused(two_ranks, monkeypatch, expect_error):
+    """Hosts holding their own copies at one path agree on the directory but would load different checkpoints, so the
+    ranks also agree on the index's id and creation time, and nothing is placed. Rank 1 stands in for a host holding an
+    older copy by reading an index with another creation time."""
+    rank, local, root = two_ranks
+    model, params, opt = fresh_tp(DIM)
+    path = os.path.join(root, "own_copies")
+    dcp.save(path, model=model)
+    if rank == 1:
+        real_read_index = _load.read_index
+
+        def older_copy(directory):
+            index = real_read_index(directory)
+            index.created = "2000-01-01T00:00:00Z"
+            return index
+
+        monkeypatch.setattr(_load, "read_index", older_copy)
+    fresh, fresh_params, _ = fresh_tp(DIM)
+    before = model_shards(fresh_params, local)
+    with expect_error(dcp.CheckpointError, r"the ranks disagree on the checkpoint \(its id and creation time\): rank "):
+        dcp.load(path, model=fresh)
+    assert_same_shards(model_shards(fresh_params, local), before, "no rank placed anything")
+    ttnn.distributed_context_barrier()
+
+
+def test_a_rank_that_placed_its_tensors_says_so_when_another_rank_fails(two_ranks, monkeypatch, expect_error):
+    """Rank 1 fails placing its first tensor, after rank 0 placed all of its own. Rank 0's error says how many tensors
+    it placed and that its model and optimizer are partly restored; rank 1's, which placed none, does not."""
+    rank, local, root = two_ranks
+    model, params, opt = fresh_tp(DIM)
+    train_step(model, opt, DIM)
+    path = os.path.join(root, "placed_on_rank0")
+    dcp.save(path, model=model, optimizer=opt)
+    fresh, fresh_params, fresh_opt = fresh_tp(DIM)
+    if rank == 1:
+
+        def fail(live, *args):
+            raise RuntimeError("simulated device out of memory")
+
+        monkeypatch.setattr(_load, "_place", fail)
+    pattern = (
+        r"^reading and placing the shards failed on rank\(s\) \[1\] of 2: rank 1: RuntimeError: simulated device out of "
+        r"memory"
+    )
+    if rank == 0:
+        pattern += (
+            r"; rank 0 had placed (\d+) of \1 tensors, so the model and optimizer are partly restored: load again"
+        )
+    with expect_error(dcp.CheckpointError, pattern) as raised:
+        dcp.load(path, model=fresh, optimizer=fresh_opt)
+    assert rank == 0 or "partly restored" not in str(raised.value), "rank 1 placed nothing"
+    ttnn.distributed_context_barrier()
+
+
+def test_differing_dataloaders_are_stored_per_rank(two_ranks, expect_error):
+    """Data-parallel loaders keep a position (a seed, a shard) of their own: the ranks' differing states are stored
+    per world rank, and each rank restores its own. A rank that saved without a dataloader has no state to restore,
+    which a strict load with one refuses on every rank."""
+    rank, local, root = two_ranks
+    model, params, opt = fresh_tp(DIM)
+    loader = Loader()
+    for _ in range(3 + rank):
+        loader.advance()
+    path = os.path.join(root, "per_rank_loaders")
+    dcp.save(path, model=model, dataloader=loader)
+    stored = dcp.read_train_state(path)
+    assert stored["dataloader_ranks"] == {"0": {"position": 3}, "1": {"position": 4}} and "dataloader" not in stored
+    resumed = Loader()
+    assert "dataloader" in dcp.load(path, model=model, dataloader=resumed, rng=False).restored
+    assert resumed.position == 3 + rank, "each rank restores its own"
+
+    path = os.path.join(root, "one_loader")
+    dcp.save(path, model=model, dataloader=loader if rank == 0 else None)
+    assert dcp.read_train_state(path)["dataloader_ranks"] == {"0": {"position": 3}}
+    with expect_error(
+        dcp.MissingKeyError,
+        r"reading the index and collecting the live tensors failed on rank\(s\) \[1\] of 2: .*train_state/dataloader",
+    ):
+        dcp.load(path, model=model, dataloader=Loader(), rng=False)
     ttnn.distributed_context_barrier()
 
 
@@ -243,7 +357,7 @@ def test_a_failure_on_one_rank_stops_every_rank_and_names_it(two_ranks, monkeypa
 def test_a_checkpoint_for_the_one_process_load(two_ranks):
     """The save half of a cross-world case: two ranks co-owning the [1, 4] mesh write a TPBlock checkpoint, so most
     keys' chunks come from both ranks' files, and dump their own shards next to it. ``test_dcp_cross_world`` runs this
-    test alone, with ``DCP_CROSS_WORLD_DIR`` set, then loads the checkpoint on one process."""
+    module with ``DCP_CROSS_WORLD_DIR`` set, then loads the checkpoint on one process."""
     out = os.environ.get("DCP_CROSS_WORLD_DIR")
     if not out:
         pytest.skip("run by test_dcp_cross_world with DCP_CROSS_WORLD_DIR set")

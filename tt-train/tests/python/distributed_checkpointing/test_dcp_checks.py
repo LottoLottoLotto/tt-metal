@@ -22,6 +22,7 @@ from ttml.distributed_checkpointing._state_dict import (
     _cpp_bound_params,
     _lint_fusion,
     _python_parameters,
+    check_member_union,
     check_param_groups,
     check_undeclared_fusion,
     reshard_fsdp_modules,
@@ -66,6 +67,24 @@ def test_param_groups_are_checked_before_anything_is_placed(expect_error):
         check_param_groups(_StubOptimizer([["c"], ["a", "b"]]), saved, strict=True)
     with expect_error(CheckpointError, "2 optimizer param groups, the live optimizer 1"):
         check_param_groups(_StubOptimizer([["a", "b", "c"]]), saved, strict=True)
+
+
+def test_strict_needs_the_ranks_to_hold_every_member_between_them(expect_error):
+    """Under strict, the ranks' live members of each group, together, must be the checkpoint's: one rank may hold part
+    of a group, but a param no rank holds is refused, since an optimizer without per-parameter state (SGD without
+    momentum) would otherwise stop training it without a word."""
+    saved = {
+        "optimizer/num_param_groups": 2,
+        "optimizer/param_groups.0.params": "a\nb",
+        "optimizer/param_groups.1.params": "c",
+    }
+    check_member_union(saved, [{"0": ["a", "b"], "1": ["c"]}])  # one process holding everything
+    check_member_union(saved, [{"0": ["a"], "1": ["c"]}, {"0": ["b"], "1": []}])  # two ranks, each holding part
+    with expect_error(CheckpointError, r"^optimizer param group 0: the checkpoint's group holds params no rank's "):
+        check_member_union(saved, [{"0": ["a"], "1": ["c"]}])
+    with expect_error(CheckpointError, r"group 1: .* no rank's optimizer holds: \['c'\]"):
+        check_member_union(saved, [{"0": ["a"], "1": []}, {"0": ["b"], "1": []}])
+    check_member_union(saved, [{}])  # no live member lists: check_param_groups warned, nothing to compare
 
 
 def test_strict_load_needs_optimizer_state(expect_error):
@@ -255,18 +274,20 @@ def test_a_lazy_parameter_is_named_by_its_key(expect_error):
 
 
 def test_argument_errors_come_first(tmp_path, expect_error):
-    """Argument errors are TypeErrors and ValueErrors, raised before anything is touched."""
+    """Argument errors are raised before anything is touched, as CheckpointErrors naming the step that failed, with
+    the TypeError or ValueError as their cause, as they are on every rank of a multi-rank world."""
     path = str(tmp_path / "step_0000001")
-    with expect_error(TypeError, "save needs a model and/or an optimizer"):
-        dcp.save(path)
-    with expect_error(TypeError, "pass model= as well"):
-        dcp.load(path, optimizer=object())
-    with expect_error(TypeError, "header must be a dict, not list"):
-        dcp.save(path, model=object(), header=[1])
-    with expect_error(ValueError, "threads must be at least 1, got 0"):
-        dcp.save(path, model=object(), threads=0)
-    with expect_error(ValueError, "max_inflight_bytes must be positive, got 0"):
-        dcp.save(path, model=object(), max_inflight_bytes=0)
-    with expect_error(ValueError, "threads must be at least 1, got -1"):
-        dcp.load(path, model=object(), threads=-1)
+    save, load = "collecting the live tensors", "checking the arguments"
+    cases = [
+        (lambda: dcp.save(path), save, TypeError, "save needs a model and/or an optimizer"),
+        (lambda: dcp.load(path, optimizer=object()), load, TypeError, r"optimizer state .*; pass model= as well"),
+        (lambda: dcp.save(path, model=object(), header=[1]), save, TypeError, "header must be a dict, not list"),
+        (lambda: dcp.save(path, model=object(), threads=0), save, ValueError, "threads must be at least 1, got 0"),
+        (lambda: dcp.save(path, model=object(), max_inflight_bytes=0), save, ValueError, "max_inflight_bytes must"),
+        (lambda: dcp.load(path, model=object(), threads=-1), load, ValueError, "threads must be at least 1, got -1"),
+    ]
+    for call, step, cause, message in cases:
+        with expect_error(dcp.CheckpointError, rf"^{step} failed: {cause.__name__}: {message}") as raised:
+            call()
+        assert type(raised.value) is dcp.CheckpointError and type(raised.value.__cause__) is cause, message
     assert os.listdir(tmp_path) == []

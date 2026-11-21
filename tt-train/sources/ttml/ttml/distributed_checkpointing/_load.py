@@ -36,11 +36,13 @@ from ._state_dict import (
     TTNN_DTYPES,
     LiveTensor,
     check_label_unchanged,
+    check_member_union,
     check_param_groups,
     check_threads,
     check_undeclared_fusion,
     collect_model,
     collect_optimizer,
+    live_group_members,
     local_coords,
     mesh_device,
     reshard_fsdp_modules,
@@ -123,14 +125,77 @@ def _check_crc(plan: KeyPlan, chunk_index: int, crc: int, path: str) -> None:
         )
 
 
+# A rank reads a chunk with one pread, and checks it against the CRC32 save recorded for it, when its destination
+# shards need at least this share of the chunk; otherwise it reads only the runs they need, which the checksum cannot
+# cover. On one host the destination shards together cover every chunk, and of two ranks one needs at least half.
+WHOLE_READ_SHARE = 0.5
+
+
+def _needed_bytes(plan: KeyPlan) -> dict[int, int]:
+    """Per chunk of the entry, the bytes this rank's destination shards need of it."""
+    needed: dict[int, int] = {}
+    for item in plan.reads:
+        needed[item.chunk] = needed.get(item.chunk, 0) + item.src.volume * plan.info.itemsize
+    return needed
+
+
+def chunk_reads(plan: LoadPlan) -> tuple[list[list], list[list]]:
+    """``(read in part, read whole although only part is needed)`` over this rank's plan, as ``[key, chunk]`` pairs.
+    A chunk split over three or more loading ranks can be read in part by every one of them, and then no rank checks
+    its CRC32; ``elect_checkers`` uses both lists to pick one reader of each such chunk to read it whole."""
+    in_part: list[list] = []
+    whole_of_part: list[list] = []
+    for kplan in plan.keys.values():
+        for chunk, needed in sorted(_needed_bytes(kplan).items()):
+            nbytes = kplan.entry.chunks[chunk].nbytes
+            if needed < WHOLE_READ_SHARE * nbytes:
+                in_part.append([kplan.entry.key, chunk])
+            elif needed < nbytes:
+                whole_of_part.append([kplan.entry.key, chunk])
+    return in_part, whole_of_part
+
+
+def elect_checkers(index: Index, reports: list[tuple[list[list], list[list]]]) -> list[list[list]]:
+    """Rank 0's pick, over every rank's ``chunk_reads``: for each chunk read only in part, by every rank that reads it,
+    the reader that reads it whole and checks its CRC32, so no chunk the load reads goes unchecked. Largest chunks
+    first, each to the reader with the fewest such bytes so far (ties to the lower rank). Returns per rank the
+    ``[key, chunk]`` pairs it reads whole."""
+    readers: dict[tuple[str, int], list[int]] = {}
+    for rank, (in_part, _) in enumerate(reports):
+        for key, chunk in in_part:
+            readers.setdefault((key, int(chunk)), []).append(rank)
+    for _, whole_of_part in reports:
+        for key, chunk in whole_of_part:
+            readers.pop((key, int(chunk)), None)  # another rank reads it whole and checks it
+
+    def size(pair: tuple[str, int]) -> int:
+        return index.entries[pair[0]].chunks[pair[1]].nbytes
+
+    extra = [0] * len(reports)
+    checkers: list[list[list]] = [[] for _ in reports]
+    for pair in sorted(readers, key=lambda p: (-size(p), p)):
+        rank = min(readers[pair], key=lambda r: (extra[r], r))
+        checkers[rank].append(list(pair))
+        extra[rank] += size(pair)
+    return checkers
+
+
 def _read_chunk(
-    fd: int, data_start: int, plan: KeyPlan, items: list[ReadItem], itemsize: int, carrier, arrays: dict, path: str
+    fd: int,
+    data_start: int,
+    plan: KeyPlan,
+    items: list[ReadItem],
+    itemsize: int,
+    carrier,
+    arrays: dict,
+    path: str,
+    whole: bool = False,
 ) -> int:
-    """The reads of one chunk: one ``pread`` of the whole chunk, sliced in memory, when the items need at least half
-    of it (on a single host the destination shards together cover every chunk), else one read per contiguous run. A
-    chunk that is its one destination shard, as in a same-world load, is read into the shard's array itself. A whole
-    chunk is checked against the CRC32 that save recorded for it; a partial read cannot be, since the checksum covers
-    the whole chunk. Returns bytes read."""
+    """The reads of one chunk: one ``pread`` of the whole chunk, sliced in memory, when the items need at least
+    ``WHOLE_READ_SHARE`` of it or ``whole`` says so (this rank was elected to check it), else one read per contiguous
+    run. A chunk that is its one destination shard, as in a same-world load, is read into the shard's array itself. A
+    whole chunk is checked against the CRC32 that save recorded for it; a partial read cannot be, since the checksum
+    covers the whole chunk. Returns bytes read."""
     record = plan.entry.chunks[items[0].chunk]
     sizes = tuple(record.box.sizes)
     dest = arrays[items[0].group]
@@ -139,7 +204,7 @@ def _read_chunk(
         _check_crc(plan, items[0].chunk, zlib.crc32(dest), path)
         return record.nbytes
     needed = sum(it.src.volume for it in items) * itemsize
-    if 2 * needed >= record.nbytes:
+    if whole or needed >= WHOLE_READ_SHARE * record.nbytes:
         raw = pread_all(fd, record.nbytes, data_start + record.data_offset)
         _check_crc(plan, items[0].chunk, zlib.crc32(raw), path)
         chunk = np.frombuffer(raw, dtype=carrier).reshape(record.box.sizes)
@@ -246,12 +311,15 @@ def _read_and_place(
     by_key: dict[str, LiveTensor],
     threads: int | None,
     local: set[tuple[int, ...]],
-) -> tuple[int, int, float, float, list[str]]:
-    """Read every planned key into host arrays and place the shards of the coordinates in ``local`` on the device;
-    returns the bytes read, the number of reads, the seconds spent waiting for reads and placing, and the keys placed.
-    A failure once a tensor was placed raises a ``CheckpointError`` that says the live state is partly restored."""
+    placed: list[str],
+    check: set[tuple[str, int]],
+) -> tuple[int, int, float, float]:
+    """Read every planned key into host arrays and place the shards of the coordinates in ``local`` on the device,
+    appending each key placed to ``placed``; the ``(key, chunk)`` pairs in ``check`` are read whole and checked
+    (``elect_checkers``). Returns the bytes read, the number of reads and the seconds spent waiting for reads and
+    placing. A failure once a tensor was placed raises a ``CheckpointError`` that says the live state is partly
+    restored."""
     fds, data_start, paths = files.fds, files.data_start, files.paths
-    placed: list[str] = []
     device = mesh_device()
     bytes_read = 0
     reads = 0
@@ -278,6 +346,7 @@ def _read_and_place(
                     carrier,
                     arrays,
                     paths[its[0].file],
+                    (kplan.entry.key, its[0].chunk) in check,
                 )
                 for its in by_chunk.values()
             ]
@@ -302,7 +371,7 @@ def _read_and_place(
             read_s += t_read_done - t_key
             place_s += time.perf_counter() - t_read_done
             reads += len(futures)
-    return bytes_read, reads, read_s, place_s, placed
+    return bytes_read, reads, read_s, place_s
 
 
 def load(
@@ -322,7 +391,8 @@ def load(
     (default), a live tensor without an entry, or an entry of a requested role (model, and optimizer state when
     ``optimizer`` is passed) without a live tensor, is an error; otherwise they are listed in the result. Optimizer
     scalars (steps, learning rates) are restored through ``set_state_dict``. ``scheduler`` and ``dataloader`` are
-    restored through their ``set_state_dict`` from the state ``save`` stored. With ``rng`` so is every random generator
+    restored through their ``set_state_dict`` from the state ``save`` stored (a dataloader from this world rank's own
+    when the saving ranks' states differed). With ``rng`` so is every random generator
     ``save`` captured for this world rank (ttml, ttml.init, python, numpy, torch when imported). By default (``None``)
     the generators are restored whenever a scheduler or a dataloader is, since a resume that restores those but keeps
     the current generators takes a different step; ``rng=False`` keeps them (a deliberate reseed), ``rng=True``
@@ -341,14 +411,9 @@ def load(
     say so after, and raises a ``CheckpointError`` naming it, with the tensors, the optimizer scalars and the scheduler
     (when the dataloader refuses) already restored.
 
-    Under ``tt-run`` with several ranks the call is collective: every rank calls it with the same ``ckpt_dir``,
-    ``strict`` and optimizer-or-not (checked before anything is read), restores the shards of the coordinates it holds,
-    and ``strict`` judges unexpected entries over the union of the ranks' live tensors. A failure on any rank makes
-    every rank raise the same error class, and no point-to-point MPI traffic between the ranks may be outstanding when
-    load is called. No other code may use the MPI tag ``DCP_TAG`` (``0x7DC0``) on the world communicator while it runs:
-    the ranks' metadata travels under it. Every rank of the world must call load (#65436 tracks a subset of the ranks;
-    #65666 a communicator of its own, without the reserved tag). A single process is the group of one and takes the same
-    path.
+    Under ``tt-run`` with several ranks the call is collective (the package docstring has the rules): every rank
+    restores the shards of the coordinates it holds, and ``strict`` judges unexpected entries over the union of the
+    ranks' live tensors.
     """
     t0 = time.perf_counter()
     rng_by_default = rng is None
@@ -385,7 +450,9 @@ def load(
         index: Index = read_index(ckpt_dir)
         header = read_checked_header(ckpt_dir)
         train_state = train_state_of(header, ckpt_dir)
-        missing_state = missing_train_state(train_state, scheduler=scheduler, dataloader=dataloader, rng=rng)
+        missing_state = missing_train_state(
+            train_state, scheduler=scheduler, dataloader=dataloader, rng=rng, world_rank=world_rank
+        )
         if strict and missing_state:
             raise missing_train_state_error(missing_state, rng_by_default=rng_by_default)
         check_train_state(train_state, scheduler=scheduler, dataloader=dataloader, rng=rng, world_rank=world_rank)
@@ -398,12 +465,19 @@ def load(
         if optimizer is not None:
             state_live, _ = collect_optimizer(optimizer, live)
             live.extend(state_live)
-        return index, header, train_state, missing_state, fsdp_states, live, set(local_coords())
+        return index, header, train_state, missing_state, live, set(local_coords())
 
     # Even the local work runs inside a phase, so a rank that fails here cannot leave the others waiting in the next
     # collective; on a single process the phase just runs it.
-    index, header, train_state, missing_state, fsdp_states, live, local = group.phase(
+    index, header, train_state, missing_state, live, local = group.phase(
         "reading the index and collecting the live tensors", open_and_collect
+    )
+    # Hosts holding their own copies at one path (a relative path into per-host clones, say) agree on the directory
+    # string but read different checkpoints: the ranks also agree on the index's id and creation time.
+    group.agree(
+        "the checkpoint (its id and creation time)",
+        crc31(f"{index.checkpoint_id}\n{index.created}"),
+        shown=f"{index.checkpoint_id}, created {index.created}",
     )
     by_key = {lt.key: lt for lt in live}
     roles = {"param", "buffer"} | ({"optimizer_state"} if optimizer is not None else set())
@@ -425,8 +499,14 @@ def load(
     def plan_and_report() -> tuple[LoadPlan, bytes]:
         plan = plan_locally()
         files.open(ckpt_dir, index, plan)  # before any rank places anything
-        used = sorted({kp.entry.key for kp in plan.keys.values()})
-        return plan, checked_payload(json.dumps(used).encode(), "this rank's planned keys")
+        in_part, whole_of_part = chunk_reads(plan)
+        report = {
+            "keys": sorted({kp.entry.key for kp in plan.keys.values()}),
+            "members": live_group_members(optimizer) if optimizer is not None else {},
+            "in_part": in_part,
+            "whole_of_part": whole_of_part,
+        }
+        return plan, checked_payload(json.dumps(report).encode(), "this rank's planned keys")
 
     try:
         plan, used_bytes = group.phase("planning the load", plan_and_report)
@@ -435,12 +515,17 @@ def load(
         def judge() -> bytes | None:
             if not group.is_coordinator:
                 return None
-            union_used = {key for part in gathered for key in json.loads(part.decode("utf-8"))}
-            return checked_payload(
-                json.dumps(unexpected_keys(index, union_used, roles)).encode(), "the unexpected keys"
-            )
+            reports = [json.loads(part.decode("utf-8")) for part in gathered]
+            union_used = {key for report in reports for key in report["keys"]}
+            if strict and optimizer is not None:
+                check_member_union(index.scalars, [report["members"] for report in reports])
+            checkers = elect_checkers(index, [(report["in_part"], report["whole_of_part"]) for report in reports])
+            verdict = {"unexpected": unexpected_keys(index, union_used, roles), "checkers": checkers}
+            return checked_payload(json.dumps(verdict).encode(), "the unexpected keys and the elected checkers")
 
-        plan.unexpected = json.loads(group.broadcast(group.phase("judging the unexpected entries", judge)))
+        verdict = json.loads(group.broadcast(group.phase("judging the unexpected entries", judge)))
+        plan.unexpected = verdict["unexpected"]
+        check = {(key, int(chunk)) for key, chunk in verdict["checkers"][group.rank]}
         if strict and plan.unexpected:
             raise UnexpectedKeyError(
                 f"{len(plan.unexpected)} checkpoint entr(ies) have no live tensor: {plan.unexpected[:5]}"
@@ -448,9 +533,21 @@ def load(
         stats: dict[str, float] = {"plan_s": time.perf_counter() - t0}
 
         t1 = time.perf_counter()
-        bytes_read, reads, read_s, place_s, placed = group.phase(
-            "reading and placing the shards", lambda: _read_and_place(plan, files, by_key, threads, local)
-        )
+        placed: list[str] = []
+        try:
+            bytes_read, reads, read_s, place_s = group.phase(
+                "reading and placing the shards",
+                lambda: _read_and_place(plan, files, by_key, threads, local, placed, check),
+            )
+        except CheckpointError as err:
+            if placed and err.__cause__ is None:
+                # Another rank's failure stopped the load after this rank placed tensors; a failure of this rank's
+                # own (the cause) already says how many it placed.
+                raise type(err)(
+                    f"{err}; rank {group.rank} had placed {len(placed)} of {len(plan.keys)} tensors, so the model and "
+                    f"optimizer are partly restored: load again or discard them"
+                ) from err
+            raise
         stats["read_and_place_s"] = time.perf_counter() - t1
         stats["read_s"] = read_s
         stats["place_s"] = place_s

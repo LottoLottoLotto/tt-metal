@@ -7,9 +7,12 @@ results into one index, and the phase protocol over an in-process transport (a f
 number; a failing collective is fatal and ends the exchanges)."""
 
 import dataclasses
+import gc
 import json
+import os
 import threading
 
+import pytest
 import ttnn
 from dcp_oracle import tp_split_of
 
@@ -27,9 +30,14 @@ from ttml.distributed_checkpointing._coordinator import (
     merge_plan_parts,
     merge_results,
 )
-from ttml.distributed_checkpointing._errors import CheckpointError, CheckpointFatalError, IncompleteCheckpointError
+from ttml.distributed_checkpointing._errors import (
+    CheckpointError,
+    CheckpointFatalError,
+    IncompleteCheckpointError,
+    MissingKeyError,
+)
 from ttml.distributed_checkpointing._index import ChunkRecord, Entry, FileRecord, data_file_name
-from ttml.distributed_checkpointing._layouts import Identity
+from ttml.distributed_checkpointing._layouts import Identity, Pad
 from ttml.distributed_checkpointing._planner import TensorInfo, create_save_plan
 from ttml.distributed_checkpointing._state_dict import check_param_groups, is_structural_scalar, restore_scalars
 from ttml.distributed_checkpointing._topology import Label, Placement, dist_coords
@@ -97,6 +105,31 @@ def test_the_election_gives_every_box_one_owner_that_holds_it():
     assert Election.from_bytes(election.to_bytes()) == election
 
 
+def test_the_election_evens_out_the_bytes_each_rank_and_device_writes():
+    """A few large replicated keys decide where most bytes land. The boxes one holder has are charged first, then the
+    others, largest first, go to the least-loaded rank among their holders and its least-loaded device, so two ranks
+    end up writing equal shares and their devices similar ones."""
+    coords = {0: [(0, 0), (0, 1)], 1: [(0, 2), (0, 3)]}
+    sharded = _info("model/w", [R, S(3)], (1, 4), (1, 1, 32, 16))  # one box per device: forced
+    rows = [512, 384, 256, 256, 128, 128, 64, 64, 32, 32, 16, 16]  # replicated keys of very different sizes
+    replicated = [_info(f"model/r{i}", [R, R], (1, 4), (1, 1, n, 64)) for i, n in enumerate(rows)]
+    parts = [PlanPart(_record(r, coords[r]), [sharded, *replicated]) for r in (0, 1)]
+    election = merge_plan_parts(parts)
+    assert election == merge_plan_parts(list(reversed(parts))), "the same parts always elect the same owners"
+    rank_bytes, device_bytes = {0: 0, 1: 0}, {}
+    for info in [sharded, *replicated]:
+        for rank, coord in election.owners[info.key].values():
+            nbytes = 2 * info.local_shape[2] * info.local_shape[3]
+            rank_bytes[rank] += nbytes
+            device_bytes[coord] = device_bytes.get(coord, 0) + nbytes
+    assert rank_bytes[0] == rank_bytes[1], rank_bytes
+    assert len(device_bytes) == 4 and max(device_bytes.values()) <= 1.25 * min(device_bytes.values()), device_bytes
+    # A key one rank holds alone is that rank's, whatever it already writes.
+    alone = _info("model/alone", [R, R], (1, 4), (1, 1, 512, 64))
+    election = merge_plan_parts([PlanPart(_record(0, coords[0]), [alone]), PlanPart(_record(1, coords[1]), [])])
+    assert {r for r, _ in election.owners["model/alone"].values()} == {0}
+
+
 def test_each_rank_plans_only_its_owned_chunks_and_files():
     parts = _big_mesh_parts()
     election = merge_plan_parts(parts)
@@ -126,16 +159,67 @@ def test_each_rank_plans_only_its_owned_chunks_and_files():
     assert "model/b" not in entries(plans[other]) and "model/b" in entries(plans[bias_writer])
 
 
-def test_ranks_must_cover_and_agree_on_the_label(expect_error):
-    """The ranks must hold every coordinate of a label between them, and describe it the same way."""
+def test_ranks_must_cover_the_label(expect_error):
+    """The ranks must hold every coordinate of a label between them."""
     infos = [_info("model/w", [R, S(3)], (1, 4), (1, 1, 32, 16))]
     with expect_error(CheckpointError, "no rank holds"):
         merge_plan_parts([PlanPart(_record(0, [(0, 0), (0, 1)]), infos), PlanPart(_record(1, [(0, 2)]), infos)])
-    different = [_info("model/w", [R, S(2)], (1, 4), (1, 1, 32, 16))]
-    with expect_error(CheckpointError, "describes it differently"):
+
+
+# One change per field _same_description compares; each is made alone, the other fields left as rank 0 has them.
+DESCRIPTION_CHANGES = {
+    "role": {"role": "buffer"},
+    "dtype": {"dtype": "F32"},
+    "label": {"label": _label([R, S(2)], (1, 4))},
+    "local_shape": {"local_shape": (1, 1, 32, 32)},
+    "transform": {"transform": Pad(2, logical=30, padded=32)},
+    "param_ref": {"param_ref": "model/v"},
+    "state_path": {"state_path": ("exp_avg",)},
+    "tp_split": {"tp_split": (1, 1, 1, 1)},
+}
+
+
+@pytest.mark.parametrize("field", sorted(DESCRIPTION_CHANGES))
+def test_ranks_must_describe_a_shared_key_alike(field, expect_error):
+    """Ranks holding one key must describe it alike: a difference in any one field of the description is refused."""
+    mine = _info("model/w", [R, S(3)], (1, 4), (1, 1, 32, 16))
+    theirs = dataclasses.replace(mine, **DESCRIPTION_CHANGES[field])
+    with expect_error(CheckpointError, r"^model/w: rank 1 describes it differently from rank 0 "):
         merge_plan_parts(
-            [PlanPart(_record(0, [(0, 0), (0, 1)]), infos), PlanPart(_record(1, [(0, 2), (0, 3)]), different)]
+            [PlanPart(_record(0, [(0, 0), (0, 1)]), [mine]), PlanPart(_record(1, [(0, 2), (0, 3)]), [theirs])]
         )
+
+
+def test_many_replicated_keys_spread_over_every_device_and_are_written_where_elected():
+    """Many equal replicated keys: every (rank, device) pair writes the same number of them, and each rank's plan
+    writes exactly the boxes it was elected for, each from the elected device's chunk."""
+    coords = {0: [(0, 0), (0, 1)], 1: [(0, 2), (0, 3)]}
+    infos = [_info(f"model/r{i:02d}", [R, R], (1, 4), (1, 1, 32, 64)) for i in range(64)]
+    parts = [PlanPart(_record(r, coords[r]), infos) for r in (0, 1)]
+    election = merge_plan_parts(parts)
+    writers = {}
+    for groups in election.owners.values():
+        for owner in groups.values():
+            writers[owner] = writers.get(owner, 0) + 1
+    assert writers == {(r, c): 16 for r in coords for c in coords[r]}, writers
+    for part in parts:
+        rank = part.record.rank
+        plan = create_save_plan(
+            part.infos, file_for_coord=lambda c, r=rank: data_file_name(r, 0, c), owner_of=election.owner_of(rank)
+        )
+        planned = {(key, it.chunk.mesh_coord) for key, its in plan.items.items() for it in its}
+        elected = {(key, c) for key, groups in election.owners.items() for r, c in groups.values() if r == rank}
+        assert planned == elected, rank
+
+
+def test_a_plan_part_stores_each_label_once():
+    """Keys of one layout share a label: a plan part stores each label once, in a table its tensors point into, and
+    decodes back to the same part, with the cyclic garbage collector back on afterwards."""
+    infos = [_info(f"model/w{i}", [R, S(3)], (1, 4), (1, 1, 32, 16)) for i in range(50)]
+    infos.append(_info("model/b", [R, R], (1, 4), (1, 1, 1, 64)))
+    data = PlanPart(_record(0, [(0, 0), (0, 1)]), infos).to_bytes()
+    assert len(json.loads(data)["labels"]) == 2
+    assert PlanPart.from_bytes(data).to_bytes() == data and gc.isenabled()
 
 
 def test_tp_split_travels_with_the_plan_part(expect_error):
@@ -283,12 +367,61 @@ def test_merge_results_builds_one_index(expect_error):
     assert index.scalars == {"optimizer/steps": 3}
     assert header["user"] == {"step": 3} and header["train_state"]["scheduler"] == {"m_last_step": 3}
     assert header["train_state"]["rng"]["ranks"] == {"0": {"ttml": "gen0"}, "1": {"ttml": "gen1"}}
-    # The index must hold exactly the elected chunks.
-    short = _result(1, r1.files, {"model/w": _entry("model/w", [_chunk(2, 0)])}, "gen1")
-    with expect_error(CheckpointError, r"model/[wb]: \d chunk\(s\) reported by the ranks, \d elected"):
-        merge_results([r0, short], election, "x")
+    assert [len(p.entries["model/w"].chunks) for p in (r0, r1)] == [2, 2], "the parts are left as they were"
     # Parts travel as bytes without loss.
     assert ResultPart.from_bytes(r1.to_bytes()).to_bytes() == r1.to_bytes()
+
+
+def _differently(entry, **changes):
+    return dataclasses.replace(entry, chunks=list(entry.chunks), **changes)
+
+
+MERGE_REFUSALS = {
+    # rank 1 reports one of its two columns of model/w
+    "too_few_chunks": (
+        lambda r1: {"model/w": _entry("model/w", [_chunk(2, 0)]), "model/b": r1.entries["model/b"]},
+        r"model/w: 3 chunk\(s\) reported by the ranks, 4 elected",
+    ),
+    # rank 1 reports a column twice
+    "too_many_chunks": (
+        lambda r1: {
+            "model/w": _entry("model/w", [_chunk(2, 0), _chunk(3, 1), _chunk(3, 1)]),
+            "model/b": r1.entries["model/b"],
+        },
+        r"model/w: 5 chunk\(s\) reported by the ranks, 4 elected",
+    ),
+    # rank 1 was elected for the bias but reports no entry for it
+    "unreported_key": (
+        lambda r1: {"model/w": r1.entries["model/w"]},
+        r"model/b: 0 chunk\(s\) reported by the ranks, 1 elected",
+    ),
+    **{
+        f"different_{name}": (
+            lambda r1, change=change: {
+                "model/w": _differently(r1.entries["model/w"], **change),
+                "model/b": r1.entries["model/b"],
+            },
+            r"model/w: rank 1 reports a different entry than earlier ranks",
+        )
+        for name, change in (
+            ("role", {"role": "buffer"}),
+            ("dtype", {"dtype": "F32"}),
+            ("global_shape", {"global_shape": (1, 1, 32, 128)}),
+            ("label", {"label": _label([R, S(2)], (1, 4))}),
+            ("tp_split", {"tp_split": (1, 1, 1, 1)}),
+        )
+    },
+}
+
+
+@pytest.mark.parametrize("case", sorted(MERGE_REFUSALS))
+def test_merge_results_refuses_parts_that_do_not_match_the_election(case, expect_error):
+    """The index must hold exactly one chunk per elected box, and the ranks must report a key alike. Each case starts
+    from a fresh save, so no case sees entries another merge extended."""
+    entries_of, message = MERGE_REFUSALS[case]
+    election, r0, r1 = _big_mesh_save()
+    with expect_error(CheckpointError, f"^{message}$"):
+        merge_results([r0, dataclasses.replace(r1, entries=entries_of(r1))], election, "x")
 
 
 class _Fake:
@@ -372,18 +505,63 @@ def test_phases_gather_and_broadcast_over_three_ranks():
     assert errors == {} and results == {0: [0, 1, 2], 1: [0, 1, 2], 2: [0, 1, 2]}
 
 
-def test_a_failing_rank_stops_every_rank_and_names_itself():
+@pytest.mark.parametrize(
+    "failures",
+    [
+        {0: ValueError("disk full")},
+        {1: ValueError("disk full")},
+        {2: ValueError("disk full")},
+        {0: MissingKeyError("no entry"), 2: IncompleteCheckpointError("no index")},
+        {1: IncompleteCheckpointError("no index"), 2: MissingKeyError("no entry")},
+    ],
+    ids=["rank_0", "rank_1", "rank_2", "two_classes_from_rank_0", "two_classes_from_rank_1"],
+)
+def test_a_failing_rank_stops_every_rank_and_names_itself(failures):
+    """Whichever ranks fail, the coordinator among them, every rank raises the class the first failing rank reported
+    (CheckpointError for an error from outside the package) and names every failing rank with its message."""
+
     def body(group, fake):
         def work():
-            if group.rank == 1:
-                raise ValueError("disk full")
+            if group.rank in failures:
+                raise failures[group.rank]
 
         group.phase("writing", work)
 
     results, errors = _run_ranks(3, body)
+    first = failures[min(failures)]
+    expected = type(first) if isinstance(first, CheckpointError) else CheckpointError
     assert set(errors) == {0, 1, 2}
-    assert all(isinstance(e, CheckpointError) and "rank(s) [1]" in str(e) for e in errors.values())
-    assert all("rank 1: ValueError: disk full" in str(e) for e in errors.values()), "every rank sees the cause"
+    for rank, err in errors.items():
+        assert type(err) is expected, (rank, repr(err))
+        assert f"writing failed on rank(s) {sorted(failures)} of 3" in str(err), (rank, str(err))
+        for failing, cause in failures.items():
+            assert f"rank {failing}: {type(cause).__name__}: {cause}" in str(err), "every rank sees every cause"
+
+
+def test_a_message_that_cannot_be_encoded_or_rendered_still_reaches_every_rank():
+    """A failing rank's message is built after the status exchange, while the others wait in the gather that follows,
+    so building it must not raise: a lone surrogate (a non-UTF-8 file name, as os.fsdecode returns it) is escaped, and
+    an exception whose message cannot be rendered is named by its class."""
+
+    class Unprintable(Exception):
+        def __str__(self):
+            raise ValueError("no message")
+
+    def body(group, fake):
+        def work():
+            if group.rank == 1:
+                raise OSError("cannot open " + os.fsdecode(b"ckpt_\xff"))  # the name in its own text, not a repr
+            if group.rank == 2:
+                raise Unprintable()
+
+        group.phase("reading", work)
+
+    results, errors = _run_ranks(3, body)
+    assert set(errors) == {0, 1, 2}, "every rank raises; none waits in the gather"
+    for err in errors.values():
+        assert type(err) is CheckpointError and "rank(s) [1, 2] of 3" in str(err), err
+        assert "rank 1: OSError: cannot open ckpt_\\udcff" in str(err), err
+        assert "rank 2: Unprintable (its message could not be rendered)" in str(err), err
 
 
 def test_a_failing_collective_is_fatal_and_ends_the_exchanges(expect_error):
@@ -422,10 +600,18 @@ def test_a_failing_point_to_point_transfer_is_fatal_on_both_ends():
         group.broadcast(b"the election" if group.is_coordinator else None)
 
     for body in (gather_body, broadcast_body):
-        _, errors = _run_ranks(2, body)
+        transports = {}
+
+        def recording(group, fake, body=body):
+            transports[group.rank] = group.transport
+            body(group, fake)
+
+        _, errors = _run_ranks(2, recording)
         assert set(errors) == {0, 1}, body.__name__
         assert all(type(e) is CheckpointFatalError for e in errors.values()), (body.__name__, errors)
         assert all("point-to-point transfer failed" in str(e) for e in errors.values()), (body.__name__, errors)
+        # Both ends record the failure, so no later save or load in either process attempts an exchange.
+        assert all("point-to-point transfer failed" in (t.broken or "") for t in transports.values()), body.__name__
 
 
 def test_no_exchange_after_a_fatal_failure(expect_error):
@@ -554,15 +740,32 @@ def test_an_oversized_payload_fails_every_rank_inside_its_phase(monkeypatch):
     assert all("more than a transfer can carry" in str(e) for e in errors.values()), "every rank names the cause"
 
 
-def test_ranks_must_agree_on_scheduler_and_loader(expect_error):
-    """Ranks with different scheduler or dataloader state are refused."""
+def test_ranks_must_agree_on_the_scheduler_and_differing_loaders_are_stored_per_rank(expect_error):
+    """The checkpoint stores one scheduler state, which every rank restores, so the ranks' must agree. Their dataloader
+    states are stored once when they agree, and per rank when they differ."""
     parts = _big_mesh_parts()
-    parts[0].train_state_hash, parts[1].train_state_hash = 11, 12
-    with expect_error(CheckpointError, r"rank\(s\) \[1\] differs from rank 0"):
+    parts[0].scheduler_hash, parts[1].scheduler_hash = 11, 12
+    with expect_error(CheckpointError, r"^the scheduler state of rank\(s\) \[1\] differs from rank 0's"):
         merge_plan_parts(parts)
-    parts[1].train_state_hash = 11
-    assert merge_plan_parts(parts).owners
-    assert PlanPart.from_bytes(parts[1].to_bytes()).train_state_hash == 11
+    parts[1].scheduler_hash = 11
+    assert not merge_plan_parts(parts).dataloader_per_rank
+    parts[1].dataloader_hash = 13
+    election = merge_plan_parts(parts)
+    assert election.dataloader_per_rank and Election.from_bytes(election.to_bytes()) == election
+    back = PlanPart.from_bytes(parts[1].to_bytes())
+    assert (back.scheduler_hash, back.dataloader_hash) == (11, 13)
+
+
+def test_differing_dataloader_states_are_stored_per_world_rank():
+    """With per-rank dataloader states, every rank's result part carries its own, keyed by its world rank, and the
+    header stores them all beside rank 0's one copy of the scheduler state."""
+    election, r0, r1 = _big_mesh_save()
+    election.dataloader_per_rank = True
+    r0.dataloader, r1.dataloader = {"0": {"position": 4}}, {"1": {"position": 5}}
+    assert ResultPart.from_bytes(r1.to_bytes()).dataloader == {"1": {"position": 5}}
+    _, header = merge_results([r0, r1], election, "step_0000003")
+    assert header["train_state"]["dataloader_ranks"] == {"0": {"position": 4}, "1": {"position": 5}}
+    assert "dataloader" not in header["train_state"] and header["train_state"]["scheduler"] == {"m_last_step": 3}
 
 
 def test_param_group_members_merge_across_ranks(expect_error):
@@ -605,9 +808,20 @@ def test_one_rank_sub_context_keeps_its_world_rank(monkeypatch):
 
 
 def test_group_of_one_runs_phases_directly(expect_error):
-    """The group of one runs its phases directly and keeps their error types."""
+    """The group of one runs its phases directly. A CheckpointError keeps its class, any other error is raised as a
+    CheckpointError naming the phase with the error as its cause, as on many ranks, and an interrupt passes as is."""
     group = Group(LoopbackTransport())
     assert group.phase("x", lambda: 5) == 5 and group.gather(b"p") == [b"p"] and group.broadcast(b"q") == b"q"
     assert group.agree("x", 3) == [3] and group.allgather(4) == [4] and group.is_coordinator
-    with expect_error(ValueError, "raw"):
-        group.phase("x", lambda: (_ for _ in ()).throw(ValueError("raw")))
+
+    def raising(err):
+        return lambda: (_ for _ in ()).throw(err)
+
+    with expect_error(CheckpointError, r"^reading failed: ValueError: raw$") as raised:
+        group.phase("reading", raising(ValueError("raw")))
+    assert type(raised.value) is CheckpointError and type(raised.value.__cause__) is ValueError
+    with expect_error(IncompleteCheckpointError, r"^no index$") as raised:
+        group.phase("reading", raising(IncompleteCheckpointError("no index")))
+    assert raised.value.__cause__ is None, "a CheckpointError propagates as raised"
+    with expect_error(KeyboardInterrupt, ""):
+        group.phase("reading", raising(KeyboardInterrupt()))
