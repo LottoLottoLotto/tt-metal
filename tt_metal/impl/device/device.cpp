@@ -384,7 +384,16 @@ void Device::init_command_queue_host() {
         std::make_unique<SystemMemoryManager>(MetalEnvAccessor(*env_).impl(), *context_, this->id_, this->num_hw_cqs());
 
     // Devices without dispatch firmware get no HWCommandQueues
-    if (!MetalEnvAccessor(*env_).impl().get_cluster().runs_dispatch_firmware()) {
+    auto& env_impl = MetalEnvAccessor(*env_).impl();
+    if (!env_impl.get_cluster().runs_dispatch_firmware()) {
+        if (env_impl.get_cluster().get_target_device_type() == tt::TargetDevice::Emule &&
+            env_impl.get_rtoptions().get_fast_dispatch()) {
+            log_warning(
+                tt::LogMetal,
+                "Device {}: fast dispatch was enabled after the emulated cluster opened in slow dispatch; it keeps "
+                "running in slow dispatch. Unset TT_METAL_SLOW_DISPATCH_MODE before startup for fast dispatch.",
+                this->id_);
+        }
         return;
     }
 
