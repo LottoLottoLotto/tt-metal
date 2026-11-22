@@ -108,7 +108,9 @@ tt::tt_metal::ProgramDescriptor build_program(
     // The ranks this rank's final carry reaches each way: half the ring each way, else to either end of the line.
     const uint32_t ahead = ring ? sp_size / 2 : sp_size - 1 - sp_rank;
     const uint32_t behind = sp_size - 1 - ahead;
-    const auto [batch_heads, key_dim] = relay_state_geometry(in);
+    const auto [batch_heads, key_dim, slab_parts] = relay_state_geometry(in);
+    // An SP-sharded slab: this rank's entry holds heads [sp_rank * H / SP, +H / SP) only.
+    const bool sharded = slab_parts > 1;
     const uint32_t kt = key_dim / tt::constants::TILE_HEIGHT;
     const uint32_t state_tiles = kt * kt;
     const uint32_t state_tile = tt::constants::TILE_HW * sizeof(float);
@@ -131,6 +133,7 @@ tt::tt_metal::ProgramDescriptor build_program(
     struct CarrySender {
         std::vector<tt::tt_fabric::FabricNodeId> connections;  // the node each connection is opened towards
         std::vector<uint32_t> peer_args;                       // per rank: its connection, chip and mesh
+        std::vector<uint32_t> steps;                           // per rank: (rank - sp_rank) mod sp_size
         uint32_t peers = 0;
     };
     std::array<CarrySender, 2> carry_senders;  // the relay's sender, then the second
@@ -179,6 +182,7 @@ tt::tt_metal::ProgramDescriptor build_program(
             sender.peer_args.insert(
                 sender.peer_args.end(),
                 {found->second, static_cast<uint32_t>(peer.chip_id), static_cast<uint32_t>(*peer.mesh_id)});
+            sender.steps.push_back(step);
             ++sender.peers;
         }
     }
@@ -289,7 +293,8 @@ tt::tt_metal::ProgramDescriptor build_program(
              slab ? &in.initial_state : nullptr, attrs.slab_index_scale, attrs.slab_index_offset)) {
         slab_ct.push_back(arg);
     }
-    slab_ct.push_back(batch_heads * state_tiles);
+    // An entry's tiles: every head, or (sharded) this rank's.
+    slab_ct.push_back((slab ? in.initial_state.logical_shape()[1] : batch_heads) * state_tiles);
     slab_ct.push_back(chron_slot_bytes / sizeof(uint32_t));
     reader_ct.insert(reader_ct.end(), slab_ct.begin(), slab_ct.end());
     const auto& slab_index = slab ? *in.slab_index : in.actual_start;
@@ -323,6 +328,7 @@ tt::tt_metal::ProgramDescriptor build_program(
          attrs.gate_column_offset / tt::constants::TILE_WIDTH});
     tt::tt_metal::TensorAccessorArgs(in.output_gate.buffer()).append_to(reader_ct);
     tt::tt_metal::TensorAccessorArgs(in.norm_weight.buffer()).append_to(reader_ct);
+    reader_ct.push_back(slab_parts);
     std::vector<uint32_t> writer_ct = {
         cb_eout,
         cb_chron,
@@ -348,6 +354,7 @@ tt::tt_metal::ProgramDescriptor build_program(
     sender_ct.insert(sender_ct.end(), slab_ct.begin(), slab_ct.end());
     tt::tt_metal::TensorAccessorArgs(slab_index.buffer()).append_to(sender_ct);
     sender_ct.push_back(uint32_t(unicast_peers));
+    sender_ct.push_back(slab_parts);
 
     tt::tt_metal::KernelDescriptor reader{
         .kernel_source = std::string(kernel_dir) + "dataflow/reader_relay_chunk_scan.cpp",
@@ -525,6 +532,42 @@ tt::tt_metal::ProgramDescriptor build_program(
             sender_rt.append(fabric_args);
             // Unicast: per rank this sender carries to, its connection, chip and mesh.
             sender_rt.append(carry_sender.peer_args);
+            if (sharded) {
+                // Sharded: every rank this sender reaches, as a unicast route: its step (rank - sp_rank) mod sp_size,
+                // connection, chip, mesh and 1D hops. The owner's heads go to the first rank, the first rank's carry to
+                // each head's owner, along it.
+                std::vector<uint32_t> routes;
+                const auto add_route = [&](uint32_t step, uint32_t connection, uint32_t hops) {
+                    auto peer_coord = coord;
+                    peer_coord[axis] = (sp_rank + step) % sp_size;
+                    const auto peer = mesh->get_fabric_node_id(peer_coord);
+                    routes.insert(
+                        routes.end(),
+                        {step,
+                         connection,
+                         static_cast<uint32_t>(peer.chip_id),
+                         static_cast<uint32_t>(*peer.mesh_id),
+                         hops});
+                };
+                if (unicast_peers) {
+                    if (!backward || back_sender) {
+                        for (uint32_t p = 0; p < carry_sender.peers; ++p) {
+                            add_route(carry_sender.steps[p], carry_sender.peer_args[3 * p], 1);
+                        }
+                    }
+                } else if (!backward) {
+                    // The relay's connection: forward to the ranks ahead, or (a line's last rank) back to the rest.
+                    for (uint32_t k = 1; k <= relay_range; ++k) {
+                        add_route(successor_forward ? k : sp_size - k, 0, k);
+                    }
+                } else if (back_sender) {
+                    for (uint32_t k = 1; k <= back_range; ++k) {
+                        add_route(sp_size - k, 0, k);
+                    }
+                }
+                sender_rt.push_back(static_cast<uint32_t>(routes.size() / 5));
+                sender_rt.append(routes);
+            }
             desc.kernels[sender_kernel].emplace_runtime_args(core, sender_rt);
         }
     }

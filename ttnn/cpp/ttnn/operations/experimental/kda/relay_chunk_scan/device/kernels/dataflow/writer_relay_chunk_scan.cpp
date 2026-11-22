@@ -57,7 +57,11 @@ void kernel_main() {
     const uint32_t chunks = chron[1];
     const uint32_t group_chunks = chron[2];
     const uint32_t index = slab ? chron[slab_index_word] : 0;
-    const bool writes_carry = !slab || index < slab_index_limit;
+    // The reader's words 3 and 4: whether this rank holds the head's carry (an SP-sharded slab holds only its own
+    // heads; the senders carry the others to their ranks) and the head's place in this rank's entry.
+    const bool owns_carry = chron[3];
+    const uint32_t stored_head = chron[4];
+    const bool writes_carry = (!slab || index < slab_index_limit) && owns_carry;
     const uint32_t carry_base = writes_carry ? (index * slab_scale + slab_offset) * entry_tiles : 0;
     cb_pop_front(cb_chron, 1);
 
@@ -106,7 +110,9 @@ void kernel_main() {
         const uint32_t tile = get_tile_size(cb_eout);
         for (uint32_t i = 0; i < state_tiles && writes_carry; ++i) {
             noc_async_write_page(
-                carry_base + head * state_tiles + (i % kt) * kt + i / kt, carry, get_read_ptr(cb_eout) + i * tile);
+                carry_base + stored_head * state_tiles + (i % kt) * kt + i / kt,
+                carry,
+                get_read_ptr(cb_eout) + i * tile);
         }
         noc_async_write_barrier();
         // The relay's release, then each carry sender's.

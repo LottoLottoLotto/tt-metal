@@ -75,6 +75,16 @@ constexpr uint32_t gate_offset_tiles = get_compile_time_arg_val(norm_ct + 5);
 constexpr auto gate_args = TensorAccessorArgs<norm_ct + 6>();
 constexpr auto weight_args = TensorAccessorArgs<gate_args.next_compile_time_args_offset()>();
 constexpr uint32_t num_chunks = local_rows / tt::constants::TILE_HEIGHT;
+// An SP-sharded slab (slab_parts == sp_size): this rank's entry holds heads [sp_rank * stored_heads, +stored_heads). On
+// the first rank, the entry state of a head another rank holds arrives from that rank's sender, column by column, into
+// the landing buffer, counted in the arrival counter as a predecessor's would be.
+constexpr uint32_t slab_parts = get_compile_time_arg_val(weight_args.next_compile_time_args_offset());
+constexpr bool sharded = slab && slab_parts > 1;
+constexpr uint32_t stored_heads = entry_tiles / (kt * kt);
+static_assert(!sharded || slab_parts == sp_size, "a sharded slab splits its heads over the SP ranks");
+// The writer's words in cb_chron: whether this rank writes the head's final carry, and at which stored head.
+constexpr uint32_t owns_carry_word = 3;
+constexpr uint32_t stored_head_word = 4;
 
 // Every core of a head corrects its chunks of the head from the head's seeds; the head's first core is also the
 // relay's head core. It reads this rank's complement-form [E | B] rows of the head (E = A - I) and its entry state
@@ -150,13 +160,17 @@ void kernel_main() {
     // rank has no predecessor to count in. They stage it in their seed buffer, unused until the relay is done.
     const uint32_t place = core % cores_per_head;
     const uint32_t entry_base = slab ? (index * slab_scale + slab_offset) * entry_tiles : 0;
+    // Sharded: the rank holding this head, and the head's place in that rank's entry.
+    const uint32_t owner = sharded ? head / stored_heads : topology.rank;
+    const uint32_t stored = sharded ? head % stored_heads : head;
+    const bool remote_entry = owner != topology.rank;
     const auto read_entry_column = [&](uint32_t j, uint32_t destination) {
         const auto init = TensorAccessor(init_args, get_common_arg_val<uint32_t>(1));
         for (uint32_t r = 0; r < kt; ++r) {
-            noc_async_read_page(entry_base + head * state_tiles + r * kt + j, init, destination + r * state_tile);
+            noc_async_read_page(entry_base + stored * state_tiles + r * kt + j, init, destination + r * state_tile);
         }
     };
-    if (holder && !zero_entry && place != 0) {
+    if (holder && !zero_entry && !remote_entry && place != 0) {
         const uint32_t stage = get_write_ptr(cb_seed);
         uint32_t posted = 0;
         for (uint32_t j = place; j < kt; j += cores_per_head) {
@@ -187,10 +201,12 @@ void kernel_main() {
     }
     const bool need_tail = reset != 0;
 
-    // The writer's chronology: this rank's position and this core's chunk counts.
+    // The writer's chronology: this rank's position and this core's chunk counts, and where the head's carry goes.
     chron_words[0] = position;
     chron_words[1] = chunks;
     chron_words[2] = group_chunks;
+    chron_words[owns_carry_word] = !remote_entry;
+    chron_words[stored_head_word] = stored;
     cb_push_back(cb_chron, 1);
     ctl[0] = holder;
     ctl[1] = interval.split;
@@ -283,7 +299,16 @@ void kernel_main() {
         // land, be computed and leave on its own.
         cb_reserve_back(cb_ein, state_tiles);
         cb_reserve_back(cb_ein_exact, state_tiles);
-        if (holder) {
+        if (holder && !zero_entry && remote_entry) {
+            // Sharded, another rank holds this head: its sender posts each column, as a predecessor would, and the hop
+            // starts on each column as it lands.
+            for (uint32_t j = 0; j < kt; ++j) {
+                kda_counter::wait(arrival_semaphore, j + 1);
+                cb_push_back(cb_ein, kt);
+                cb_push_back(cb_ein_exact, kt);
+            }
+            kda_counter::consume(arrival_semaphore, kt);
+        } else if (holder) {
             // The columns the head's other cores post (see above).
             uint32_t posted = 0;
             if (zero_entry) {
@@ -309,6 +334,8 @@ void kernel_main() {
             }
             cb_push_back(cb_ein, state_tiles - kt);
             cb_push_back(cb_ein_exact, state_tiles - kt);
+        }
+        if (holder) {
             // The first rank applies its final transition to P when the interval ends in a separated tail. P lands only
             // after the whole lap, so E and B are read after the entry state: the relay starts from the first rank, and
             // every rank waits for it.
