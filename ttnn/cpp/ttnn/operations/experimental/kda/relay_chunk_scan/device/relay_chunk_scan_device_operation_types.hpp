@@ -60,21 +60,18 @@ struct RelayChunkScanInputs {
     // The gated output norm: the [B, T, W] gate (the input projection) and the [V] weight.
     Tensor output_gate;
     Tensor norm_weight;
-    // initial_state is then a [entries, H, K, K] slab, read at its entry (zeros at actual_start == 0); the final carry
-    // is written back into the same entry, in place, and the slab is returned as the carry. An entry holds every head
-    // (replicated over SP), or is SP-sharded, [entries, H / SP, K, K]: SP rank r holds heads [r * H / SP, (r + 1) * H /
-    // SP). Sharded, the other ranks send their heads of the entry to the chronologically first rank over the fabric,
-    // and the final carry goes to each head's rank only.
+    // initial_state is then an SP-sharded [entries, H / SP, K, K] slab (SP rank r holds heads [r * H / SP, (r + 1) * H
+    // / SP)), read at its entry (zeros at actual_start == 0); the final carry is written back into the same entry, in
+    // place, and the slab is returned as the carry. The other ranks send their heads of the entry to the
+    // chronologically first rank over the fabric, and the final carry goes to each head's rank only.
     std::optional<Tensor> slab_index;
 };
 
-// The heads and K of a relay: initial_state is [B*H, K, K], or with slab_index a [entries, H / slab_parts, K, K] slab;
-// the relay's B*H heads are packed's [B*H, K, 2K] rows.
+// The heads and K of a relay: initial_state is [B*H, K, K], or with slab_index an SP-sharded [entries, H / SP, K, K]
+// slab; the relay's B*H heads are packed's [B*H, K, 2K] rows.
 struct RelayStateGeometry {
     uint32_t heads;
     uint32_t key_dim;
-    // The SP ranks a slab entry's heads are split over: 1 without a slab or for an entry holding every head.
-    uint32_t slab_parts = 1;
 };
 inline RelayStateGeometry relay_state_geometry(const RelayChunkScanInputs& in) {
     const auto& state = in.initial_state.logical_shape();
@@ -82,9 +79,7 @@ inline RelayStateGeometry relay_state_geometry(const RelayChunkScanInputs& in) {
         return {state[0], state[1]};
     }
     const uint32_t key_dim = state[-1];
-    const auto heads = static_cast<uint32_t>(in.packed.physical_volume() / (2ull * key_dim * key_dim));
-    const uint32_t entry_heads = state[1];
-    return {heads, key_dim, entry_heads != 0 && heads % entry_heads == 0 ? heads / entry_heads : 0};
+    return {static_cast<uint32_t>(in.packed.physical_volume() / (2ull * key_dim * key_dim)), key_dim};
 }
 
 }  // namespace ttnn::experimental::prim

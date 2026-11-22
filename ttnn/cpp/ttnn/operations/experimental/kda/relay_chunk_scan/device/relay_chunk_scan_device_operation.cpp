@@ -75,15 +75,15 @@ void RelayChunkScanOperation::validate_on_program_cache_miss(
         kda_factory_detail::check_interleaved(in.initial_state, operation_name, "initial_state");
         TT_FATAL(state.rank() == 3 && state[1] == state[2], "{}: initial_state must be [B*H, K, K]", operation_name);
     }
-    const auto [heads, key_dim, slab_parts] = relay_state_geometry(in);
+    const auto [heads, key_dim] = relay_state_geometry(in);
     if (in.slab_index && attrs.sequence_parallel_axis < in.packed.device()->shape().dims()) {
         const uint32_t sp_size = in.packed.device()->shape()[attrs.sequence_parallel_axis];
         TT_FATAL(
-            slab_parts == 1 || slab_parts == sp_size,
-            "{}: a slab entry must hold all {} heads or this SP rank's {} (SP-sharded), got {}",
+            heads % sp_size == 0 && state[1] * sp_size == heads,
+            "{}: a slab entry holds this SP rank's {} of the {} heads (SP-sharded), got {}",
             operation_name,
-            heads,
             heads / sp_size,
+            heads,
             state[1]);
     }
     TT_FATAL(
@@ -325,7 +325,7 @@ RelayChunkScanOperation::spec_return_value_t RelayChunkScanOperation::compute_ou
                 shape, tt::tt_metal::TensorLayout(dtype, tt::tt_metal::PageConfig(tt::tt_metal::Layout::TILE), memory));
         };
     // The normalized outputs [B, T, H*V], and the final carry: with a slab, written into the slab's entry, in place.
-    const auto [heads, key_dim, slab_parts] = relay_state_geometry(in);
+    const auto [heads, key_dim] = relay_state_geometry(in);
     // Output specs are derived before validation runs.
     TT_FATAL(
         attrs.num_heads > 0 && heads % attrs.num_heads == 0,

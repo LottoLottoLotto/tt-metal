@@ -75,13 +75,10 @@ constexpr uint32_t gate_offset_tiles = get_compile_time_arg_val(norm_ct + 5);
 constexpr auto gate_args = TensorAccessorArgs<norm_ct + 6>();
 constexpr auto weight_args = TensorAccessorArgs<gate_args.next_compile_time_args_offset()>();
 constexpr uint32_t num_chunks = local_rows / tt::constants::TILE_HEIGHT;
-// An SP-sharded slab (slab_parts == sp_size): this rank's entry holds heads [sp_rank * stored_heads, +stored_heads). On
-// the first rank, the entry state of a head another rank holds arrives from that rank's sender, column by column, into
-// the landing buffer, counted in the arrival counter as a predecessor's would be.
-constexpr uint32_t slab_parts = get_compile_time_arg_val(weight_args.next_compile_time_args_offset());
-constexpr bool sharded = slab && slab_parts > 1;
+// The slab is SP-sharded: this rank's entry holds heads [sp_rank * stored_heads, +stored_heads). On the first rank, the
+// entry state of a head another rank holds arrives from that rank's sender, column by column, into the landing buffer,
+// counted in the arrival counter as a predecessor's would be.
 constexpr uint32_t stored_heads = entry_tiles / (kt * kt);
-static_assert(!sharded || slab_parts == sp_size, "a sharded slab splits its heads over the SP ranks");
 // The writer's words in cb_chron: whether this rank writes the head's final carry, and at which stored head.
 constexpr uint32_t owns_carry_word = 3;
 constexpr uint32_t stored_head_word = 4;
@@ -161,8 +158,8 @@ void kernel_main() {
     const uint32_t place = core % cores_per_head;
     const uint32_t entry_base = slab ? (index * slab_scale + slab_offset) * entry_tiles : 0;
     // Sharded: the rank holding this head, and the head's place in that rank's entry.
-    const uint32_t owner = sharded ? head / stored_heads : topology.rank;
-    const uint32_t stored = sharded ? head % stored_heads : head;
+    const uint32_t owner = slab ? head / stored_heads : topology.rank;
+    const uint32_t stored = slab ? head % stored_heads : head;
     const bool remote_entry = owner != topology.rank;
     const auto read_entry_column = [&](uint32_t j, uint32_t destination) {
         const auto init = TensorAccessor(init_args, get_common_arg_val<uint32_t>(1));

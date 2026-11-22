@@ -108,9 +108,9 @@ tt::tt_metal::ProgramDescriptor build_program(
     // The ranks this rank's final carry reaches each way: half the ring each way, else to either end of the line.
     const uint32_t ahead = ring ? sp_size / 2 : sp_size - 1 - sp_rank;
     const uint32_t behind = sp_size - 1 - ahead;
-    const auto [batch_heads, key_dim, slab_parts] = relay_state_geometry(in);
-    // An SP-sharded slab: this rank's entry holds heads [sp_rank * H / SP, +H / SP) only.
-    const bool sharded = slab_parts > 1;
+    const auto [batch_heads, key_dim] = relay_state_geometry(in);
+    // A slab is SP-sharded: this rank's entry holds heads [sp_rank * H / SP, +H / SP) only.
+    const bool slab = in.slab_index.has_value();
     const uint32_t kt = key_dim / tt::constants::TILE_HEIGHT;
     const uint32_t state_tiles = kt * kt;
     const uint32_t state_tile = tt::constants::TILE_HW * sizeof(float);
@@ -287,13 +287,12 @@ tt::tt_metal::ProgramDescriptor build_program(
     reader_ct.push_back(cb_identity);
     // The slab (slab_kernel_args), its entry's tiles and the word the slab index lands at: the reader reads the
     // initial state from the entry, and the writer and senders write the final carry back into it.
-    const bool slab = in.slab_index.has_value();
     std::vector<uint32_t> slab_ct;
     for (const uint32_t arg : kda_factory_detail::slab_kernel_args(
              slab ? &in.initial_state : nullptr, attrs.slab_index_scale, attrs.slab_index_offset)) {
         slab_ct.push_back(arg);
     }
-    // An entry's tiles: every head, or (sharded) this rank's.
+    // An entry's tiles: this rank's heads.
     slab_ct.push_back((slab ? in.initial_state.logical_shape()[1] : batch_heads) * state_tiles);
     slab_ct.push_back(chron_slot_bytes / sizeof(uint32_t));
     reader_ct.insert(reader_ct.end(), slab_ct.begin(), slab_ct.end());
@@ -328,7 +327,6 @@ tt::tt_metal::ProgramDescriptor build_program(
          attrs.gate_column_offset / tt::constants::TILE_WIDTH});
     tt::tt_metal::TensorAccessorArgs(in.output_gate.buffer()).append_to(reader_ct);
     tt::tt_metal::TensorAccessorArgs(in.norm_weight.buffer()).append_to(reader_ct);
-    reader_ct.push_back(slab_parts);
     std::vector<uint32_t> writer_ct = {
         cb_eout,
         cb_chron,
@@ -354,7 +352,6 @@ tt::tt_metal::ProgramDescriptor build_program(
     sender_ct.insert(sender_ct.end(), slab_ct.begin(), slab_ct.end());
     tt::tt_metal::TensorAccessorArgs(slab_index.buffer()).append_to(sender_ct);
     sender_ct.push_back(uint32_t(unicast_peers));
-    sender_ct.push_back(slab_parts);
 
     tt::tt_metal::KernelDescriptor reader{
         .kernel_source = std::string(kernel_dir) + "dataflow/reader_relay_chunk_scan.cpp",
@@ -532,7 +529,7 @@ tt::tt_metal::ProgramDescriptor build_program(
             sender_rt.append(fabric_args);
             // Unicast: per rank this sender carries to, its connection, chip and mesh.
             sender_rt.append(carry_sender.peer_args);
-            if (sharded) {
+            if (slab) {
                 // Sharded: every rank this sender reaches, as a unicast route: its step (rank - sp_rank) mod sp_size,
                 // connection, chip, mesh and 1D hops. The owner's heads go to the first rank, the first rank's carry to
                 // each head's owner, along it.

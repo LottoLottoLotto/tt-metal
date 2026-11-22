@@ -41,14 +41,10 @@ constexpr auto slab_index_args = TensorAccessorArgs<slab_ct + 6>();
 // serves as a 2D unicast (per rank after the connection args: the connection its route leaves on, its chip and mesh),
 // carry_range ranks in all.
 constexpr bool unicast_peers = get_compile_time_arg_val(slab_index_args.next_compile_time_args_offset());
-// An SP-sharded slab (slab_parts == sp_size): this rank's entry holds heads [sp_rank * stored_heads, +stored_heads).
-// Before the relay, a rank other than the first sends the first rank its heads of the entry; on the first rank the
-// final carry of each head goes to the rank holding it only. Both go as unicasts along this sender's routes (runtime
-// args).
-constexpr uint32_t slab_parts = get_compile_time_arg_val(slab_index_args.next_compile_time_args_offset() + 1);
-constexpr bool sharded = slab && slab_parts > 1;
+// The slab is SP-sharded: this rank's entry holds heads [sp_rank * stored_heads, +stored_heads). Before the relay, a
+// rank other than the first sends the first rank its heads of the entry; on the first rank the final carry of each head
+// goes to the rank holding it only. Both go as unicasts along this sender's routes (runtime args).
 constexpr uint32_t stored_heads = entry_tiles / (kt * kt);
-static_assert(!sharded || slab_parts == sp_size, "a sharded slab splits its heads over the SP ranks");
 // One packet header per packet of each slot, out of this RISC's share of the pool.
 static_assert(
     slots * chunks <= MEM_PACKET_HEADER_POOL_SIZE / MaxDMProcessorsPerCoreType / PACKET_HEADER_MAX_SIZE,
@@ -58,7 +54,7 @@ static_assert(
 // the successor's landing buffer (the first rank's final-state landing, from the last rank) over the fabric. On the
 // chronologically first rank, every sender then multicasts the final carry its head cores form, carry_range ranks
 // along its one connection (or unicasts it to each of them), into every rank's carry output; together a link's
-// senders reach every other rank once. With an SP-sharded slab the sender first sends the first rank this rank's heads
+// senders reach every other rank once. With the SP-sharded slab the sender first sends the first rank this rank's heads
 // of the entry state (unless it is the first rank), and the first rank's senders carry each head only to its rank.
 void kernel_main() {
     size_t arg = 0;
@@ -118,7 +114,7 @@ void kernel_main() {
     const size_t peer_args = arg;
     // Sharded: per rank this sender reaches, its step (rank - sp_rank) mod sp_size, connection, chip, mesh and 1D hops.
     const size_t route_args = peer_args + (unicast_peers ? 3 * carry_range : 0) + 1;
-    const uint32_t routes = sharded ? get_arg_val<uint32_t>(route_args - 1) : 0;
+    const uint32_t routes = slab ? get_arg_val<uint32_t>(route_args - 1) : 0;
     const auto route_word = [&](uint32_t route, uint32_t word) {
         return get_arg_val<uint32_t>(route_args + 5 * route + word);
     };
@@ -170,7 +166,7 @@ void kernel_main() {
     // Unit u's head: this sender serves heads link, link + links, ...
     const auto unit_head = [&](uint32_t u) { return link + u / kt * links; };
 
-    if constexpr (sharded) {
+    if constexpr (slab) {
         // This rank's heads of the slot's entry state, straight from the slab into the first rank's landing buffer, a
         // tile column per unit, counted in the head core's arrival counter there (the first rank's reader waits for
         // them as for a predecessor's columns). Nothing here waits on another rank.
@@ -302,7 +298,7 @@ void kernel_main() {
         for (uint32_t i = 0; i <= kt; ++i) {
             carry_hdrs[i] = hdrs[i / chunks][i % chunks];
         }
-        if constexpr (!unicast_peers && !sharded) {
+        if constexpr (!unicast_peers && !slab) {
             uint8_t range[1] = {carry_range};
             for (uint32_t i = 0; i <= kt; ++i) {
                 fabric_set_mcast_route(fabric, carry_hdrs[i], range, 0);
@@ -344,7 +340,7 @@ void kernel_main() {
             const uint32_t owner = unit_head(u) / stored_heads;
             return owner == sp_rank ? routes : find_route((owner + sp_size - sp_rank) % sp_size);
         };
-        const auto sends = [&](uint32_t u) { return !sharded || (writes_carry && owner_route(u) < routes); };
+        const auto sends = [&](uint32_t u) { return !slab || (writes_carry && owner_route(u) < routes); };
         const auto fetch_carry = [&](uint32_t u) {
             volatile tt_l1_ptr uint32_t* count = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
                 get_semaphore(get_arg_val<uint32_t>(notify_args + u / kt)));
@@ -373,8 +369,8 @@ void kernel_main() {
                 noc_semaphore_inc(get_noc_addr(xy & 0xFFFF, xy >> 16, ack_semaphore), 1);
             }
             const uint32_t head = unit_head(u);
-            // A sharded entry holds only its rank's heads.
-            const uint32_t entry_head = sharded ? head % stored_heads : head;
+            // A slab entry holds only its rank's heads.
+            const uint32_t entry_head = slab ? head % stored_heads : head;
             const uint32_t buffer = stage + (u % 2) * unit_bytes;
             // The column's tiles are rows 0..kt-1 of tile column `column` of the row-major carry; a slab index past
             // the slabs writes nothing, and only the arrival increment goes out.
@@ -382,7 +378,7 @@ void kernel_main() {
                 return linear::addrgen_detail::get_noc_address(
                     carry, carry_base + entry_head * kt * kt + r * kt + column, 0);
             };
-            if constexpr (sharded) {
+            if constexpr (slab) {
                 if (sends(u)) {
                     const uint32_t route = owner_route(u);
                     for (uint32_t r = 0; r < kt; ++r) {
@@ -426,7 +422,7 @@ void kernel_main() {
         }
         // Flushed after this sender's columns, the increment tells each rank it reaches that its share has landed.
         const uint64_t arrival = safe_get_noc_addr(drain_x, drain_y, carry_semaphore, 0);
-        if constexpr (sharded) {
+        if constexpr (slab) {
             // Unicast after this sender's writes to the rank, on the same connection and route.
             for (uint32_t route = 0; route < routes; ++route) {
                 volatile tt_l1_ptr PACKET_HEADER_TYPE* hdr = hdrs[0][0];
