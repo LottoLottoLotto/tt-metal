@@ -20,7 +20,10 @@ Loading never touches the original HF safetensors: 2-D matrices are passed to th
 constructor as meta-device placeholders (shape only) and every ttnn.as_tensor call hits its
 .tensorbin file; a missing/corrupt file makes the fallback conversion fail loudly on the meta
 tensor. The loader refuses to serve without an equivalence proof that matches the manifest,
-the runtime source tree and the TTNN binaries.
+the runtime source tree and the TTNN binaries. ``GEMMA4_PROOF_BINARIES=rebuilt`` declares an image
+whose TTNN binaries were rebuilt from the proof's sources (a source-built package of this runtime):
+the source tree, manifest, proofs and GEMMA4_* environment are still checked exactly, only the
+binary hashes may differ, and the loader prints both sets.
 
 Subcommands (run inside the TT image):
   finalize <root> --source <hf dir> --fetch-verification <json>
@@ -47,6 +50,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
 FORMAT = "gemma4-12b-it-ttnn-native-text-1x1-v1"
@@ -57,7 +61,7 @@ DRAFTER_FORMAT = "gemma4-12b-it-assistant-ttnn-drafter-1x1-v1"
 DRAFTER_MANIFEST = "drafter_manifest.json"
 SPEC_PROOF = "spec_equivalence.json"
 META_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json")
-TT_ROOT = Path("/home/container_app_user/tt-metal")
+TT_ROOT = Path(os.environ.get("TT_METAL_HOME") or "/home/container_app_user/tt-metal")
 TREE = TT_ROOT / "models/demos/gemma4"
 BINARIES = ("build/lib/_ttnncpp.so", "build/lib/libtt_metal.so", "ttnn/ttnn/_ttnn.so")
 TEXT_PREFIX = "model.language_model."
@@ -146,6 +150,26 @@ def runtime_identity():
     }
 
 
+def runtime_mismatch(recorded):
+    """None when this runtime is the one a proof recorded, else what differs.
+
+    With ``GEMMA4_PROOF_BINARIES=rebuilt`` (a package whose TTNN binaries were compiled from the proof's
+    sources) the gemma4 source tree must still match exactly; only the binary hashes may differ."""
+    now = runtime_identity()
+    tree, binaries = now["gemma4_tree"], now["binaries"]
+    if tree != recorded["gemma4_tree"]:
+        names = sorted(set(tree) | set(recorded["gemma4_tree"]))
+        return [k for k in names if tree.get(k) != recorded["gemma4_tree"].get(k)][:8]
+    if binaries == recorded["binaries"]:
+        return None
+    if os.environ.get("GEMMA4_PROOF_BINARIES") == "rebuilt":
+        print(f"native_checkpoint: GEMMA4_PROOF_BINARIES=rebuilt: gemma4 tree matches the proof; TTNN binaries "
+              f"{binaries} were rebuilt from source (proof recorded on {recorded['binaries']})",
+              file=sys.stderr, flush=True)
+        return None
+    return "binaries"
+
+
 def read_manifest(root):
     root = Path(root)
     m = json.loads((root / MANIFEST).read_text())
@@ -190,7 +214,7 @@ def require_proof(root, m):
 # GEMMA4_* variable (matmul accumulation, norms, GELU, ring / prefill chunk, ...) must match the proof.
 # GEMMA4_DRAFT_LEN is checked against the drafter's speculative proof (draft_len) by the serving loader.
 SERVING_SELECTORS = frozenset({"GEMMA4_NATIVE", "GEMMA4_SINGLE_USER", "GEMMA4_ASSISTANT_DIR", "GEMMA4_DRAFT_LEN",
-                               "GEMMA4_TOOLS_DIR"})
+                               "GEMMA4_TOOLS_DIR", "GEMMA4_PROOF_BINARIES"})
 
 
 def prepare_native_runtime(root, allow_unproven=False, verify_hashes=True):
@@ -205,10 +229,9 @@ def prepare_native_runtime(root, allow_unproven=False, verify_hashes=True):
     identity = {"manifest_sha256": digest(root / MANIFEST), "proof": None}
     if not allow_unproven:
         proof = require_proof(root, m)
-        now = runtime_identity()
-        if now != proof["runtime_identity"]:
-            diff = [k for k in now["gemma4_tree"] if proof["runtime_identity"]["gemma4_tree"].get(k) != now["gemma4_tree"][k]]
-            raise ValueError(f"runtime differs from the one the equivalence proof covers: {diff[:8] or 'binaries'}")
+        diff = runtime_mismatch(proof["runtime_identity"])
+        if diff:
+            raise ValueError(f"runtime differs from the one the equivalence proof covers: {diff}")
         env_now = {k: v for k, v in os.environ.items()
                    if k.startswith("GEMMA4_") and k != "GEMMA4_PRECISION_PLAN" and k not in SERVING_SELECTORS}
         if env_now != proof["runtime_env"]:
@@ -386,7 +409,7 @@ def prepare_drafter(droot, target_identity, allow_unproven=False):
             raise ValueError("speculative proof does not cover this drafter")
         if proof.get("target_proof_sha256") != target_identity.get("proof"):
             raise ValueError("speculative proof was made against a different target proof")
-        if proof["runtime_identity"] != runtime_identity():
+        if runtime_mismatch(proof["runtime_identity"]):
             raise ValueError("runtime differs from the one the speculative proof covers")
         identity["spec_proof"] = digest(droot / SPEC_PROOF)
         identity["draft_len"] = proof["draft_len"]
