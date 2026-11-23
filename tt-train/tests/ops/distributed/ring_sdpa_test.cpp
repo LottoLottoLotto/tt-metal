@@ -598,6 +598,7 @@ TEST_F(GalaxyRingSDPATest, ReuseMatchesReshiftBitExact) {
     ExpectReuseMatchesReshiftBitExact(/*seq_len=*/256, ttml::ops::distributed::RingAttentionLayout::Contiguous);
 }
 
+// CP8 zig-zag fw+bw matches non-ring causal SDPA on inputs permuted into zig-zag order.
 TEST_F(GalaxyRingSDPATest, ZigZagCausalMaskBackward) {
     TestRingAttention(
         /*batch=*/1,
@@ -610,6 +611,7 @@ TEST_F(GalaxyRingSDPATest, ZigZagCausalMaskBackward) {
         ttml::ops::distributed::RingAttentionLayout::ZigZag);
 }
 
+// Same with batch 2, 8 heads and 512 rows per device.
 TEST_F(GalaxyRingSDPATest, ZigZagLargerBatchSequenceBackward) {
     TestRingAttention(
         /*batch=*/2,
@@ -622,6 +624,7 @@ TEST_F(GalaxyRingSDPATest, ZigZagLargerBatchSequenceBackward) {
         ttml::ops::distributed::RingAttentionLayout::ZigZag);
 }
 
+// Zig-zag backward gives bit-identical grads with kept forward K/V and with re-shifted K/V.
 TEST_F(GalaxyRingSDPATest, ZigZagReuseMatchesReshiftBitExact) {
     ExpectReuseMatchesReshiftBitExact(/*seq_len=*/1024, ttml::ops::distributed::RingAttentionLayout::ZigZag);
 }
@@ -656,6 +659,7 @@ TEST_F(Mesh1x2RingSDPATest, LargerBatchSequenceBackward) {
         /*test_backward=*/true);
 }
 
+// CP2 zig-zag fw+bw matches non-ring causal SDPA on inputs permuted into zig-zag order.
 TEST_F(Mesh1x2RingSDPATest, ZigZagBackward) {
     TestRingAttention(
         /*batch=*/2,
