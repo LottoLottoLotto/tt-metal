@@ -251,7 +251,8 @@ autograd::TensorPtr ring_attention_sdpa_zigzag(
             AttentionMaskType::None,
             kFwDirection);
 
-        // Chunk 1 goes stale after a rank's last chunk-1 step; chunk 0 is rewritten at every step once first used.
+        // A rank computes chunk 1 for its first steps, then chunk 0. Reset chunk 1's lse to -inf every step so the
+        // merge ignores it after the switch; chunk 0 starts at -inf and is written at every step after the switch.
         ttnn::copy(no_contrib_intermediates, chunk_intermediates[1]);
         ttml::metal::ring_sdpa_fw(
             {{.query = q_halves.first,
@@ -346,7 +347,8 @@ autograd::TensorPtr ring_attention_sdpa_zigzag(
                 AttentionMaskType::None,
                 kBwDirection);
 
-            // Unwritten chunk grads are summed too, so they must be zero; chunk 0 goes stale after its last step.
+            // Steps run backwards here, so a rank computes chunk 0 first, then chunk 1. Both chunks' grads are summed,
+            // so zero chunk 0 every step: after the switch it would add its last grads again.
             ttnn::copy(zero_Q_half, grad_Q_chunk[0]);
             ttnn::copy(zero_K_half, grad_K_chunk[0]);
             ttnn::copy(zero_V_half, grad_V_chunk[0]);
