@@ -58,7 +58,7 @@
 // Replay buffer + MOP expander
 // ----------------------------
 // The math thread can record a window of up to 32 instructions into the
-// "replay buffer" and re-issue any contiguous sub-range with `lltt::replay`.
+// "replay buffer" and re-issue any contiguous sub-range with `TT_REPLAY`.
 // On top of that, the MOP expander can fire a 5-slot template per
 // `TTI_MOP` issue, where each slot can itself be a REPLAY(start, len).
 // We use:
@@ -2558,7 +2558,7 @@ inline void _topk_xl_local_sort_generic_(const std::uint32_t dst_index, const bo
         // Inner iter i=0 records `sort_8 + sort_16` (14 + 18 = 32 instr)
         // into replay slots [0..31] — an exact fit for the 32-slot
         // replay buffer. Iters 1..rsf-1 fire the recorded body via
-        // `lltt::replay`. `sort_4` is left inline because adding it to
+        // TT_REPLAY. `sort_4` is left inline because adding it to
         // the recording would overflow the buffer; `sort_32` is left
         // inline because `dir` alternates per iter (replaying it would
         // freeze the direction).

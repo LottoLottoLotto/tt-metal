@@ -668,9 +668,8 @@ inline void enable_gathering()
 // replay buffer, and LEN is the number of instructions to record
 // (should match the expansion of CALLABLE). CALLABLE is a callable,
 // to which ARGS are forwarded.
-// Every record goes through here, never a raw lltt::record / TTI_REPLAY: loading the replay
+// Every record goes through here, never a raw TTI_REPLAY: loading the replay
 // buffer is incompatible with Blackhole instruction gathering, which this disables around it.
-// When we move to c++23 we can use 'using enum lltt::ExecBool;'
 enum ExecBool : bool
 {
     NoExec,
@@ -687,7 +686,7 @@ template <ExecBool Exec = NoExec, typename Callable, typename... Args>
 #endif
 
     // Issue instruction to load replay buffer
-    lltt::record<lltt::ExecBool(Exec)>(start, len);
+    TT_REPLAY(start, len, bool(Exec), 1);
 
     // Send in the user's desired instructions
     callable(std::forward<Args>(args)...);
