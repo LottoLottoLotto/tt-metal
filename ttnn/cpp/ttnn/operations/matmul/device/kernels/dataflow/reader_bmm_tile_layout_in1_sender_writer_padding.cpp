@@ -296,6 +296,21 @@ void kernel_main() {
                     uint32_t l1_read_addr_in1_offset = 0;
 #endif  // IN1_DRAM_WIDTH_SHARDED
 
+#ifdef QWEN_GATEUP_PIPELINE_INSTRUMENT
+#define QWEN_GATEUP_ZONE(name) DeviceZoneScopedN(name)
+#else
+#define QWEN_GATEUP_ZONE(name)
+#endif
+#ifdef QWEN_GATEUP_PACKED_LAYOUT
+                    constexpr uint32_t qwen_cb_slots = QWEN_GATEUP_CB_SLOTS;
+                    constexpr uint32_t qwen_outstanding = QWEN_GATEUP_OUTSTANDING;
+                    constexpr uint32_t qwen_trids = qwen_outstanding + 1;
+                    uint32_t qwen_free_pipeline_blocks = qwen_outstanding + 1;
+                    uint32_t qwen_issue_trid = 1;
+                    uint32_t qwen_wait_trid = 1;
+                    uint32_t qwen_write_slot = 0;
+                    uint32_t qwen_write_start = 0;
+#endif
                     for (uint32_t block = 0; block < num_blocks_inner_dim; ++block) {
                         if constexpr (fuse_op_all_gather) {
                             fused_op_receiver.update_current_block_start_tile_id(
@@ -395,6 +410,77 @@ void kernel_main() {
 
                         // Barrier! make sure the reads are done
                         noc.async_read_barrier();
+#elif defined(QWEN_GATEUP_PACKED_LAYOUT)
+                        // Fixed Qwen3.5-9B gate/up layout. Transaction IDs separate DMA
+                        // completion from CB producer credits so future K blocks can remain
+                        // in flight while TRISC consumes the oldest completed block.
+                        constexpr uint32_t packed_grid_x = 11;
+                        constexpr uint32_t packed_banks = 8;
+                        constexpr uint32_t packed_k_tiles = QWEN_PACKED_K_TILES;
+                        const uint32_t packed_block_tiles = in1_block_h * in1_block_w;
+                        const uint32_t packed_blocks = packed_k_tiles / in1_block_h;
+                        const uint32_t worker =
+                            get_absolute_logical_x() + packed_grid_x * get_absolute_logical_y();
+                        const uint32_t bank = worker % packed_banks;
+                        const uint32_t region = worker / packed_banks;
+                        const uint32_t block_bytes = packed_block_tiles * in1_single_tile_size_bytes;
+                        const uint32_t region_bytes = packed_blocks * block_bytes;
+                        if constexpr (qwen_outstanding == 1) {
+                            {
+                                QWEN_GATEUP_ZONE("QWEN_CB_RESERVE");
+                                dfb_in1.reserve_back(in1_block_num_tiles);
+                            }
+                            const uint64_t src = get_noc_addr_from_bank_id<true>(
+                                bank, in1_tensor_addr + region * region_bytes + block * block_bytes);
+                            {
+                                QWEN_GATEUP_ZONE("QWEN_DRAM_READ_ISSUE");
+                                noc_async_read(src, dfb_in1.get_write_ptr(), block_bytes);
+                            }
+                            {
+                                QWEN_GATEUP_ZONE("QWEN_DRAM_READ_BARRIER");
+                                noc_async_read_barrier();
+                            }
+                        } else {
+                            if (block == 0) {
+                                {
+                                    QWEN_GATEUP_ZONE("QWEN_CB_RESERVE");
+                                    dfb_in1.reserve_back(in1_block_num_tiles * qwen_outstanding);
+                                }
+                                qwen_write_start = dfb_in1.get_write_ptr();
+                            }
+                            {
+                                QWEN_GATEUP_ZONE("QWEN_DRAM_READ_ISSUE");
+                                AllocatorBank<AllocatorBankType::DRAM> packed_bank;
+                                noc.async_read<NocOptions::TXN_ID, NOC_MAX_BURST_SIZE>(
+                                    packed_bank,
+                                    CoreLocalMem<uint32_t>(qwen_write_start + qwen_write_slot * block_bytes),
+                                    block_bytes,
+                                    {.bank_id = bank,
+                                     .addr = in1_tensor_addr + region * region_bytes + block * block_bytes},
+                                    {},
+                                    NocOptVals{.trid = static_cast<uint8_t>(qwen_issue_trid)});
+                            }
+                            if (qwen_free_pipeline_blocks == 2) {
+                                {
+                                    QWEN_GATEUP_ZONE("QWEN_DRAM_READ_BARRIER");
+                                    noc.async_read_barrier<NocOptions::TXN_ID>(
+                                        {.trid = static_cast<uint8_t>(qwen_wait_trid)});
+                                }
+                                {
+                                    QWEN_GATEUP_ZONE("QWEN_CB_PUSH");
+                                    dfb_in1.push_back(in1_block_num_tiles);
+                                }
+                                qwen_wait_trid = qwen_wait_trid == qwen_trids ? 1 : qwen_wait_trid + 1;
+                                if (block + 1 < num_blocks_inner_dim) {
+                                    QWEN_GATEUP_ZONE("QWEN_CB_RESERVE");
+                                    dfb_in1.reserve_back(in1_block_num_tiles);
+                                }
+                            } else {
+                                --qwen_free_pipeline_blocks;
+                            }
+                            qwen_write_slot = qwen_write_slot + 1 == qwen_cb_slots ? 0 : qwen_write_slot + 1;
+                            qwen_issue_trid = qwen_issue_trid == qwen_trids ? 1 : qwen_issue_trid + 1;
+                        }
 #elif !defined(IN1_SHARDED)
                         // Operand 1 - interleaved
                         dfb_in1.reserve_back(in1_block_num_tiles);
@@ -470,9 +556,9 @@ void kernel_main() {
                             in1_mcast_num_cores);
 #endif  // SKIP_MCAST
 
-#ifndef IN1_SHARDED
+#if !defined(IN1_SHARDED) && !defined(QWEN_GATEUP_PIPELINED)
                         dfb_in1.push_back(in1_block_num_tiles);
-#endif  // IN1_SHARDED
+#endif
 #ifdef ENABLE_GLOBAL_CB
                         if (block >= 1) {
                             while (!dfb_in1.pages_reservable_at_back(in1_fifo_tiles - in1_block_num_tiles)) {
@@ -482,6 +568,20 @@ void kernel_main() {
                         }
 #endif
                     }
+#ifdef QWEN_GATEUP_PACKED_LAYOUT
+                    for (uint32_t pending = 1; pending < qwen_outstanding; ++pending) {
+                        {
+                            QWEN_GATEUP_ZONE("QWEN_DRAM_READ_BARRIER");
+                            noc.async_read_barrier<NocOptions::TXN_ID>(
+                                {.trid = static_cast<uint8_t>(qwen_wait_trid)});
+                        }
+                        {
+                            QWEN_GATEUP_ZONE("QWEN_CB_PUSH");
+                            dfb_in1.push_back(in1_block_num_tiles);
+                        }
+                        qwen_wait_trid = qwen_wait_trid == qwen_trids ? 1 : qwen_wait_trid + 1;
+                    }
+#endif
 #ifdef ENABLE_GLOBAL_CB
                     if (num_blocks_inner_dim > 0) {
                         while (!dfb_in1.pages_reservable_at_back(in1_fifo_tiles)) {

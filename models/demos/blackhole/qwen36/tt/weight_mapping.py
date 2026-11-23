@@ -108,6 +108,29 @@ def remap_qwen36_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, to
     return remapped
 
 
+def load_qwen36_mtp_state_dict(model_path) -> Dict[str, torch.Tensor]:
+    """Load only the checkpoint's small MTP subtree from sharded safetensors."""
+    from safetensors import safe_open
+
+    model_path = Path(model_path)
+    with open(model_path / "model.safetensors.index.json") as f:
+        weight_map = json.load(f)["weight_map"]
+
+    file_to_keys: Dict[str, list[str]] = {}
+    for key, filename in weight_map.items():
+        if key.startswith("mtp."):
+            file_to_keys.setdefault(filename, []).append(key)
+
+    mtp: Dict[str, torch.Tensor] = {}
+    for filename, keys in file_to_keys.items():
+        with safe_open(str(model_path / filename), framework="pt") as sf:
+            for key in keys:
+                mtp[key] = sf.get_tensor(key)
+    if not mtp:
+        raise ValueError(f"Qwen3.5 checkpoint at {model_path} has no mtp.* weights")
+    return mtp
+
+
 def is_fp8_checkpoint(model_path) -> bool:
     """True when the checkpoint dir holds block-wise FP8 safetensors.
 

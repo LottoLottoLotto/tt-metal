@@ -16,6 +16,34 @@ from models.tt_transformers.tt.model_config import ModelArgs
 GDN_CONV1D_L1_SMALL_SIZE = 24576
 
 
+def evaluation_weight_dtype(family, cache_path, default):
+    """Resolve an isolated evaluator's fully expanded target precision map.
+
+    The evaluator owns validation and a content-addressed cache root. Normal
+    serving has no QWEN36_EVAL_PRECISION and retains its original loading path.
+    """
+    import json
+    import ttnn
+
+    serialized = os.environ.get("QWEN36_EVAL_PRECISION")
+    if serialized is None:
+        return default
+    # Draft layers are stored losslessly and retain their own runtime dtype
+    # policy; the target's layers.N precision map does not describe them.
+    if cache_path is not None and Path(cache_path).name.startswith("mtp.layers."):
+        return default
+    plan = json.loads(serialized)
+    if family == "lm_head":
+        name = plan["lm_head"]
+    else:
+        if cache_path is None or not Path(cache_path).name.startswith("layers."):
+            raise ValueError("Evaluation layer precision requires a layers.N cache path")
+        index = Path(cache_path).name.split(".")[1]
+        values = plan["layers"][index]
+        name = values.get("gdn_output", values["gdn"]) if family == "gdn_output" else values[family]
+    return {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b, "bfp4": ttnn.bfloat4_b}[name]
+
+
 class Qwen36ModelArgs(ModelArgs):
     """Qwen3.5-9B ModelArgs for Blackhole P150."""
 
@@ -89,7 +117,11 @@ class Qwen36ModelArgs(ModelArgs):
         if mesh_device is not None:
             import ttnn
 
-            self.weight_dtype = ttnn.bfloat8_b
+            self.weight_dtype = (
+                ttnn.bfloat4_b
+                if os.environ.get("QWEN36_BFP4_WEIGHTS") == "1"
+                else ttnn.bfloat8_b
+            )
             self.act_dtype = ttnn.bfloat16
         else:
             self.weight_dtype = None
@@ -275,6 +307,8 @@ class Qwen36ModelArgs(ModelArgs):
 
         if dtype == ttnn.bfloat8_b:
             suffix = "tensor_cache_bfp8"
+        elif dtype == ttnn.bfloat4_b:
+            suffix = "tensor_cache_bfp4_mixed"
         else:
             suffix = "tensor_cache_bf16"
         if self.num_devices > 1:
@@ -285,15 +319,36 @@ class Qwen36ModelArgs(ModelArgs):
     def load_state_dict(self):
         """Load + remap weights via the text-only HF Qwen3_5ForCausalLM.
         Overrides base meta-key loader."""
+        native_manifest = Path(self.CKPT_DIR) / "native_manifest.json"
+        if native_manifest.is_file():
+            import native_checkpoint as loader
+
+            loader.validate_runtime(self.CKPT_DIR, Path(__file__).resolve().parents[1], self.num_devices)
+            manifest = loader.read_manifest(self.CKPT_DIR)
+            serialized = os.environ.get("QWEN36_EVAL_PRECISION")
+            if serialized is not None:
+                import json
+
+                if json.loads(serialized) != manifest["precision"]:
+                    raise ValueError("Runtime precision must match the native checkpoint precision map")
+            else:
+                import json
+
+                os.environ["QWEN36_EVAL_PRECISION"] = json.dumps(manifest["precision"])
+            return loader.load_native_checkpoint(self.CKPT_DIR)
         from models.demos.blackhole.qwen36.tt.weight_mapping import (
             is_fp8_checkpoint,
+            load_qwen36_mtp_state_dict,
             load_qwen36_state_dict_fp8,
             remap_qwen36_state_dict,
         )
 
         # Block FP8 checkpoints: dequant + remap for TP loaders (skip the HF model).
         if is_fp8_checkpoint(self.CKPT_DIR):
-            return load_qwen36_state_dict_fp8(self.CKPT_DIR)
+            state_dict = load_qwen36_state_dict_fp8(self.CKPT_DIR)
+            if os.environ.get("QWEN36_MTP") == "1":
+                state_dict.update(load_qwen36_mtp_state_dict(self.CKPT_DIR))
+            return state_dict
 
         # Import the HF classes directly rather than going through AutoModelForCausalLM.
         # Serving out-of-tree, vllm.transformers_utils.config registers vLLM's OWN
@@ -319,4 +374,6 @@ class Qwen36ModelArgs(ModelArgs):
         model = Qwen3_5ForCausalLM.from_pretrained(self.CKPT_DIR, config=text_config, dtype="auto")
         state_dict = remap_qwen36_state_dict(model.state_dict())
         del model
+        if os.environ.get("QWEN36_MTP") == "1":
+            state_dict.update(load_qwen36_mtp_state_dict(self.CKPT_DIR))
         return state_dict

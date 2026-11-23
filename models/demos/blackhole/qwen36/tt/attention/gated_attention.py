@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The Qwen3.5-9B gated full-attention layer — composes config/weights/prefill/decode."""
 
+import os
 import ttnn
 from models.demos.blackhole.qwen36.tt.attention.config import AttentionConfig
 from models.demos.blackhole.qwen36.tt.attention.decode import decode_forward
@@ -22,6 +23,29 @@ class Qwen36GatedAttention:
         self.config = config
 
         self.weights = load_attention_weights(mesh_device, state_dict, tensor_cache_path)
+        self.decode_program_configs = {}
+        if os.environ.get("QWEN36_SINGLE_1D_DECODE") == "1":
+            from models.demos.blackhole.qwen36.tt import tp_common as tpc
+
+            grid_w = int(os.environ.get("QWEN36_DECODE_GRID_W", "11"))
+            specs = {
+                "q": (self.weights.q_proj, 44),
+                "k": (self.weights.k_proj, 8),
+                "v": (self.weights.v_proj, 8),
+                "o": (self.weights.o_proj, 33),
+            }
+            if self.weights.qkv_fused is not None:
+                specs["qkv"] = (self.weights.qkv_fused, 64)
+            self.decode_program_configs = {
+                name: tpc.create_matmul_1d_decode_progcfg(
+                    1,
+                    weight.shape[-2],
+                    weight.shape[-1],
+                    num_cores=num_cores,
+                    grid_w=grid_w,
+                )
+                for name, (weight, num_cores) in specs.items()
+            }
 
         self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.LoFi,
@@ -73,6 +97,8 @@ class Qwen36GatedAttention:
                 page_table=page_table,
                 paged_kv_cache_key=self.paged_kv_cache_key,
                 paged_kv_cache_value=self.paged_kv_cache_value,
+                program_configs=self.decode_program_configs,
+                qkv_fused_weight=self.weights.qkv_fused,
             )
         elif self.use_paged_attention and T > 1 and chunk_page_table is not None:
             # Branch A — paged prefill
@@ -111,6 +137,60 @@ class Qwen36GatedAttention:
             self.past_key = new_key
             self.past_value = new_value
             return output
+
+    def verify_two(
+        self,
+        x,
+        cos,
+        sin,
+        position_tensor,
+        page_table,
+        shadow_fill_page_table,
+        shadow_source_page,
+        shadow_same_page,
+    ):
+        """Run causal M=2 attention with the second KV position isolated in a shadow page."""
+        from models.experimental.gated_attention_gated_deltanet.tt.ttnn_gated_attention import (
+            gated_attention_forward_ttnn,
+        )
+
+        output, key1, value1 = gated_attention_forward_ttnn(
+            hidden_states=x,
+            q_proj_weight=self.weights.q_proj,
+            k_proj_weight=self.weights.k_proj,
+            v_proj_weight=self.weights.v_proj,
+            o_proj_weight=self.weights.o_proj,
+            q_norm_weight=self.weights.q_norm,
+            k_norm_weight=self.weights.k_norm,
+            cos=cos,
+            sin=sin,
+            num_attention_heads=self.config.num_heads,
+            num_key_value_heads=self.config.num_kv_heads,
+            head_dim=self.config.head_dim,
+            device=self.device,
+            norm_eps=self.config.norm_eps,
+            compute_kernel_config=self.compute_kernel_config_decode,
+            use_optimized_concat=True,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            norm_weights_pre_offset=True,
+            cur_pos_tensor=position_tensor,
+            page_table=page_table,
+            paged_kv_cache_key=self.paged_kv_cache_key,
+            paged_kv_cache_value=self.paged_kv_cache_value,
+            q_decode_program_config=self.decode_program_configs.get("q"),
+            k_decode_program_config=self.decode_program_configs.get("k"),
+            v_decode_program_config=self.decode_program_configs.get("v"),
+            o_decode_program_config=self.decode_program_configs.get("o"),
+            qkv_fused_weight=self.weights.qkv_fused,
+            qkv_fused_q_dim=self.weights.q_proj.shape[-1],
+            qkv_fused_k_dim=self.weights.k_proj.shape[-1],
+            qkv_fused_program_config=self.decode_program_configs.get("qkv"),
+            verify_two=True,
+            shadow_fill_page_table=shadow_fill_page_table,
+            shadow_source_page=shadow_source_page,
+            shadow_same_page=shadow_same_page,
+        )
+        return output, (key1, value1)
 
     def reset_cache(self):
         """Clear the concat KV cache for a new sequence."""

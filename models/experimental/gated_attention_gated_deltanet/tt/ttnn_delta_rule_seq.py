@@ -103,72 +103,101 @@ def chunk_gated_delta_rule_seq_adapter(
     qkv_head_dims=None,  # (Hq,K,H,V): flat q/k/v [B,T,Hq*K]/[B,T,H*V]
     return_o_bh=False,  # True: return o as [BH,T,V], skip token-major relayout
 ):
-    """Drop-in for chunk_gated_delta_rule_ttnn using `gated_delta_attn_seq`.
-
-    [B,T,H,*] in -> (o [B,T,H,V], new_state [B,H,K,V]). L2-norms q/k, converts to
-    [BH,T,*] float32, runs kernel, converts back. new_state is bf16 (decode dtype) unless
-    QWEN_GDN_FP32_STATE=1.
-    """
+    """Baseline adapter with a tile-only relayout for aligned flat q/k/v."""
     B = q.shape[0]
     T = q.shape[1]
     if qkv_head_dims is not None:
-        # FLAT q/k [B,T,Hq*K], v [B,T,H*V]: head-split in _to_bhtd; L2 norm deferred (bit-identical).
         Hq, K, H, V = qkv_head_dims
         _defer_l2 = True
     else:
-        H = v.shape[2]  # Nv: beta/g/v/output/state
-        Hq = q.shape[2]  # q/k heads; may be < H (GQA) — norm at Hq, expand to H after via repeat_interleave
+        H = v.shape[2]
+        Hq = q.shape[2]
         K = q.shape[3]
         V = v.shape[3]
         _defer_l2 = False
     BH = B * H
 
-    # L2-norm q/k (kernel doesn't); deferred for flat inputs via _defer_l2.
     if not _defer_l2:
         q = l2_norm_ttnn(q, dim=-1)
         k = l2_norm_ttnn(k, dim=-1)
 
-    # Relayout untilize/permute in L1; land kernel inputs in DRAM (CBs ~1.36MB/core clash with L1).
     _L1 = ttnn.L1_MEMORY_CONFIG
+    _DRAM = ttnn.DRAM_MEMORY_CONFIG
+    _standard_tile = ttnn.Tile([32, 32])
 
     def _tilize_f32(t):
-        # Tilize + fp32 cast in one op (main #49565), avoiding a separate typecast pass.
         return ttnn.to_layout(t, ttnn.TILE_LAYOUT, dtype=ttnn.float32, memory_config=_DRAM)
 
-    def _to_bhtd(t, D, Hh, l2=False):  # [B,T,Hh,D] (or flat [B,T,Hh*D]) -> [B*Hh,T,D] float32 TILE
-        t = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT, memory_config=_L1)  # untilize -> L1
-        t = ttnn.reshape(t, [B, T, Hh, D])  # head-split (no-op if already 4D)
+    def _to_bhtd(t, D, Hh, l2=False):
+        tile_only = (
+            qkv_head_dims is not None
+            and B > 0
+            and T > 0
+            and Hh > 0
+            and D > 0
+            and T % 32 == 0
+            and D % 32 == 0
+            and tuple(t.shape) == (B, T, Hh * D)
+            and tuple(t.padded_shape) == (B, T, Hh * D)
+            and t.layout == ttnn.TILE_LAYOUT
+            and t.dtype in (ttnn.bfloat16, ttnn.float32)
+            and not t.is_sharded()
+            and t.tile == _standard_tile
+        )
+        if tile_only:
+            # Physical tiles are ordered [B, T/32, Hh, D/32]. This is an
+            # intentional tile-buffer reinterpretation, NOT a logical reshape.
+            # Keep each 32x32 tile intact; only exchange the head/time-block axes.
+            t = ttnn.experimental.view(t, [B, T // 32, Hh, 32, D])
+            t = ttnn.permute(t, (0, 2, 1, 3, 4), memory_config=_DRAM)
+            t = ttnn.reshape(t, [B * Hh, T, D])
+            if l2:
+                # Identical [BH,T,D] dtype and operation sequence to baseline.
+                t = l2_norm_ttnn(t, dim=-1)
+            if t.dtype != ttnn.float32:
+                t = ttnn.typecast(t, ttnn.float32, memory_config=_DRAM)
+            return t
+
+        # Original generic path: padded/nonflat/sharded/nonstandard-tile inputs.
+        t = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT, memory_config=_L1)
+        t = ttnn.reshape(t, [B, T, Hh, D])
         t = ttnn.permute(t, (0, 2, 1, 3))
         t = ttnn.reshape(t, [B * Hh, T, D])
         if l2:
-            # Per-head L2 on [BH,T,D] bf16 (before the fp32 cast) — bit-identical to pre-split norm,
-            # so keep tilize/typecast separate here (fused f32 tilize would norm in fp32 instead).
-            t = ttnn.to_layout(t, ttnn.TILE_LAYOUT, memory_config=_DRAM)  # kernel input in DRAM
+            t = ttnn.to_layout(t, ttnn.TILE_LAYOUT, memory_config=_DRAM)
             t = l2_norm_ttnn(t, dim=-1)
             if t.dtype != ttnn.float32:
                 t = ttnn.typecast(t, ttnn.float32, memory_config=_DRAM)
             return t
-        return _tilize_f32(t)  # non-normed (v): fused tilize+cast
+        return _tilize_f32(t)
 
-    def _to_bht(t):  # [B,T,H] -> [BH,T] float32 TILE
-        t = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT, memory_config=_L1)  # untilize -> L1
+    def _to_bht(t):
+        t = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT, memory_config=_L1)
         t = ttnn.reshape(t, [B, T, H])
         t = ttnn.permute(t, (0, 2, 1))
         t = ttnn.reshape(t, [BH, T])
-        return _tilize_f32(t)  # no norm on g/beta -> fused tilize+cast is safe
+        return _tilize_f32(t)
 
     q_bh = _to_bhtd(q, K, Hq, l2=_defer_l2)
     k_bh = _to_bhtd(k, K, Hq, l2=_defer_l2)
     v_bh = _to_bhtd(v, V, H)
     if Hq != H:
-        # GQA: repeat_interleave q/k along BH dim (Hq -> H heads); norm+permute ran on Hq only.
         rf = H // Hq
-        q_bh = ttnn.repeat_interleave(q_bh, rf, dim=0)
-        k_bh = ttnn.repeat_interleave(k_bh, rf, dim=0)
+        if T % 32 == 0 and K % 32 == 0 and rf > 0:
+            # Repeat whole head tile streams. repeat_interleave otherwise
+            # untilizes and retilizes the entire fp32 q/k tensors.
+            def repeat_heads(t):
+                heads = ttnn.reshape(t, [B * Hq, 1, T, K])
+                repeated = ttnn.concat([heads] * rf, dim=1, memory_config=_DRAM)
+                return ttnn.reshape(repeated, [B * Hq * rf, T, K])
+            q_bh = repeat_heads(q_bh)
+            k_bh = repeat_heads(k_bh)
+        else:
+            q_bh = ttnn.repeat_interleave(q_bh, rf, dim=0)
+            k_bh = ttnn.repeat_interleave(k_bh, rf, dim=0)
     g_bh = _to_bht(g)
     beta_bh = ttnn.reshape(_to_bht(beta), [BH, T, 1])
 
-    # initial_state [B,H,K,V] -> [BH,K,V]
     s0 = None
     if initial_state is not None:
         s0 = ttnn.reshape(initial_state, [BH, K, V])
@@ -187,16 +216,14 @@ def chunk_gated_delta_rule_seq_adapter(
         valid_len=valid_len,
     )
 
-    # o [BH,T,V] -> [B,T,H,V] (L1 shuffle, DRAM output). return_o_bh skips for caller-side fusion.
     if return_o_bh:
         o = o_bh
     else:
         o = ttnn.to_layout(o_bh, ttnn.ROW_MAJOR_LAYOUT, memory_config=_L1)
         o = ttnn.reshape(o, [B, H, T, V])
-        o = ttnn.permute(o, (0, 2, 1, 3))  # [B,T,H,V]
+        o = ttnn.permute(o, (0, 2, 1, 3))
         o = ttnn.to_layout(o, ttnn.TILE_LAYOUT, memory_config=_DRAM)
 
-    # final_state [BH,K,V] -> [B,H,K,V]. Default bf16; QWEN_GDN_FP32_STATE=1 avoids ~128x requant in long prefill.
     new_state = ttnn.reshape(final_state, [B, H, K, V])
     _state_dtype = ttnn.float32 if _os.environ.get("QWEN_GDN_FP32_STATE", "0") != "0" else ttnn.bfloat16
     if new_state.dtype != _state_dtype:
@@ -216,10 +243,10 @@ def create_chunk_masks_seq(chunk_size, device):
     # Replicate on TP mesh; single device leaves mapper unset (matches kernel fallback).
     _mesh_mapper = ttnn.ReplicateTensorToMesh(device) if device.get_num_devices() > 1 else None
 
-    def _from(m):
+    def _from(m, dtype=ttnn.float32):
         return ttnn.from_torch(
             m.to(torch.float32).reshape(1, m.shape[-2], m.shape[-1]),
-            dtype=ttnn.float32,
+            dtype=dtype,
             layout=ttnn.TILE_LAYOUT,
             device=device,
             mesh_mapper=_mesh_mapper,
@@ -233,6 +260,7 @@ def create_chunk_masks_seq(chunk_size, device):
         "lower_causal": _from(torch.tril(ones, diagonal=0)),
         "eye": _from(torch.eye(chunk_size)),
         "eye_32": _from(torch.eye(32)),
+        "ones_32": _from(torch.ones(32, 32), dtype=ttnn.bfloat16),
     }
 
 
@@ -262,7 +290,11 @@ def _solve_lower_triangular_ttnn(L, eye_1cc, mesh_device):
     D_diag = ttnn.sum(D_mat, dim=-1, keepdim=True, memory_config=mc)  # [batch, C, 1]
     D_inv_row = ttnn.reciprocal(D_diag, memory_config=mc)  # [batch, C, 1] all in (0, 1]
     ttnn.deallocate(D_diag)
-    D_inv_col = ttnn.clone(ttnn.reshape(D_inv_row, [batch, 1, C], memory_config=mc), memory_config=mc)
+    # C>1 changes the logical last dimension, so reshape allocates its own
+    # relayout buffer. The extra clone does not protect a live alias in this case.
+    D_inv_col = ttnn.reshape(D_inv_row, [batch, 1, C], memory_config=mc)
+    if C <= 1:
+        D_inv_col = ttnn.clone(D_inv_col, memory_config=mc)
 
     # N = D^{-1} (L - D) via row scaling
     L_strict = ttnn.subtract(L, D_mat, memory_config=mc)
@@ -315,20 +347,24 @@ def _solve_lower_triangular_ttnn(L, eye_1cc, mesh_device):
     # DEFAULT: Horner R = I + (-N)@R
     neg_N = ttnn.neg(N, memory_config=mc)  # -N (strictly lower)
     ttnn.deallocate(N)
-    # Pre-broadcast eye to [batch,C,C] when batch>1 (~-4% prefill; batch==1 unchanged).
-    _eye = eye_1cc
-    if batch > 1:
-        _eye = ttnn.repeat(eye_1cc, ttnn.Shape([batch, 1, 1]), memory_config=mc)
-    R = ttnn.add(_eye, neg_N, memory_config=mc)  # R_1 = I - N  ([batch,C,C])
-    for _ in range(C - 2):  # R_1 -> R_{C-1} = sum (-N)^j (exact: N^C=0)
-        NR = ttnn.matmul(neg_N, R, memory_config=mc, compute_kernel_config=_hifi_cfg)  # (-N) @ R
-        R_new = ttnn.add(_eye, NR, memory_config=mc)  # I + (-N) @ R
-        ttnn.deallocate(NR)
-        ttnn.deallocate(R)
-        R = R_new
+    from . import fused_horner
+    if fused_horner.supports(neg_N, eye_1cc):
+        R = fused_horner.horner(neg_N, eye_1cc, memory_config=mc)
+    else:
+        # Pre-broadcast eye for the original generic Horner implementation.
+        _eye = eye_1cc
+        if batch > 1:
+            _eye = ttnn.repeat(eye_1cc, ttnn.Shape([batch, 1, 1]), memory_config=mc)
+        R = ttnn.add(_eye, neg_N, memory_config=mc)
+        for _ in range(C - 2):
+            NR = ttnn.matmul(neg_N, R, memory_config=mc, compute_kernel_config=_hifi_cfg)
+            R_new = ttnn.add(_eye, NR, memory_config=mc)
+            ttnn.deallocate(NR)
+            ttnn.deallocate(R)
+            R = R_new
+        if _eye is not eye_1cc:
+            ttnn.deallocate(_eye)
     ttnn.deallocate(neg_N)
-    if _eye is not eye_1cc:
-        ttnn.deallocate(_eye)
 
     # L_inv = (I+N)^{-1} @ D^{-1} via column scaling
     L_inv = ttnn.multiply(R, D_inv_col, memory_config=mc)
@@ -374,6 +410,16 @@ def _compute_L_inv_ttnn(L_mat_4d, BH, NC, C, mesh_device, _cmc=None, eye_32=None
 
     stacked_inv = _solve_lower_triangular_ttnn(stacked_blocks, eye_32, mesh_device)
     ttnn.deallocate(stacked_blocks)
+
+    if Ct > 1:
+        # Solver batch order is [tile_block, BH*NC]. Swap only these leading
+        # dimensions, moving whole fp32 tiles rather than extracting each block
+        # and concatenating the results. No arithmetic or matmul shape changes.
+        stacked_inv_4d = ttnn.reshape(stacked_inv, [Ct, batch, 32, 32])
+        inv_by_batch = ttnn.transpose(stacked_inv_4d, 0, 1, memory_config=_cmc)
+        ttnn.deallocate(stacked_inv)
+        # Both reshapes preserve the tile width; retain the output's owner.
+        return ttnn.reshape(inv_by_batch, [BH, NC, C, 32], memory_config=_cmc)
 
     inv_blocks = []
     for b in range(Ct):
@@ -542,30 +588,43 @@ def chunk_gated_delta_rule_seq(
         memory_config=None,
     )
 
-    decay_col = ttnn.reshape(decay, [batch, chunk_size, 1], memory_config=None)
-    decay_row = ttnn.reshape(decay, [batch, 1, chunk_size], memory_config=None)
-    L_diff = ttnn.subtract(decay_col, decay_row, memory_config=_cmc)
-    del decay_col, decay_row
-
-    L_diff_masked = ttnn.multiply(L_diff, tril_mask, memory_config=_cmc)
-    ttnn.deallocate(L_diff)
-    L_diff_clamped = ttnn.clip(L_diff_masked, min=-20.0, max=0.0)
-    ttnn.deallocate(L_diff_masked)
-    L_mask = ttnn.multiply(ttnn.exp(L_diff_clamped, memory_config=_cmc), tril_mask, memory_config=_cmc)
-    ttnn.deallocate(L_diff_clamped)
+    from . import fused_decay
+    if fused_decay.supports(decay, tril_mask):
+        L_mask = fused_decay.decay_mask(decay, tril_mask, memory_config=_cmc)
+    else:
+        decay_col = ttnn.reshape(decay, [batch, chunk_size, 1], memory_config=None)
+        decay_row = ttnn.reshape(decay, [batch, 1, chunk_size], memory_config=None)
+        L_diff = ttnn.subtract(decay_col, decay_row, memory_config=_cmc)
+        del decay_col, decay_row
+        L_diff_masked = ttnn.multiply(L_diff, tril_mask, memory_config=_cmc)
+        ttnn.deallocate(L_diff)
+        L_diff_clamped = ttnn.clip(L_diff_masked, min=-20.0, max=0.0)
+        ttnn.deallocate(L_diff_masked)
+        L_mask = ttnn.multiply(ttnn.exp(L_diff_clamped, memory_config=_cmc), tril_mask, memory_config=_cmc)
+        ttnn.deallocate(L_diff_clamped)
 
     # ---- kk = k_beta @ k.T ----
     del k
     k_c = ttnn.move(k_c)
+    # Keep the existing transpose for qk as well. Restrict reuse to the DRAM,
+    # tile-aligned path so small-chunk L1 pressure follows the baseline.
+    _reuse_k_transpose = (
+        chunk_size > 64
+        and chunk_size % _TILE == 0
+        and K % _TILE == 0
+    )
     k_c_t = ttnn.transpose(k_c, 1, 2, memory_config=_cmc)
     kk = ttnn.matmul(k_beta_c, k_c_t, memory_config=_cmc, compute_kernel_config=_hifi_cfg, program_config=_bmm_cfg)
-    ttnn.deallocate(k_c_t)
+    if not _reuse_k_transpose:
+        ttnn.deallocate(k_c_t)
 
     _ck("kk", kk)
     # L_mat diagonal regularization (QWEN_GDN_DIAG_ALPHA): diag = 1 + alpha*diag(kk*L_mask).
     # alpha=0: exact HF/FLA (unit diag, undamped ||N||~19). alpha=1: full 1/(1+beta) damping.
     # Default 0.25: partial damping prevents GDN state saturation at 256k (alpha=0 rides doc narrative).
     # Horner inverse stable at any alpha; QWEN_GDN_INV_DOUBLING=1 forces alpha=1 + doubling (A/B pair).
+    from . import fused_normalization
+    fused_regularization = False
     if _os.environ.get("QWEN_GDN_INV_DOUBLING", "0") != "0":
         # A/B: full diagonal-included L_mat + doubling inverse.
         L_mat = ttnn.add(_eye_1cc, ttnn.multiply(kk, L_mask, memory_config=_cmc), memory_config=_cmc)
@@ -573,25 +632,31 @@ def chunk_gated_delta_rule_seq(
     else:
         # L_mat = I + kk*L_mask - (1-alpha)*diag(kk*L_mask)
         alpha = float(_os.environ.get("QWEN_GDN_DIAG_ALPHA", "0.25"))
-        kk_lmask = ttnn.multiply(kk, L_mask, memory_config=_cmc)
-        ttnn.deallocate(kk)
-        kk_diag = ttnn.multiply(kk_lmask, _eye_1cc, memory_config=_cmc)  # diag(kk*L_mask)
-        if alpha == 0.0:
-            # alpha=0: strip diagonal -> unit diag (torch/FLA-equivalent)
-            kk_reg = ttnn.subtract(kk_lmask, kk_diag, memory_config=_cmc)
+        fused_regularization = fused_normalization.supports(kk, L_mask, _eye_1cc, alpha=alpha, memory_config=_cmc)
+        if fused_regularization:
+            L_mat, D_mat = fused_normalization.regularize(kk, L_mask, _eye_1cc, alpha=alpha, memory_config=_cmc)
+            ttnn.deallocate(kk)
         else:
-            # keep alpha*diag; drop (1-alpha)*diag
-            kk_drop = ttnn.multiply(kk_diag, 1.0 - alpha, memory_config=_cmc)
-            kk_reg = ttnn.subtract(kk_lmask, kk_drop, memory_config=_cmc)
-            ttnn.deallocate(kk_drop)
-        ttnn.deallocate(kk_lmask)
-        ttnn.deallocate(kk_diag)
-        L_mat = ttnn.add(_eye_1cc, kk_reg, memory_config=_cmc)
-        ttnn.deallocate(kk_reg)
+            kk_lmask = ttnn.multiply(kk, L_mask, memory_config=_cmc)
+            ttnn.deallocate(kk)
+            kk_diag = ttnn.multiply(kk_lmask, _eye_1cc, memory_config=_cmc)  # diag(kk*L_mask)
+            if alpha == 0.0:
+                # alpha=0: strip diagonal -> unit diag (torch/FLA-equivalent)
+                kk_reg = ttnn.subtract(kk_lmask, kk_diag, memory_config=_cmc)
+            else:
+                # keep alpha*diag; drop (1-alpha)*diag
+                kk_drop = ttnn.multiply(kk_diag, 1.0 - alpha, memory_config=_cmc)
+                kk_reg = ttnn.subtract(kk_lmask, kk_drop, memory_config=_cmc)
+                ttnn.deallocate(kk_drop)
+            ttnn.deallocate(kk_lmask)
+            ttnn.deallocate(kk_diag)
+            L_mat = ttnn.add(_eye_1cc, kk_reg, memory_config=_cmc)
+            ttnn.deallocate(kk_reg)
     _ck("L_mat", L_mat)
 
     # ---- Normalize to unit-diagonal: L_unit = D^{-1} L_mat ----
-    D_mat = ttnn.multiply(L_mat, _eye_1cc, memory_config=_cmc)
+    if not fused_regularization:
+        D_mat = ttnn.multiply(L_mat, _eye_1cc, memory_config=_cmc)
     # keepdim -> reduce writes [batch, C, 1] directly; skips the [batch,C]->[batch,C,1] reshape,
     # which on TILE is a physical relayout (~60us). Bit-identical to sum+reshape.
     D_diag = ttnn.sum(D_mat, dim=-1, keepdim=True, memory_config=_cmc)
@@ -600,13 +665,18 @@ def chunk_gated_delta_rule_seq(
     _ck("D_inv", D_inv_row)
     ttnn.deallocate(D_diag)
 
-    L_strict = ttnn.subtract(L_mat, D_mat, memory_config=_cmc)
-    ttnn.deallocate(D_mat)
-    ttnn.deallocate(L_mat)
-    N = ttnn.multiply(D_inv_row, L_strict, memory_config=_cmc)
-    ttnn.deallocate(L_strict)
-    L_unit = ttnn.add(_eye_1cc, N, memory_config=_cmc)
-    ttnn.deallocate(N)
+    if fused_regularization and fused_normalization.supports_normalize(L_mat, D_mat, D_inv_row, _eye_1cc, memory_config=_cmc):
+        L_unit = fused_normalization.normalize(L_mat, D_mat, D_inv_row, _eye_1cc, memory_config=_cmc)
+        ttnn.deallocate(D_mat)
+        ttnn.deallocate(L_mat)
+    else:
+        L_strict = ttnn.subtract(L_mat, D_mat, memory_config=_cmc)
+        ttnn.deallocate(D_mat)
+        ttnn.deallocate(L_mat)
+        N = ttnn.multiply(D_inv_row, L_strict, memory_config=_cmc)
+        ttnn.deallocate(L_strict)
+        L_unit = ttnn.add(_eye_1cc, N, memory_config=_cmc)
+        ttnn.deallocate(N)
 
     v_beta_sc = ttnn.multiply(D_inv_row, v_beta_c, memory_config=_cmc)
     del v_beta_c
@@ -668,7 +738,10 @@ def chunk_gated_delta_rule_seq(
     lower_causal_4d = ttnn.reshape(lower_causal, [1, 1, chunk_size, chunk_size], memory_config=None)
     combined_mask_4d = ttnn.multiply(L_mask_4d, lower_causal_4d, memory_config=_cmc)
     ttnn.deallocate(L_mask_4d)
-    k_c_4d_t = ttnn.transpose(k_c_4d, 2, 3, memory_config=_cmc)
+    if _reuse_k_transpose:
+        k_c_4d_t = ttnn.reshape(k_c_t, [BH, num_chunks, K, chunk_size], memory_config=_cmc)
+    else:
+        k_c_4d_t = ttnn.transpose(k_c_4d, 2, 3, memory_config=_cmc)
     qk_4d = ttnn.matmul(q_c_4d, k_c_4d_t, memory_config=_cmc, compute_kernel_config=_hifi_cfg, program_config=_bmm_cfg)
     ttnn.deallocate(k_c_4d_t)
     intra_attn_4d = ttnn.multiply(qk_4d, combined_mask_4d, memory_config=_cmc)

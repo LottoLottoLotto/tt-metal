@@ -5,11 +5,36 @@
 Wraps the experimental ``gated_deltanet_forward_ttnn()`` and the on-device GDN prefill
 kernel into a module that manages weight tensors, recurrent state, and conv state.
 """
+import os
+from loguru import logger
 import ttnn
 from models.demos.blackhole.qwen36.tt.gdn.config import GDNConfig
 from models.demos.blackhole.qwen36.tt.gdn.decode import recurrent_forward
 from models.demos.blackhole.qwen36.tt.gdn.state import init_recurrent_state, restore_split_conv_from_fused
 from models.demos.blackhole.qwen36.tt.gdn.weights import load_gdn_weights
+
+_LEGACY_NATIVE_FLAGS = (
+    "QWEN36_GDN_RECURRENT_FUSED",
+    "QWEN36_GDN_FRONTEND_FUSED",
+    "QWEN36_GDN_MEGA_CORES",
+)
+
+
+def _effective_native_gdn_config():
+    legacy = [name for name in _LEGACY_NATIVE_FLAGS if name in os.environ]
+    if legacy:
+        raise RuntimeError(
+            f"Obsolete native GDN environment variable(s): {', '.join(legacy)}; "
+            "use QWEN_GDN_RECURRENT_FUSED and QWEN_GDN_FRONTEND_FUSED"
+        )
+    recurrent = os.environ.get("QWEN_GDN_RECURRENT_FUSED", "0") == "1"
+    frontend = os.environ.get("QWEN_GDN_FRONTEND_FUSED", "0") == "1"
+    if frontend and not recurrent:
+        raise RuntimeError("QWEN_GDN_FRONTEND_FUSED=1 requires QWEN_GDN_RECURRENT_FUSED=1")
+    output = os.environ.get("QWEN_GDN_OUTPUT_FUSED", "0") == "1"
+    if output and not frontend:
+        raise RuntimeError("QWEN_GDN_OUTPUT_FUSED=1 requires QWEN_GDN_FRONTEND_FUSED=1")
+    return recurrent, frontend, output
 
 
 class Qwen36GatedDeltaNet:
@@ -21,6 +46,9 @@ class Qwen36GatedDeltaNet:
       - "recurrent": single-token decode (T=1), O(1) memory
       - "chunk": multi-token prefill (T>1), chunked parallel processing
     """
+    _logged_effective_config = False
+    _shared_native_output_value = None
+    _shared_native_output_value_m2 = None
 
     def __init__(self, mesh_device, config: GDNConfig, state_dict, tensor_cache_path=None):
         self.device = mesh_device
@@ -46,7 +74,65 @@ class Qwen36GatedDeltaNet:
             packer_l1_acc=True,
         )
 
+        self.native_recurrent, self.native_frontend, self.native_output = _effective_native_gdn_config()
         self.weights = load_gdn_weights(mesh_device, config, state_dict, tensor_cache_path)
+        self.native_frontend_output = None
+        self.native_frontend_output_m2 = None
+        self.native_output_output = None
+        self.native_output_output_m2 = None
+        self.mega_decode_program_config = None
+        self.out_decode_program_config = None
+        if os.environ.get("QWEN36_SINGLE_1D_DECODE") == "1":
+            from models.demos.blackhole.qwen36.tt import tp_common as tpc
+
+            grid_w = int(os.environ.get("QWEN36_DECODE_GRID_W", "11"))
+            if self.weights.mega_fused_weight_decode is not None:
+                if (
+                    os.environ.get("QWEN_GDN_MEGA_PACKED") == "1"
+                    and self.weights.mega_fused_weight_decode.dtype == ttnn.bfloat4_b
+                ):
+                    self.mega_decode_program_config = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                        compute_with_storage_grid_size=(11, 10),
+                        in0_block_w=4,
+                        out_subblock_h=1,
+                        out_subblock_w=4,
+                        per_core_M=1,
+                        per_core_N=4,
+                        fuse_batch=True,
+                        fused_activation=None,
+                        mcast_in0=True,
+                    )
+                else:
+                    self.mega_decode_program_config = tpc.create_matmul_1d_decode_progcfg(
+                        1,
+                        self.weights.mega_fused_weight.shape[-2],
+                        self.weights.mega_fused_weight.shape[-1],
+                        num_cores=int(os.environ.get("QWEN_GDN_MEGA_CORES", "44")),
+                        grid_w=grid_w,
+                    )
+            self.out_decode_program_config = tpc.create_matmul_1d_decode_progcfg(
+                1,
+                self.weights.o_proj_weight.shape[-2],
+                self.weights.o_proj_weight.shape[-1],
+                num_cores=33,
+                grid_w=grid_w,
+            )
+        if not Qwen36GatedDeltaNet._logged_effective_config:
+            logger.info(
+                "GDN effective config: implementation={} recurrent_fused={} frontend_fused={} output_fused={} "
+                "recurrent_cores={} mega_projection_cores={} state_dtype=BF16 state_placement=L1 "
+                "conv_state_placement=L1 recurrent_cb_bytes=237568 cb_alias=input_state/final_state "
+                "phased={} flat_qkv={}",
+                "native" if self.native_recurrent else "safe",
+                self.native_recurrent,
+                self.native_frontend,
+                self.native_output,
+                self.num_v_heads,
+                int(os.environ.get("QWEN_GDN_MEGA_CORES", "44")),
+                os.environ.get("QWEN_GDN_PHASED", "1") != "0",
+                os.environ.get("QWEN_GDN_FLAT_QKV", "1") != "0",
+            )
+            Qwen36GatedDeltaNet._logged_effective_config = True
 
         # ---- Runtime state (plain instance attributes, exact same names as before;
         # poked directly by the trace machinery in model.py / qwen36_vllm.py) ----
@@ -70,20 +156,48 @@ class Qwen36GatedDeltaNet:
     def forward(self, x, mode="recurrent", chunk_size=None, valid_len=None):
         return recurrent_forward(self, x, mode=mode, chunk_size=chunk_size, valid_len=valid_len)
 
+    def verify_two(self, x):
+        """Return M=2 output plus (S1,S2) recurrent and convolution candidates."""
+        return recurrent_forward(self, x, mode="verify_two")
+
     def set_external_state(self, recurrent_state, conv_state):
         """Point layer at externally-allocated state buffers.
         Sets use_inplace_state=True so all forward passes write state inplace (preserving buffer addresses).
         Does NOT create split_conv_state — that happens after prefill when there is real data to split.
         """
-        expected_rec = [1, self.num_v_heads, self.head_k_dim, self.head_v_dim]
-        assert (
-            list(recurrent_state.shape) == expected_rec
-        ), f"recurrent_state shape mismatch: {list(recurrent_state.shape)} != {expected_rec}"
-        assert (
-            conv_state.shape[1] == self.conv_kernel_size - 1
-        ), f"conv_state dim 1 mismatch: {conv_state.shape[1]} != {self.conv_kernel_size - 1}"
+        recurrent_shape = list(recurrent_state.shape)
+        conv_shape = list(conv_state.shape)
+        expected_tail = [self.num_v_heads, self.head_k_dim, self.head_v_dim]
+        assert recurrent_shape[1:] == expected_tail, (
+            f"recurrent_state shape mismatch: {recurrent_shape} "
+            f"does not end in {expected_tail}"
+        )
+        assert recurrent_shape[0] == conv_shape[0], (
+            f"state batch mismatch: recurrent={recurrent_shape[0]}, "
+            f"conv={conv_shape[0]}"
+        )
+        assert conv_state.shape[1] == self.conv_kernel_size - 1, (
+            f"conv_state dim 1 mismatch: {conv_state.shape[1]} != "
+            f"{self.conv_kernel_size - 1}"
+        )
+        assert recurrent_state.dtype == ttnn.bfloat16 and conv_state.dtype == ttnn.bfloat16, (
+            "single-P150 GDN state must use BF16"
+        )
+        assert recurrent_state.layout == ttnn.ROW_MAJOR_LAYOUT, (
+            "persistent recurrent state must use compact row-major layout"
+        )
+        assert recurrent_state.memory_config().buffer_type == ttnn.BufferType.L1, (
+            "recurrent state must be allocated in L1"
+        )
+        assert conv_state.memory_config().buffer_type == ttnn.BufferType.L1, (
+            "convolution state must be allocated in L1"
+        )
         self.recurrent_state = recurrent_state
         self.fused_conv_state = conv_state
+        self._persistent_state_addresses = (
+            int(recurrent_state.buffer_address()),
+            int(conv_state.buffer_address()),
+        )
         self.use_inplace_state = True
 
     def _restore_split_conv_from_fused(self):

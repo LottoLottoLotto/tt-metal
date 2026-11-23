@@ -53,12 +53,34 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
     _tt_allow_decode_trace_buffer_reuse = True
 
     # supports_async_decode=False: async decode assumes on-device token/position continuity, which
-    # corrupts Qwen's GDN scan. supports_sample_on_device=True: on-device sampling is decode-only.
+    # corrupts Qwen's GDN scan. Single-device sampling supports only the force-argmax fast path;
+    # the runner falls back to host sampling for random or penalized requests.
     model_capabilities = {
         "supports_prefix_caching": False,
         "supports_async_decode": False,
         "supports_sample_on_device": True,
+        "supports_greedy_only_sample_on_device": True,
     }
+
+    @classmethod
+    def get_kv_cache_spec(cls, vllm_config):
+        """Describe paged attention; GDN state is owned by the TT model."""
+        from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        # Upstream Mamba page alignment is not applicable to our unpaged GDN
+        # state. Keep KV blocks aligned with the fixed prefill chunk traces.
+        cache_config.block_size = _BLOCK_SIZE
+        dtype = model_config.dtype if cache_config.cache_dtype == "auto" else STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+        return {"foo": FullAttentionSpec(
+            block_size=_BLOCK_SIZE,
+            num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
+            head_size=model_config.get_head_size(),
+            dtype=dtype,
+            sliding_window=model_config.get_sliding_window(),
+        )}
 
     def _validate_device_sampling_request(self, requested):
         if not requested:
@@ -137,10 +159,9 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         args, model, _ = create_tt_model(
             mesh_device, max_batch_size=max_batch_size, max_seq_len=max_seq_len, hf_model=name_or_path
         )
-        # Attach the TT vision tower so prefill can splice image/video embeddings (multimodal path).
-        # No-op cost for text-only requests; get_image_features / get_video_features are only invoked
-        # when a request actually carries pixel_values / pixel_values_videos.
-        model.init_vision_model()
+        # Native checkpoints are validated as text-only by load_state_dict.
+        if not os.path.isfile(os.path.join(args.CKPT_DIR, "native_manifest.json")):
+            model.init_vision_model()
         return cls([model], [args], mesh_device)
 
     def allocate_kv_cache(self, kv_cache_shape, dtype, num_layers):
@@ -203,7 +224,7 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
     def prefill_forward(self, tokens, page_table, kv_cache, prompt_lens, **kwargs):
         """All prefill is model-owned (Generator drives decode only)."""
         model = self.model[0]
-        if model.num_devices > 1 and model.args.max_batch_size > 1:
+        if model.args.max_batch_size > 1:
             # Batched text prefill into decode slots (MM is B=1). Require real visual data, not a
             # non-None empty pixel_values placeholder from vLLM on text requests.
             assert not self._has_visual(kwargs, "pixel_values") and not self._has_visual(
@@ -294,6 +315,50 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         logger.info(f"Finished batched prefill of {N} user(s), starting decode...")
         return logits, torch.zeros(N, dtype=torch.long)
 
+    # ---- MTP-1 device-resident speculative decode (QWEN36_MTP=1) ----
+    def mtp_available(self):
+        return getattr(self.model[0], "mtp", None) is not None
+
+    def mtp_first_draft(self, first_token, first_position):
+        """Trace-replayed first draft; read back only the selected token."""
+        return self.model[0].mtp.first_draft(int(first_token), int(first_position))
+
+    def mtp_step(self, committed_token, draft_token, position, page_table_row):
+        pt = page_table_row if isinstance(page_table_row, torch.Tensor) else torch.tensor(page_table_row)
+        pt = pt.to(torch.int32).reshape(-1)
+        width = self.model[0]._mtp_cycle_width
+        if pt.shape[0] < width:
+            pt = torch.cat([pt, torch.zeros(width - pt.shape[0], dtype=torch.int32)])
+        return self.model[0].mtp_step(committed_token, draft_token, position, pt[:width])
+
+    def mtp_warmup(self, page_table_width):
+        self.model[0].mtp_cycle_warmup(page_table_width)
+        self.model[0].mtp.warmup_first_draft()
+
+    def warmup_model_decode(self, *args, **kwargs):
+        width = None
+        if self.mtp_available():
+            model = self.model[0]
+            width = 8
+            if getattr(model, "_paged_kv_caches", None):
+                blocks = int(model._paged_kv_caches[0][0].shape[0])
+                # paged_update_cache requires table width <= cache blocks; the int32 row must
+                # be 32-byte aligned, so round down to a multiple of 8.
+                width = max(8, (blocks // 8) * 8)
+            # Allocate the cycle's fixed buffers (incl. the last-hidden store the decode trace
+            # writes) BEFORE the decode trace is captured so its baked addresses stay valid.
+            model.init_mtp_cycle(width)
+        result = self._warmup_model_decode_base(*args, **kwargs)
+        if width is not None:
+            # Capture the cycle last, without moving its persistent buffers.
+            if model._mtp_cycle_trace is not None:
+                ttnn.release_trace(model.device, model._mtp_cycle_trace)
+                model._mtp_cycle_trace = None
+            cache_shape = tuple(model._paged_kv_caches[0][0].shape) if getattr(model, "_paged_kv_caches", None) else None
+            logger.info("Warming Qwen MTP-1 device cycle trace (page_table_width={}, kv_cache_shape={})...", width, cache_shape)
+            self.mtp_warmup(width)
+        return result
+
     def decode_forward(self, *args, **kwargs):
         # Traced decode (single-device and TP): trace captured at pos 0 in warmup, replayed here.
         # Valid for TP — GDN state is in fixed in-place buffers, and prefill only replays pre-warmed programs.
@@ -305,7 +370,7 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         # BEFORE the decode trace reads it. The plugin remaps its own buffers (and the seed RNG via
         # super().decode_forward), but GDN state is model-internal, so mirror the same reindex here.
         # slot_remap is passed through unchanged so the seed-RNG remap inside super() still runs.
-        if model.num_devices > 1 and model.args.max_batch_size > 1:
+        if model.args.max_batch_size > 1:
             slot_remap = kwargs.get("slot_remap")
             if slot_remap is not None:
                 model._remap_gdn_slots(slot_remap)
@@ -327,7 +392,7 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
                 args[pos] = val
 
         tokens = _read("tokens", 0)
-        if os.environ.get("TT_DECODE_BUCKETING", "1") == "1" and tokens is not None:
+        if os.environ.get("TT_DECODE_BUCKETING", "0") == "1" and tokens is not None:
             start_pos = _read("start_pos", 1)
             width = int(tokens.shape[0])
             num_active = int((start_pos != -1).sum()) if start_pos is not None else width
@@ -384,7 +449,7 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         # (>chunk_size) replay the traced chunk-outer path per user instead of the slower eager fallback.
         # The scratch is not freed (prefill_paged_slots rebinds it per request); the batched decode
         # buffers are restored before the decode-trace warmup captures at [B,...].
-        batched = model.num_devices > 1 and model.args.max_batch_size > 1
+        batched = model.args.max_batch_size > 1
         logger.info(
             f"Starting Qwen prefill warmup: chunk-prefill trace{' (batched, B=1 scratch)' if batched else ''} "
             f"(chunk={_PREFILL_WARMUP_CHUNK}, page_table_blocks={num_blocks})..."
@@ -398,9 +463,11 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
             if prev is not None:
                 model._unbind_gdn_prefill_scratch(prev)
 
-    def warmup_model_decode(self, *args, **kwargs):
+    def _warmup_model_decode_base(self, *args, **kwargs):
         # Defer to WarmupForwardMixin, which warms the paged-SDPA + GDN decode path at pos 0.
         # Drop stale `non_greedy_decoding_on_device` from the old vLLM plugin; no-op for Qwen.
         kwargs.pop("non_greedy_decoding_on_device", None)
         self._validate_device_sampling_request(kwargs.get("can_sample_on_device", False))
+        if kwargs.get("can_sample_on_device", False) and self.model[0].num_devices == 1:
+            kwargs["greedy_only"] = True
         return warmup_decode_buckets(self, super().warmup_model_decode, *args, **kwargs)

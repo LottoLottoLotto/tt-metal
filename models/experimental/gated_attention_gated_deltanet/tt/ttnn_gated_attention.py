@@ -207,6 +207,18 @@ def gated_attention_forward_ttnn(
     chunk_page_table=None,  # [1, num_blocks_in_chunk] int32 — blocks for this chunk only
     chunk_start_idx=None,  # int — absolute position of this chunk in the full sequence
     chunk_start_idx_tensor=None,  # device tensor [1] int32 — runtime offset for trace-replay (flexible SDPA)
+    q_decode_program_config=None,
+    k_decode_program_config=None,
+    v_decode_program_config=None,
+    o_decode_program_config=None,
+    qkv_fused_weight=None,
+    qkv_fused_q_dim=None,
+    qkv_fused_k_dim=None,
+    qkv_fused_program_config=None,
+    verify_two=False,
+    shadow_fill_page_table=None,
+    shadow_source_page=0,
+    shadow_same_page=True,
 ):
     """
     TTNN forward pass for Gated Attention with KV cache support.
@@ -235,13 +247,67 @@ def gated_attention_forward_ttnn(
         new_key: ttnn.Tensor [B, H_kv, S_total, D] updated KV cache key
         new_value: ttnn.Tensor [B, H_kv, S_total, D] updated KV cache value
     """
-    B = hidden_states.shape[0]
-    T = hidden_states.shape[1]
+    flat_decode = (
+        not verify_two
+        and len(hidden_states.shape) == 4
+        and int(hidden_states.shape[0]) == 1
+        and int(hidden_states.shape[1]) == 1
+    )
+    B = 1 if verify_two else (int(hidden_states.shape[-2]) if flat_decode else int(hidden_states.shape[0]))
+    T = 2 if verify_two else (1 if flat_decode else int(hidden_states.shape[1]))
     scaling = head_dim**-0.5
 
-    # Q projection: 2x wide
+    # Decode can fuse Q+gate, K, and V into one projection. Prefill retains the
+    # existing individual projections to preserve its validated layouts.
     ckc = compute_kernel_config
-    qg = ttnn.linear(hidden_states, q_proj_weight, compute_kernel_config=ckc, memory_config=memory_config)
+
+    def decode_linear(x, weight, program_config=None):
+        """Treat every leading serving dimension as M rows."""
+        original_shape = list(x.shape)
+        rows = 1
+        for dim in original_shape[:-1]:
+            rows *= int(dim)
+        if T == 1 and rows > 1:
+            x = ttnn.reshape(x, [1, 1, rows, original_shape[-1]])
+            out = ttnn.linear(
+                x,
+                weight,
+                compute_kernel_config=ckc,
+                memory_config=memory_config,
+                program_config=program_config,
+            )
+            return ttnn.reshape(out, original_shape[:-1] + [out.shape[-1]])
+        return ttnn.linear(
+            x,
+            weight,
+            compute_kernel_config=ckc,
+            memory_config=memory_config,
+            program_config=program_config,
+        )
+    use_fused_qkv = (T == 1 or verify_two) and qkv_fused_weight is not None
+    if use_fused_qkv:
+        qkv_fused = decode_linear(
+            hidden_states,
+            qkv_fused_weight,
+            program_config=qkv_fused_program_config if (T == 1 or verify_two) else None,
+        )
+        qg = qkv_fused[..., :qkv_fused_q_dim]
+        qg = ttnn.to_layout(qg, ttnn.TILE_LAYOUT)
+        key_states = qkv_fused[
+            ..., qkv_fused_q_dim : qkv_fused_q_dim + qkv_fused_k_dim
+        ]
+        key_states = ttnn.to_layout(key_states, ttnn.TILE_LAYOUT)
+        value_states = qkv_fused[..., qkv_fused_q_dim + qkv_fused_k_dim :]
+        value_states = ttnn.to_layout(value_states, ttnn.TILE_LAYOUT)
+        ttnn.deallocate(qkv_fused)
+    else:
+        qg = ttnn.linear(
+            hidden_states,
+            q_proj_weight,
+            compute_kernel_config=ckc,
+            memory_config=memory_config,
+            program_config=q_decode_program_config if (T == 1 or verify_two) else None,
+        )
     qg = ttnn.reshape(qg, [B, T, num_attention_heads, head_dim * 2])
     # Split into query and gate
     query_states, gate = ttnn.chunk(qg, 2, dim=-1)
@@ -256,7 +322,14 @@ def gated_attention_forward_ttnn(
     query_states = ttnn.transpose(query_states, 1, 2)
 
     # K projection + norm + transpose to [B, H_kv, T, D]
-    key_states = ttnn.linear(hidden_states, k_proj_weight, compute_kernel_config=ckc, memory_config=memory_config)
+    if not use_fused_qkv:
+        key_states = ttnn.linear(
+            hidden_states,
+            k_proj_weight,
+            compute_kernel_config=ckc,
+            memory_config=memory_config,
+            program_config=k_decode_program_config if (T == 1 or verify_two) else None,
+        )
     key_states = ttnn.reshape(key_states, [B, T, num_key_value_heads, head_dim])
     if norm_weights_pre_offset:
         key_states = ttnn.rms_norm(key_states, weight=k_norm_weight, epsilon=norm_eps)
@@ -265,7 +338,14 @@ def gated_attention_forward_ttnn(
     key_states = ttnn.transpose(key_states, 1, 2)
 
     # V projection + transpose to [B, H_kv, T, D]
-    value_states = ttnn.linear(hidden_states, v_proj_weight, compute_kernel_config=ckc, memory_config=memory_config)
+    if not use_fused_qkv:
+        value_states = ttnn.linear(
+            hidden_states,
+            v_proj_weight,
+            compute_kernel_config=ckc,
+            memory_config=memory_config,
+            program_config=v_decode_program_config if (T == 1 or verify_two) else None,
+        )
     value_states = ttnn.reshape(value_states, [B, T, num_key_value_heads, head_dim])
     value_states = ttnn.transpose(value_states, 1, 2)
 
@@ -280,7 +360,82 @@ def gated_attention_forward_ttnn(
     # KV cache handling
     _use_sdpa_decode = False
     _paged_sdpa_done = False
-    if paged_kv_cache_key is not None and page_table is not None and T > 1 and chunk_page_table is not None:
+    if verify_two:
+        if paged_kv_cache_key is None or page_table is None:
+            raise ValueError("verify_two requires paged KV caches and a two-row page table")
+        if shadow_fill_page_table is not None:
+            # Snapshot the destination logical block before provisional writes. Row 1
+            # maps that logical block to the shadow physical page.
+            key_block = paged_kv_cache_key[shadow_source_page : shadow_source_page + 1, :, :, :]
+            value_block = paged_kv_cache_value[shadow_source_page : shadow_source_page + 1, :, :, :]
+            ttnn.experimental.paged_fill_cache(
+                paged_kv_cache_key, key_block, shadow_fill_page_table, batch_idx=0
+            )
+            ttnn.experimental.paged_fill_cache(
+                paged_kv_cache_value, value_block, shadow_fill_page_table, batch_idx=0
+            )
+
+        # key_states/value_states are [1, H_kv, 2, D]. Positions p and p+1 share one
+        # 32-row tile, and paged_update_cache does a per-core read-modify-write of that
+        # tile, so a single two-row call races (one token's K/V is dropped
+        # nondeterministically). Write the two tokens in two dependent single-row calls.
+        worker_grid = device.compute_with_storage_grid_size()
+        shard1 = ttnn.num_cores_to_corerangeset(1, worker_grid, row_wise=True)
+        sharded1 = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(shard1, [32, head_dim], ttnn.ShardOrientation.ROW_MAJOR),
+        )
+
+        def provisional_write(cache, tokens, positions, table):
+            for t in range(2):
+                value = ttnn.to_memory_config(tokens[:, t : t + 1, :, :], sharded1)
+                ttnn.experimental.paged_update_cache(
+                    cache, value, update_idxs_tensor=positions[t : t + 1], page_table=table[t : t + 1, :]
+                )
+                ttnn.deallocate(value)
+
+        k_tokens = ttnn.permute(key_states, (0, 2, 1, 3))  # [1, 2, H_kv, D]
+        v_tokens = ttnn.permute(value_states, (0, 2, 1, 3))
+        key1 = k_tokens[:, 1:2, :, :]
+        value1 = v_tokens[:, 1:2, :, :]
+        provisional_write(paged_kv_cache_key, k_tokens, cur_pos_tensor, page_table)
+        provisional_write(paged_kv_cache_value, v_tokens, cur_pos_tensor, page_table)
+        if shadow_same_page:
+            # Token 0 must also be visible in the shadow page for token 1's causal read.
+            pos0 = cur_pos_tensor[0:1]
+            shadow_table = page_table[1:2, :]
+            for cache, tokens in ((paged_kv_cache_key, k_tokens), (paged_kv_cache_value, v_tokens)):
+                shadow0 = ttnn.to_memory_config(tokens[:, 0:1, :, :], sharded1)
+                ttnn.experimental.paged_update_cache(
+                    cache, shadow0, update_idxs_tensor=pos0, page_table=shadow_table
+                )
+                ttnn.deallocate(shadow0)
+
+        # query_states is [1, H, 2, D]; paged decode wants [S=1, B=2, H, D].
+        # A reshape would interleave heads across the two tokens.
+        q_decode = ttnn.permute(query_states, (0, 2, 1, 3))
+        q_decode = ttnn.to_memory_config(q_decode, ttnn.DRAM_MEMORY_CONFIG)
+        attn_output = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+            q_decode,
+            paged_kv_cache_key,
+            paged_kv_cache_value,
+            cur_pos_tensor=cur_pos_tensor,
+            page_table_tensor=page_table,
+            is_causal=True,
+            scale=scaling,
+            program_config=_get_paged_sdpa_decode_program_config(
+                device, paged_kv_cache_key.shape[0] * paged_kv_cache_key.shape[2]
+            ),
+        )
+        attn_output = ttnn.permute(attn_output, (0, 2, 1, 3))
+        new_key = key1
+        new_value = value1
+        _paged_sdpa_done = True
+        S_total = paged_kv_cache_key.shape[0] * paged_kv_cache_key.shape[2]
+        is_causal = False
+        segmented_attn_mask = None
+    elif paged_kv_cache_key is not None and page_table is not None and T > 1 and chunk_page_table is not None:
         # Paged prefill: fill K/V into paged cache, then chunked SDPA.
         # Q/K/V stay bfloat16 — no typecast. Production models (Qwen3_VL) typecast to
         # bfloat8_b, but on Blackhole P150 this causes L1 clashes in downstream ops
@@ -338,8 +493,9 @@ def gated_attention_forward_ttnn(
         # This is different from the non-paged path which uses [1, B*num_kv_heads, T, head_dim].
         k_for_paged = ttnn.reshape(key_states, [1, B, num_key_value_heads, head_dim])
         v_for_paged = ttnn.reshape(value_states, [1, B, num_key_value_heads, head_dim])
-        # Shard to L1 (HEIGHT_SHARDED on B cores) for paged_update_cache
-        _shard_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(B - 1, 0))})
+        # Shard to L1 (HEIGHT_SHARDED on B cores) across the full 2D worker grid.
+        _worker_grid = device.compute_with_storage_grid_size()
+        _shard_grid = ttnn.num_cores_to_corerangeset(B, _worker_grid, row_wise=True)
         _shard_spec = ttnn.ShardSpec(_shard_grid, [32, head_dim], ttnn.ShardOrientation.ROW_MAJOR)
         _sharded_mc = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, _shard_spec)
         k_sharded = ttnn.to_memory_config(k_for_paged, _sharded_mc)
@@ -352,9 +508,8 @@ def gated_attention_forward_ttnn(
             paged_kv_cache_value, v_sharded, update_idxs_tensor=cur_pos_tensor, page_table=page_table
         )
         # Paged SDPA decode
-        q_decode = ttnn.transpose(query_states, 1, 2)  # [B, H_q, 1, D] -> [B, 1, H_q, D] = [1, B, H_q, D] for B=1
-        # paged_scaled_dot_product_attention_decode requires Q in DRAM when not sharded
-        # (sdpa_decode_device_operation.cpp:89). transpose preserves L1 layout from query_states.
+        q_decode = ttnn.reshape(query_states, [1, B, num_attention_heads, head_dim])
+        # paged_scaled_dot_product_attention_decode requires Q in DRAM when not sharded.
         q_decode = ttnn.to_memory_config(q_decode, ttnn.DRAM_MEMORY_CONFIG)
         attn_output = ttnn.transformer.paged_scaled_dot_product_attention_decode(
             q_decode,
@@ -368,7 +523,7 @@ def gated_attention_forward_ttnn(
                 device, paged_kv_cache_key.shape[0] * paged_kv_cache_key.shape[2]
             ),
         )
-        attn_output = ttnn.transpose(attn_output, 1, 2)  # back to [B, H_q, 1, D]
+        attn_output = ttnn.reshape(attn_output, [B, num_attention_heads, 1, head_dim])
         new_key = paged_kv_cache_key
         new_value = paged_kv_cache_value
         _paged_sdpa_done = True  # Skip the bottom SDPA section (attn_output already computed)
@@ -397,8 +552,9 @@ def gated_attention_forward_ttnn(
                 v_for_cache, paged_v_buf.memory_config(), preallocated_output=paged_v_buf
             )
         else:
-            # Eager path: allocate on the fly (not inside trace)
-            _shard_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(N - 1, 0))})
+            # Eager path: allocate on the full 2D worker grid.
+            _worker_grid = device.compute_with_storage_grid_size()
+            _shard_grid = ttnn.num_cores_to_corerangeset(N, _worker_grid, row_wise=True)
             _shard_spec = ttnn.ShardSpec(_shard_grid, [32, head_dim], ttnn.ShardOrientation.ROW_MAJOR)
             _sharded_mc = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, _shard_spec)
             k_sharded = ttnn.to_memory_config(k_for_cache, _sharded_mc)
@@ -560,6 +716,12 @@ def gated_attention_forward_ttnn(
     ttnn.deallocate(gate)
 
     # Output projection
-    attn_output = ttnn.linear(attn_output, o_proj_weight, compute_kernel_config=ckc, memory_config=memory_config)
+    attn_output = decode_linear(
+        attn_output,
+        o_proj_weight,
+        program_config=o_decode_program_config if (T == 1 or verify_two) else None,
+    )
+    if flat_decode:
+        attn_output = ttnn.reshape(attn_output, [1, 1, B, attn_output.shape[-1]])
 
     return attn_output, new_key, new_value

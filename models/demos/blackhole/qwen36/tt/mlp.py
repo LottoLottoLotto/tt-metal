@@ -10,14 +10,18 @@ import os
 from dataclasses import dataclass
 
 import ttnn
+from models.demos.blackhole.qwen36.tt.fused_swiglu import fused_swiglu
 
 
 @dataclass(frozen=True)
 class MLPWeights:
-    w1: ttnn.Tensor  # gate_proj [in, out], bfloat4_b
+    w1: ttnn.Tensor | None  # gate_proj [in, out], bfloat4_b
     w2: ttnn.Tensor  # down_proj [in, out], bfloat8_b
-    w3: ttnn.Tensor  # up_proj [in, out], bfloat4_b
+    w3: ttnn.Tensor | None  # up_proj [in, out], bfloat4_b
     w_gate_up: ttnn.Tensor = None  # TP prefill: tile-pair-interleaved packed [gate|up] for fused-swiglu AGMM
+    w_gate_up_dense: ttnn.Tensor = None  # Single-device decode: contiguous [up|gate] for matmul + SwiGLU.
+    w_gate_up_dense_packed: ttnn.Tensor = None  # Decode-only worker/bank-major copy.
+    w2_decode_packed: ttnn.Tensor = None  # Decode-only worker/bank-major down projection.
 
 
 def _build_gate_up(gate_w, up_w, mesh, tp, cache_path):
@@ -42,9 +46,131 @@ def _build_gate_up(gate_w, up_w, mesh, tp, cache_path):
     )
 
 
+def _repack_gate_up_for_worker_banks(weight):
+    """Reorder 32x32 tiles for the fixed 96-worker, eight-bank decode reader."""
+    import torch
+
+    k_tiles = weight.shape[0] // 32
+    n_tiles = weight.shape[1] // 32
+    if (k_tiles, n_tiles) != (128, 768):
+        raise ValueError(
+            f"packed gate/up reader requires 128x768 tiles, got {k_tiles}x{n_tiles}"
+        )
+    source_tiles = (
+        weight.reshape(k_tiles, 32, n_tiles, 32)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .reshape(k_tiles * n_tiles, 32, 32)
+    )
+    target_to_source = torch.empty(k_tiles * n_tiles, dtype=torch.int64)
+    for worker in range(96):
+        bank = worker % 8
+        region = worker // 8
+        for block in range(32):
+            for h in range(4):
+                bank_page = region * 1024 + block * 32 + h * 8
+                target_pages = bank + 8 * torch.arange(bank_page, bank_page + 8)
+                source_page = (block * 4 + h) * n_tiles + worker * 8
+                target_to_source[target_pages] = torch.arange(source_page, source_page + 8)
+    packed_tiles = source_tiles[target_to_source]
+    return (
+        packed_tiles.reshape(k_tiles, n_tiles, 32, 32)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .reshape(weight.shape)
+    )
+
+
+def _build_dense_gate_up(gate_w, up_w, mesh, cache_path, packed_worker_banks=False):
+    """Pack [up|gate] for one dense projection followed by ttnn.swiglu."""
+    import torch
+
+    packed = torch.cat(
+        [up_w.to(torch.bfloat16).T.contiguous(), gate_w.to(torch.bfloat16).T.contiguous()],
+        dim=-1,
+    )
+    if packed_worker_banks:
+        packed = _repack_gate_up_for_worker_banks(packed)
+    return ttnn.as_tensor(
+        packed,
+        dtype=ttnn.bfloat4_b,
+        device=mesh,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        cache_file_name=cache_path,
+    )
+
+
+def _repack_down_for_worker_banks(weight):
+    """Reorder down-projection tiles for 64 workers, two output columns each."""
+    import torch
+
+    k_tiles = weight.shape[0] // 32
+    n_tiles = weight.shape[1] // 32
+    if (k_tiles, n_tiles) != (384, 128):
+        raise ValueError(
+            f"packed down reader requires 384x128 tiles, got {k_tiles}x{n_tiles}"
+        )
+    workers = 64
+    banks = 8
+    cols = 2
+    block_h = 8
+    blocks = k_tiles // block_h
+    source_tiles = (
+        weight.reshape(k_tiles, 32, n_tiles, 32)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .reshape(k_tiles * n_tiles, 32, 32)
+    )
+    target_to_source = torch.empty(k_tiles * n_tiles, dtype=torch.int64)
+    block_tiles = block_h * cols
+    for worker in range(workers):
+        bank = worker % banks
+        region = worker // banks
+        for block in range(blocks):
+            bank_page = region * blocks * block_tiles + block * block_tiles
+            targets = bank + banks * torch.arange(bank_page, bank_page + block_tiles)
+            sources = torch.cat(
+                [
+                    torch.arange(
+                        (block * block_h + h) * n_tiles + worker * cols,
+                        (block * block_h + h) * n_tiles + (worker + 1) * cols,
+                    )
+                    for h in range(block_h)
+                ]
+            )
+            target_to_source[targets] = sources
+    packed_tiles = source_tiles[target_to_source]
+    return (
+        packed_tiles.reshape(k_tiles, n_tiles, 32, 32)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .reshape(weight.shape)
+    )
+
+
+def _build_packed_down(down_w, mesh, cache_path):
+    import torch
+
+    packed = _repack_down_for_worker_banks(
+        down_w.to(torch.bfloat16).T.contiguous()
+    )
+    return ttnn.as_tensor(
+        packed,
+        dtype=ttnn.bfloat4_b,
+        device=mesh,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        cache_file_name=cache_path,
+    )
+
+
 def load_mlp_weights(mesh_device, state_dict, tensor_cache_path=None, args=None) -> MLPWeights:
     """Per-layer MLP state: gate_proj, down_proj, up_proj weights."""
     tp = getattr(args, "num_devices", 1) if args is not None else 1
+    down_bfp4 = os.environ.get("QWEN36_BFP4_MLP_DOWN") == "1"
+    down_dtype = ttnn.bfloat4_b if down_bfp4 else ttnn.bfloat8_b
+    down_cache_tag = ".bfp4" if down_bfp4 else ""
 
     if tp > 1:
         # TP: w1/w3 column-parallel (shard out dim), w2 row-parallel (shard in dim).
@@ -100,8 +226,8 @@ def load_mlp_weights(mesh_device, state_dict, tensor_cache_path=None, args=None)
                     mesh_device,
                     dim=0,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    cache_path=cache("down_proj"),
-                    dtype=ttnn.bfloat8_b,
+                    cache_path=cache("down_proj", down_cache_tag),
+                    dtype=down_dtype,
                 ),
                 w_gate_up=wgu,
             )
@@ -129,13 +255,21 @@ def load_mlp_weights(mesh_device, state_dict, tensor_cache_path=None, args=None)
                 mesh_device,
                 dim=0,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                cache_path=cache("down_proj"),
-                dtype=ttnn.bfloat8_b,
+                cache_path=cache("down_proj", down_cache_tag),
+                dtype=down_dtype,
             ),
             w_gate_up=wgu,
         )
 
-    def load(name, dtype):
+    from models.demos.blackhole.qwen36.tt.model_config import evaluation_weight_dtype
+
+    gate_up_dtype = evaluation_weight_dtype("mlp_gate_up", tensor_cache_path, ttnn.bfloat4_b)
+    down_dtype = evaluation_weight_dtype("mlp_down", tensor_cache_path, down_dtype)
+    # Select packed readers per family, never globally downgrade other layers.
+    down_bfp4 = down_dtype == ttnn.bfloat4_b
+    down_cache_tag = ".bfp4" if down_bfp4 else ""
+
+    def load(name, dtype, cache_tag=""):
         t = state_dict[f"{name}.weight"].T.contiguous()  # [in, out] for ttnn.linear
         return ttnn.as_tensor(
             t,
@@ -143,14 +277,52 @@ def load_mlp_weights(mesh_device, state_dict, tensor_cache_path=None, args=None)
             layout=ttnn.TILE_LAYOUT,
             device=mesh_device,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            cache_file_name=(tensor_cache_path / f"mlp.{name}.weight") if tensor_cache_path else None,
+            cache_file_name=(tensor_cache_path / f"mlp.{name}.weight{cache_tag}") if tensor_cache_path else None,
         )
 
-    # gate/up: bfloat4_b (bandwidth); down: bfloat8_b (accuracy).
+    # Evaluation may raise gate/up precision; packed kernels remain BFP4-only.
+    fused_gate_up = os.environ.get("QWEN36_FUSED_GATE_UP") == "1" and gate_up_dtype == ttnn.bfloat4_b
+    dense_gate_up = (
+        _build_dense_gate_up(
+            state_dict["gate_proj.weight"],
+            state_dict["up_proj.weight"],
+            mesh_device,
+            (tensor_cache_path / "mlp.gate_up.weight.dense") if tensor_cache_path else None,
+        )
+        if fused_gate_up
+        else None
+    )
+    dense_gate_up_packed = (
+        _build_dense_gate_up(
+            state_dict["gate_proj.weight"],
+            state_dict["up_proj.weight"],
+            mesh_device,
+            (tensor_cache_path / "mlp.gate_up.weight.dense.packed-worker-bank")
+            if tensor_cache_path
+            else None,
+            packed_worker_banks=True,
+        )
+        if fused_gate_up and os.environ.get("QWEN36_FUSED_GATE_UP_PACKED") == "1"
+        else None
+    )
+    down_decode_packed = (
+        _build_packed_down(
+            state_dict["down_proj.weight"],
+            mesh_device,
+            (tensor_cache_path / "mlp.down_proj.weight.bfp4.packed-worker-bank")
+            if tensor_cache_path
+            else None,
+        )
+        if down_bfp4 and os.environ.get("QWEN36_MLP_DOWN_PACKED") == "1"
+        else None
+    )
     return MLPWeights(
-        w1=load("gate_proj", ttnn.bfloat4_b),
-        w2=load("down_proj", ttnn.bfloat8_b),
-        w3=load("up_proj", ttnn.bfloat4_b),
+        w1=None if fused_gate_up else load("gate_proj", gate_up_dtype),
+        w2=load("down_proj", down_dtype, down_cache_tag),
+        w3=None if fused_gate_up else load("up_proj", gate_up_dtype),
+        w_gate_up_dense=dense_gate_up,
+        w_gate_up_dense_packed=dense_gate_up_packed,
+        w2_decode_packed=down_decode_packed,
     )
 
 
@@ -187,6 +359,70 @@ class Qwen36MLP:
         self.compute_kernel_config_decode = ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=True, packer_l1_acc=True
         )
+        self._single_1d_decode = (
+            self.num_devices == 1
+            and os.environ.get("QWEN36_SINGLE_1D_DECODE") == "1"
+        )
+        self._single_fused_gate_up = self._single_1d_decode and self.weights.w_gate_up_dense is not None
+        if self._single_1d_decode:
+            grid_w = int(os.environ.get("QWEN36_DECODE_GRID_W", "11"))
+            if not self._single_fused_gate_up:
+                self._single_w1_pc = tpc.create_matmul_1d_decode_progcfg(
+                    1,
+                    self.weights.w1.shape[-2],
+                    self.weights.w1.shape[-1],
+                    num_cores=44,
+                    fused_activation=ttnn.UnaryOpType.SILU,
+                    grid_w=grid_w,
+                )
+                self._single_w3_pc = tpc.create_matmul_1d_decode_progcfg(
+                    1,
+                    self.weights.w3.shape[-2],
+                    self.weights.w3.shape[-1],
+                    num_cores=44,
+                    grid_w=grid_w,
+                )
+            if self._single_fused_gate_up:
+                if self.weights.w_gate_up_dense_packed is not None:
+                    self._single_gate_up_pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                        compute_with_storage_grid_size=(11, 9),
+                        in0_block_w=2,
+                        out_subblock_h=1,
+                        out_subblock_w=4,
+                        per_core_M=1,
+                        per_core_N=8,
+                        fuse_batch=True,
+                        fused_activation=None,
+                        mcast_in0=True,
+                    )
+                else:
+                    self._single_gate_up_pc = tpc.create_matmul_1d_decode_progcfg(
+                        1,
+                        self.weights.w_gate_up_dense.shape[-2],
+                        self.weights.w_gate_up_dense.shape[-1],
+                        num_cores=int(os.environ.get("QWEN36_FUSED_GATE_UP_CORES", "88")),
+                        grid_w=grid_w,
+                    )
+            if self.weights.w2_decode_packed is not None:
+                self._single_w2_pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                    compute_with_storage_grid_size=(11, 6),
+                    in0_block_w=8,
+                    out_subblock_h=1,
+                    out_subblock_w=2,
+                    per_core_M=1,
+                    per_core_N=2,
+                    fuse_batch=True,
+                    fused_activation=None,
+                    mcast_in0=True,
+                )
+            else:
+                self._single_w2_pc = tpc.create_matmul_1d_decode_progcfg(
+                    1,
+                    self.weights.w2.shape[-2],
+                    self.weights.w2.shape[-1],
+                    num_cores=33,
+                    grid_w=grid_w,
+                )
 
     def forward(self, x):
         if self.num_devices > 1:
@@ -194,20 +430,124 @@ class Qwen36MLP:
         w = self.weights
         T = x.shape[1] if len(x.shape) >= 3 else 1
         ckc = self.compute_kernel_config_decode if T <= 1 else self.compute_kernel_config
-        mc = ttnn.L1_MEMORY_CONFIG if T <= 512 else ttnn.DRAM_MEMORY_CONFIG
-        w1_out = ttnn.linear(x, w.w1, activation="silu", compute_kernel_config=ckc, memory_config=mc)
-        w3_out = ttnn.linear(x, w.w3, compute_kernel_config=ckc, memory_config=mc)
+        # Leave room for matmul circular buffers beside persistent GDN state.
+        mc = ttnn.L1_MEMORY_CONFIG if T <= 256 else ttnn.DRAM_MEMORY_CONFIG
+        if self._single_1d_decode and T <= 1:
+            # Normalize once to packed rows and preserve the caller's output rank.
+            # In particular, verification enters as [1, 1, M, D], not [M, 1, D].
+            input_shape = list(x.shape)
+            batch = int(x.shape[0]) * (int(x.shape[2]) if len(x.shape) == 4 else 1)
+            x_il = ttnn.reshape(x, [1, 1, batch, x.shape[-1]])
+
+            def decode_linear(inp, weight, program_config):
+                return ttnn.linear(
+                    inp,
+                    weight,
+                    compute_kernel_config=ckc,
+                    program_config=program_config,
+                    memory_config=ttnn.L1_MEMORY_CONFIG,
+                )
+
+            if self._single_fused_gate_up:
+                decode_gate_up_weight = (
+                    w.w_gate_up_dense_packed
+                    if w.w_gate_up_dense_packed is not None
+                    else w.w_gate_up_dense
+                )
+                gate_up = decode_linear(x_il, decode_gate_up_weight, self._single_gate_up_pc)
+                if w.w_gate_up_dense_packed is not None and batch in (1, 2):
+                    hidden = fused_swiglu(gate_up)
+                    ttnn.deallocate(gate_up)
+                else:
+                    half = gate_up.shape[-1] // 2
+                    up = ttnn.slice(
+                        gate_up,
+                        (0, 0, 0, 0),
+                        (1, 1, batch, half),
+                        memory_config=ttnn.L1_MEMORY_CONFIG,
+                    )
+                    gate = ttnn.slice(
+                        gate_up,
+                        (0, 0, 0, half),
+                        (1, 1, batch, gate_up.shape[-1]),
+                        memory_config=ttnn.L1_MEMORY_CONFIG,
+                    )
+                    ttnn.deallocate(gate_up)
+                    gate_act = ttnn.silu(gate, memory_config=ttnn.L1_MEMORY_CONFIG)
+                    ttnn.deallocate(gate)
+                    hidden = ttnn.mul(gate_act, up, memory_config=ttnn.L1_MEMORY_CONFIG)
+                    ttnn.deallocate(gate_act)
+                    ttnn.deallocate(up)
+                down_weight = w.w2_decode_packed if w.w2_decode_packed is not None else w.w2
+                output = decode_linear(hidden, down_weight, self._single_w2_pc)
+                ttnn.deallocate(hidden)
+                return ttnn.reshape(output, input_shape[:-1] + [output.shape[-1]])
+
+            w1_out = decode_linear(x_il, w.w1, self._single_w1_pc)
+            w3_out = decode_linear(x_il, w.w3, self._single_w3_pc)
+            hidden = ttnn.mul(
+                w1_out, w3_out, memory_config=ttnn.L1_MEMORY_CONFIG
+            )
+            ttnn.deallocate(w1_out)
+            ttnn.deallocate(w3_out)
+            down_weight = w.w2_decode_packed if w.w2_decode_packed is not None else w.w2
+            output = decode_linear(hidden, down_weight, self._single_w2_pc)
+            ttnn.deallocate(hidden)
+            return ttnn.reshape(output, input_shape[:-1] + [output.shape[-1]])
+
+        def prefill_linear(inp, weight, activation=None, tune=False):
+            from models.demos.blackhole.qwen36.tt import tp_common as tpc
+
+            pc = None
+            if T > 1 and tune:
+                pc = tpc.create_prefill_mlp_matmul_program_config(
+                    T, weight.shape[-2], weight.shape[-1],
+                    max_cols=self.device.compute_with_storage_grid_size().x,
+                    fused_activation=ttnn.UnaryOpType.SILU if activation == "silu" else None,
+                )
+                # Bound FP32 partial-output storage independently of the core's
+                # total output region; full per-core blocks exceed P150 L1.
+                pc.out_block_h = 1
+                pc.out_block_w = max(
+                    width
+                    for width in range(pc.out_subblock_w, min(16, pc.per_core_N) + 1, pc.out_subblock_w)
+                    if pc.per_core_N % width == 0
+                )
+            return ttnn.linear(
+                inp, weight, compute_kernel_config=ckc, memory_config=mc,
+                program_config=pc, activation=activation if pc is None else None,
+            )
+
+        if w.w_gate_up_dense is not None:
+            gate_up = prefill_linear(x, w.w_gate_up_dense)
+            half = gate_up.shape[-1] // 2
+            up = ttnn.slice(
+                gate_up,
+                (0, 0, 0),
+                (gate_up.shape[0], gate_up.shape[1], half),
+                memory_config=mc,
+            )
+            gate = ttnn.slice(
+                gate_up,
+                (0, 0, half),
+                (gate_up.shape[0], gate_up.shape[1], gate_up.shape[-1]),
+                memory_config=mc,
+            )
+            ttnn.deallocate(gate_up)
+            gate_act = ttnn.silu(gate, memory_config=mc)
+            ttnn.deallocate(gate)
+            hidden = ttnn.mul(gate_act, up, memory_config=mc)
+            ttnn.deallocate(gate_act)
+            ttnn.deallocate(up)
+            output = prefill_linear(hidden, w.w2, tune=True)
+            ttnn.deallocate(hidden)
+            return output
+        w1_out = prefill_linear(x, w.w1, activation="silu", tune=T >= 2048)
+        w3_out = prefill_linear(x, w.w3, tune=T >= 2048)
         hidden = ttnn.mul(w1_out, w3_out, memory_config=mc)
         ttnn.deallocate(w1_out)
         ttnn.deallocate(w3_out)
-        down_pc = None
-        if (
-            T > 1
-            and getattr(self.args, "prefill_progcfg", None) is not None
-            and os.environ.get("QWEN9B_MLP_DOWN_AUTO") != "1"
-        ):
-            down_pc = self.args.prefill_progcfg(T, hidden.shape[-1], w.w2.shape[-1])
-        output = ttnn.linear(hidden, w.w2, compute_kernel_config=ckc, memory_config=mc, program_config=down_pc)
+        output = prefill_linear(hidden, w.w2, tune=True)
         ttnn.deallocate(hidden)
         return output
 

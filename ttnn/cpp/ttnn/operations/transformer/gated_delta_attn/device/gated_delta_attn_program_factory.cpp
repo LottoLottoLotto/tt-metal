@@ -105,19 +105,18 @@ GatedDeltaAttnSeqProgramFactory::cached_program_t GatedDeltaAttnSeqProgramFactor
     make_cb(16, df_f32, 1, 1);  // L_inv2
     make_cb(17, df_f32, 1, 1);  // L_inv3
 
-    // Forward-substitution outputs
-    make_cb(18, df_f32, out_tiles, 1);    // v_cor = L^{-1} @ v_beta_sc
-    make_cb(19, df_f32, in_kv_tiles, 1);  // k_cum = L^{-1} @ k_bd_sc
-
-    // 7-step scratch
-    make_cb(20, df_f32, out_tiles, 1);    // v_prime
+    // Phase-lifetime aliases. Ct == Kt == Vt == 4, so all hold 16 fp32 tiles:
+    // c18: v_cor -> intra_v
+    // c19: k_cum -> S_tmp
+    // c20: v_prime -> o_inter -> s_upd
+    make_cb(18, df_f32, out_tiles, 1);
+    make_cb(19, df_f32, out_tiles, 1);
+    make_cb(20, df_f32, out_tiles, 1);
     make_cb(21, df_f32, out_tiles, 1);    // v_new
-    make_cb(22, df_f32, out_tiles, 1);    // o_inter
-    make_cb(23, df_f32, out_tiles, 1);    // intra_v
-    make_cb(24, df_f32, out_tiles, 2);    // out (writer pops, double-buffered)
-    make_cb(25, df_f32, state_tiles, 1);  // s_upd
-    make_cb(26, df_f32, state_tiles, 1);  // S_tmp
-    make_cb(27, df_f32, state_tiles, 1);  // final_state (writer reads once)
+    // Single-buffered: persistent batch-one GDN state occupies the top of L1.
+    // Writer backpressure is acceptable on the prefill-only path.
+    make_cb(24, df_f32, out_tiles, 1);    // out (writer pops)
+    make_cb(27, df_f32, state_tiles, 1);  // final_state (writer reads)
 
     // -----------------------------------------------------------------------
     // Kernel paths
