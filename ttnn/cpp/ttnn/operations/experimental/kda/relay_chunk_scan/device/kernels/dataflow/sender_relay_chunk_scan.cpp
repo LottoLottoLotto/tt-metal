@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "api/dataflow/dataflow_api.h"
+#include "api/debug/assert.h"
 #include "tt_metal/fabric/hw/inc/packet_header_pool.h"
 #include "tt_metal/fabric/hw/inc/edm_fabric/routing_plane_connection_manager.hpp"
 #include "tt_metal/fabric/hw/inc/linear/addrgen_api.h"
@@ -118,6 +119,12 @@ void kernel_main() {
     const auto route_word = [&](uint32_t route, uint32_t word) {
         return get_arg_val<uint32_t>(route_args + 5 * route + word);
     };
+    // The route table (watcher builds only): fewer routes than ranks, none without a connection, and each route a step
+    // of 1..sp_size-1 on an opened connection.
+    ASSERT(routes < sp_size && (connections != 0 || routes == 0));
+    for (uint32_t route = 0; route < routes; ++route) {
+        ASSERT(route_word(route, 0) - 1 < sp_size - 1 && route_word(route, 1) < connections);
+    }
     // The route to the rank `step` ranks on, or `routes` if this sender does not reach it.
     const auto find_route = [&](uint32_t step) {
         uint32_t route = 0;
