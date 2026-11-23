@@ -62,14 +62,6 @@ ttnn::Tensor slice_seq(
     return ttnn::slice(tensor, start, stop, step);
 }
 
-ttnn::Tensor concat_seq(const ttnn::Tensor& first, const ttnn::Tensor& second) {
-    return ttnn::concat(std::vector<ttnn::Tensor>{first, second}, /*dim=*/2);
-}
-
-ttnn::Tensor to_fp32(const ttnn::Tensor& tensor) {
-    return ttnn::typecast(tensor, ttnn::DataType::FLOAT32);
-}
-
 struct SeqHalves {
     ttnn::Tensor first;
     ttnn::Tensor second;
@@ -210,7 +202,7 @@ autograd::TensorPtr ring_attention_sdpa_zigzag(
         AttentionMaskType::Causal,
         kFwDirection);
 
-    const SeqHalves step0_fp32 = split_seq(to_fp32(step0_output));
+    const SeqHalves step0_fp32 = split_seq(ttnn::typecast(step0_output, ttnn::DataType::FLOAT32));
     ttnn::Tensor accum_first = step0_fp32.first;
     ttnn::Tensor accum_second = step0_fp32.second;
     ttnn::Tensor lse_first = slice_seq(step0_intermediates, 0U, half, /*width=*/1U);
@@ -281,8 +273,9 @@ autograd::TensorPtr ring_attention_sdpa_zigzag(
         detail::online_softmax_merge(accum_second, lse_second, chunk_output[1], chunk_intermediates[1]);
     }
 
-    auto out = autograd::create_tensor(ttnn::typecast(concat_seq(accum_first, accum_second), query_tensor.dtype()));
-    const ttnn::Tensor final_lse = concat_seq(lse_first, lse_second);
+    auto out = autograd::create_tensor(ttnn::typecast(
+        ttnn::concat(std::vector<ttnn::Tensor>{accum_first, accum_second}, /*dim=*/2), query_tensor.dtype()));
+    const ttnn::Tensor final_lse = ttnn::concat(std::vector<ttnn::Tensor>{lse_first, lse_second}, /*dim=*/2);
     if (reuse_forward_kv) {
         // The backward reads k_steps / v_steps; do not hold a second reference to the last step's K/V.
         k_current = SeqHalves{ttnn::Tensor(), ttnn::Tensor()};
@@ -381,14 +374,26 @@ autograd::TensorPtr ring_attention_sdpa_zigzag(
                 kBwDirection,
                 RingLoadBalancing::ZigZag);
 
-            grad_Q_first = ttnn::add(grad_Q_first, to_fp32(grad_Q_chunk[0]));
-            grad_Q_second = ttnn::add(grad_Q_second, ttnn::add(to_fp32(grad_Q_cross), to_fp32(grad_Q_chunk[1])));
-            grad_K_accum.first =
-                ttnn::add(grad_K_accum.first, ttnn::add(to_fp32(grad_K_cross), to_fp32(grad_K_chunk[0])));
-            grad_K_accum.second = ttnn::add(grad_K_accum.second, to_fp32(grad_K_chunk[1]));
-            grad_V_accum.first =
-                ttnn::add(grad_V_accum.first, ttnn::add(to_fp32(grad_V_cross), to_fp32(grad_V_chunk[0])));
-            grad_V_accum.second = ttnn::add(grad_V_accum.second, to_fp32(grad_V_chunk[1]));
+            grad_Q_first = ttnn::add(grad_Q_first, ttnn::typecast(grad_Q_chunk[0], ttnn::DataType::FLOAT32));
+            grad_Q_second = ttnn::add(
+                grad_Q_second,
+                ttnn::add(
+                    ttnn::typecast(grad_Q_cross, ttnn::DataType::FLOAT32),
+                    ttnn::typecast(grad_Q_chunk[1], ttnn::DataType::FLOAT32)));
+            grad_K_accum.first = ttnn::add(
+                grad_K_accum.first,
+                ttnn::add(
+                    ttnn::typecast(grad_K_cross, ttnn::DataType::FLOAT32),
+                    ttnn::typecast(grad_K_chunk[0], ttnn::DataType::FLOAT32)));
+            grad_K_accum.second =
+                ttnn::add(grad_K_accum.second, ttnn::typecast(grad_K_chunk[1], ttnn::DataType::FLOAT32));
+            grad_V_accum.first = ttnn::add(
+                grad_V_accum.first,
+                ttnn::add(
+                    ttnn::typecast(grad_V_cross, ttnn::DataType::FLOAT32),
+                    ttnn::typecast(grad_V_chunk[0], ttnn::DataType::FLOAT32)));
+            grad_V_accum.second =
+                ttnn::add(grad_V_accum.second, ttnn::typecast(grad_V_chunk[1], ttnn::DataType::FLOAT32));
 
             if (k_steps.empty() && step > 1U) {
                 k_current = ring_shift_halves(k_current, RingShiftDirection::Forward);
@@ -416,11 +421,15 @@ autograd::TensorPtr ring_attention_sdpa_zigzag(
             /*step=*/0U,
             AttentionMaskType::Causal,
             kBwDirection);
-        const ttnn::Tensor grad_Q_accum = ttnn::add(concat_seq(grad_Q_first, grad_Q_second), to_fp32(grad_Q_step0));
-        const ttnn::Tensor grad_K =
-            ttnn::add(concat_seq(grad_K_accum.first, grad_K_accum.second), to_fp32(grad_K_step0));
-        const ttnn::Tensor grad_V =
-            ttnn::add(concat_seq(grad_V_accum.first, grad_V_accum.second), to_fp32(grad_V_step0));
+        const ttnn::Tensor grad_Q_accum = ttnn::add(
+            ttnn::concat(std::vector<ttnn::Tensor>{grad_Q_first, grad_Q_second}, /*dim=*/2),
+            ttnn::typecast(grad_Q_step0, ttnn::DataType::FLOAT32));
+        const ttnn::Tensor grad_K = ttnn::add(
+            ttnn::concat(std::vector<ttnn::Tensor>{grad_K_accum.first, grad_K_accum.second}, /*dim=*/2),
+            ttnn::typecast(grad_K_step0, ttnn::DataType::FLOAT32));
+        const ttnn::Tensor grad_V = ttnn::add(
+            ttnn::concat(std::vector<ttnn::Tensor>{grad_V_accum.first, grad_V_accum.second}, /*dim=*/2),
+            ttnn::typecast(grad_V_step0, ttnn::DataType::FLOAT32));
 
         query->add_grad(ttnn::typecast(grad_Q_accum, query_tensor.dtype()));
         key->add_grad(ttnn::typecast(grad_K, key->get_value().dtype()));
