@@ -7,7 +7,7 @@
 #include <memory>
 
 #include "autograd/tensor.hpp"
-#include "ops/distributed/ring_attention_layout.hpp"
+#include "ops/distributed/ring_attention_utils.hpp"
 
 // Forward declaration to avoid heavy include in files that only need the pointer type
 namespace ttnn::distributed {

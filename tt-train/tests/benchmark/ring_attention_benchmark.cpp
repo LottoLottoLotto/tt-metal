@@ -19,7 +19,6 @@
 
 #include "autograd/auto_context.hpp"
 #include "core/tt_tensor_utils.hpp"
-#include "ops/distributed/ring_attention_layout.hpp"
 #include "ops/distributed/ring_attention_sdpa.hpp"
 #include "test_utils/random_data.hpp"
 #include "ttnn/distributed/create_socket.hpp"

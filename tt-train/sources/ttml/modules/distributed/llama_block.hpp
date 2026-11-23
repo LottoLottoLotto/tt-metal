@@ -9,7 +9,7 @@
 
 #include "modules/linear_module.hpp"
 #include "modules/module_base.hpp"
-#include "ops/distributed/ring_attention_layout.hpp"
+#include "ops/distributed/ring_attention_utils.hpp"
 #include "ops/rope_op.hpp"
 
 namespace ttml::modules::distributed {
