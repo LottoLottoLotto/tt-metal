@@ -72,6 +72,23 @@ SeqHalves split_seq(const ttnn::Tensor& tensor) {
     return {slice_seq(tensor, 0U, seq_len / 2U), slice_seq(tensor, seq_len / 2U, seq_len)};
 }
 
+SeqHalves ring_shift_halves(
+    const SeqHalves& tensor, uint32_t cp_axis, ttnn_fixed::distributed::RingShiftDirection direction) {
+    return {
+        ttnn_fixed::distributed::ring_shift(tensor.first, cp_axis, direction),
+        ttnn_fixed::distributed::ring_shift(tensor.second, cp_axis, direction)};
+}
+
+ttnn::Tensor make_intermediates(const ttnn::Tensor& query, uint32_t seq_len) {
+    const auto& shape = query.logical_shape();
+    return ttnn::empty(
+        ttnn::Shape{shape[0], shape[1], seq_len, 32U},
+        ttnn::DataType::FLOAT32,
+        ttnn::Layout::TILE,
+        query.device(),
+        ttnn::MemoryConfig(tt::tt_metal::TensorMemoryLayout::INTERLEAVED, ttnn::BufferType::DRAM));
+}
+
 }  // namespace
 
 namespace detail {
@@ -171,25 +188,10 @@ autograd::TensorPtr ring_attention_sdpa_zigzag(
         2U * tt::constants::TILE_HEIGHT);
     const uint32_t half = seq_len_local / 2U;
 
-    const auto ring_shift_halves = [cp_axis_value](const SeqHalves& tensor, RingShiftDirection direction) {
-        return SeqHalves{
-            ttnn_fixed::distributed::ring_shift(tensor.first, cp_axis_value, direction),
-            ttnn_fixed::distributed::ring_shift(tensor.second, cp_axis_value, direction)};
-    };
-
-    const auto make_intermediates = [&](uint32_t seq_len) {
-        return ttnn::empty(
-            ttnn::Shape{batch_num, heads, seq_len, 32U},
-            ttnn::DataType::FLOAT32,
-            ttnn::Layout::TILE,
-            mesh_device,
-            ttnn::MemoryConfig(tt::tt_metal::TensorMemoryLayout::INTERLEAVED, ttnn::BufferType::DRAM));
-    };
-
     const SeqHalves q_halves = split_seq(query_tensor);
 
     ttnn::Tensor step0_output = ttnn::empty_like(query_tensor);
-    ttnn::Tensor step0_intermediates = make_intermediates(seq_len_local);
+    ttnn::Tensor step0_intermediates = make_intermediates(query_tensor, seq_len_local);
     ttml::metal::ring_sdpa_fw(
         {{.query = query_tensor,
           .key = key->get_value(),
@@ -216,9 +218,10 @@ autograd::TensorPtr ring_attention_sdpa_zigzag(
         ttnn::Layout::TILE,
         std::ref(*mesh_device)));
     ttnn::Tensor cross_output = ttnn::empty_like(q_halves.first);
-    ttnn::Tensor cross_intermediates = make_intermediates(half);
+    ttnn::Tensor cross_intermediates = make_intermediates(query_tensor, half);
     std::array<ttnn::Tensor, 2> chunk_output = {ttnn::zeros_like(q_halves.first), ttnn::zeros_like(q_halves.first)};
-    std::array<ttnn::Tensor, 2> chunk_intermediates = {make_intermediates(half), make_intermediates(half)};
+    std::array<ttnn::Tensor, 2> chunk_intermediates = {
+        make_intermediates(query_tensor, half), make_intermediates(query_tensor, half)};
     ttnn::copy(no_contrib_intermediates, chunk_intermediates[0]);
 
     std::vector<SeqHalves> k_steps(reuse_forward_kv ? ring_size : 0U);
@@ -227,8 +230,8 @@ autograd::TensorPtr ring_attention_sdpa_zigzag(
     SeqHalves k_current = split_seq(key->get_value());
     SeqHalves v_current = split_seq(value->get_value());
     for (uint32_t step = 1U; step < ring_size; ++step) {
-        k_current = ring_shift_halves(k_current, RingShiftDirection::Backward);
-        v_current = ring_shift_halves(v_current, RingShiftDirection::Backward);
+        k_current = ring_shift_halves(k_current, cp_axis_value, RingShiftDirection::Backward);
+        v_current = ring_shift_halves(v_current, cp_axis_value, RingShiftDirection::Backward);
         const SeqHalves& k = k_current;
         const SeqHalves& v = v_current;
         if (reuse_forward_kv) {
@@ -293,8 +296,7 @@ autograd::TensorPtr ring_attention_sdpa_zigzag(
                                       v_steps,
                                       ring_size,
                                       cp_axis_value,
-                                      half,
-                                      ring_shift_halves]() mutable {
+                                      half]() mutable {
         const ttnn::Tensor& grad_output = out->get_grad();
         const ttnn::Tensor& attn_output = out->get_value();
         const ttnn::Tensor& query_tensor = query->get_value();
@@ -311,12 +313,12 @@ autograd::TensorPtr ring_attention_sdpa_zigzag(
 
         ttnn::Tensor grad_Q_first = ttnn::zeros_like(q_halves.first, ttnn::DataType::FLOAT32);
         ttnn::Tensor grad_Q_second = ttnn::zeros_like(q_halves.first, ttnn::DataType::FLOAT32);
-        const auto fp32_zero_halves = [](const ttnn::Tensor& like) {
-            return SeqHalves{
-                ttnn::zeros_like(like, ttnn::DataType::FLOAT32), ttnn::zeros_like(like, ttnn::DataType::FLOAT32)};
-        };
-        SeqHalves grad_K_accum = fp32_zero_halves(zero_K_half);
-        SeqHalves grad_V_accum = fp32_zero_halves(zero_V_half);
+        SeqHalves grad_K_accum{
+            ttnn::zeros_like(zero_K_half, ttnn::DataType::FLOAT32),
+            ttnn::zeros_like(zero_K_half, ttnn::DataType::FLOAT32)};
+        SeqHalves grad_V_accum{
+            ttnn::zeros_like(zero_V_half, ttnn::DataType::FLOAT32),
+            ttnn::zeros_like(zero_V_half, ttnn::DataType::FLOAT32)};
         ttnn::Tensor grad_Q_cross = ttnn::empty_like(zero_Q_half);
         ttnn::Tensor grad_K_cross = ttnn::empty_like(zero_K_half);
         ttnn::Tensor grad_V_cross = ttnn::empty_like(zero_V_half);
@@ -396,11 +398,11 @@ autograd::TensorPtr ring_attention_sdpa_zigzag(
                 ttnn::add(grad_V_accum.second, ttnn::typecast(grad_V_chunk[1], ttnn::DataType::FLOAT32));
 
             if (k_steps.empty() && step > 1U) {
-                k_current = ring_shift_halves(k_current, RingShiftDirection::Forward);
-                v_current = ring_shift_halves(v_current, RingShiftDirection::Forward);
+                k_current = ring_shift_halves(k_current, cp_axis_value, RingShiftDirection::Forward);
+                v_current = ring_shift_halves(v_current, cp_axis_value, RingShiftDirection::Forward);
             }
-            grad_K_accum = ring_shift_halves(grad_K_accum, RingShiftDirection::Forward);
-            grad_V_accum = ring_shift_halves(grad_V_accum, RingShiftDirection::Forward);
+            grad_K_accum = ring_shift_halves(grad_K_accum, cp_axis_value, RingShiftDirection::Forward);
+            grad_V_accum = ring_shift_halves(grad_V_accum, cp_axis_value, RingShiftDirection::Forward);
         }
 
         const ttnn::Tensor grad_Q_step0 = ttnn::empty_like(query_tensor);
