@@ -38,8 +38,7 @@ constexpr uint32_t entry_tiles = get_compile_time_arg_val(slab_ct + 4);
 constexpr uint32_t slab_index_word = get_compile_time_arg_val(slab_ct + 5);
 constexpr auto slab_index_args = TensorAccessorArgs<slab_ct + 6>();
 // On a 2D fabric whose SP axis turns, a multicast cannot follow the axis: the carry goes to each rank this sender
-// serves as a 2D unicast (per rank after the connection args: the connection its route leaves on, its chip and mesh),
-// carry_range ranks in all.
+// serves as a 2D unicast along its route (runtime args), carry_range ranks in all.
 constexpr bool unicast_peers = get_compile_time_arg_val(slab_index_args.next_compile_time_args_offset());
 // The slab is SP-sharded: this rank's entry holds heads [sp_rank * stored_heads, +stored_heads). Before the relay, a
 // rank other than the first sends the first rank its heads of the entry; on the first rank the final carry of each head
@@ -85,6 +84,11 @@ void kernel_main() {
     const uint8_t carry_range = get_arg_val<uint32_t>(arg++);
     // A second carry sender without ranks behind its rank holds no connection.
     const uint32_t connections = get_arg_val<uint32_t>(arg++);
+    // Per rank this sender reaches as a unicast (a turning SP axis, or the sharded slab): its step
+    // (rank - sp_rank) mod sp_size, connection, chip, mesh and 1D hops. None on a sender without connections.
+    const uint32_t routes = get_arg_val<uint32_t>(arg++);
+    const size_t route_args = arg;
+    arg += 5 * routes;
 
     cb_reserve_back(cb_stage, 1);
     const uint32_t stage = get_write_ptr(cb_stage);
@@ -111,10 +115,6 @@ void kernel_main() {
 
     RoutingPlaneConnectionManager fabric;
     open_connections(fabric, connections, arg);
-    const size_t peer_args = arg;
-    // Sharded: per rank this sender reaches, its step (rank - sp_rank) mod sp_size, connection, chip, mesh and 1D hops.
-    const size_t route_args = peer_args + (unicast_peers ? 3 * carry_range : 0) + 1;
-    const uint32_t routes = slab ? get_arg_val<uint32_t>(route_args - 1) : 0;
     const auto route_word = [&](uint32_t route, uint32_t word) {
         return get_arg_val<uint32_t>(route_args + 5 * route + word);
     };
@@ -161,6 +161,34 @@ void kernel_main() {
             }
         }
     };
+    // One tile column of a head's state, `buffer`, into `dst` on head core (hx, hy) a fabric packet at a time; the last
+    // packet increments `semaphore` there once the column has landed.
+    const auto send_column = [&](auto* to,
+                                 volatile tt_l1_ptr PACKET_HEADER_TYPE* const* column_hdrs,
+                                 uint32_t buffer,
+                                 uint32_t dst,
+                                 uint32_t semaphore,
+                                 uint32_t hx,
+                                 uint32_t hy,
+                                 uint32_t hops) {
+        for (uint32_t c = 0; c < chunks; ++c) {
+            const uint32_t offset = c * chunk_bytes;
+            const uint32_t bytes = offset + chunk_bytes <= unit_bytes ? chunk_bytes : unit_bytes - offset;
+            const uint64_t address = get_noc_addr(hx, hy, dst + offset);
+            if (c + 1 == chunks) {
+                fabric_unicast_noc_fused_unicast_with_atomic_inc(
+                    to,
+                    column_hdrs[c],
+                    buffer + offset,
+                    bytes,
+                    NocUnicastAtomicIncFusedCommandHeader{address, get_noc_addr(hx, hy, semaphore), 1, true},
+                    hops);
+            } else {
+                fabric_unicast_noc_unicast_write(
+                    to, column_hdrs[c], buffer + offset, bytes, NocUnicastCommandHeader{address}, hops);
+            }
+        }
+    };
     const uint32_t units = num_heads * kt;
     const auto head_xy = [&](uint32_t u) { return get_arg_val<uint32_t>(head_args + u / kt); };
     // Unit u's head: this sender serves heads link, link + links, ...
@@ -192,33 +220,18 @@ void kernel_main() {
                 }
                 noc_async_read_barrier();
                 const uint32_t xy = head_xy(u);
-                const uint32_t hx = xy & 0xFFFF;
-                const uint32_t hy = xy >> 16;
                 for (uint32_t c = 0; c < chunks; ++c) {
-                    const uint32_t offset = c * chunk_bytes;
-                    const uint32_t bytes = offset + chunk_bytes <= unit_bytes ? chunk_bytes : unit_bytes - offset;
-                    const uint64_t dst = get_noc_addr(hx, hy, ein_landing + column * unit_bytes + offset);
-                    volatile tt_l1_ptr PACKET_HEADER_TYPE* hdr = hdrs[sent % slots][c];
-                    set_route(hdr, route);
-                    if (c + 1 == chunks) {
-                        fabric_unicast_noc_fused_unicast_with_atomic_inc(
-                            route_sender(route),
-                            hdr,
-                            buffer + offset,
-                            bytes,
-                            NocUnicastAtomicIncFusedCommandHeader{
-                                dst, get_noc_addr(hx, hy, arrival_semaphore), 1, true},
-                            route_word(route, 4));
-                    } else {
-                        fabric_unicast_noc_unicast_write(
-                            route_sender(route),
-                            hdr,
-                            buffer + offset,
-                            bytes,
-                            NocUnicastCommandHeader{dst},
-                            route_word(route, 4));
-                    }
+                    set_route(hdrs[sent % slots][c], route);
                 }
+                send_column(
+                    route_sender(route),
+                    hdrs[sent % slots],
+                    buffer,
+                    ein_landing + column * unit_bytes,
+                    arrival_semaphore,
+                    xy & 0xFFFF,
+                    xy >> 16,
+                    route_word(route, 4));
                 ++sent;
             }
             noc_async_writes_flushed();
@@ -264,27 +277,16 @@ void kernel_main() {
             // The head's last column has left its head core: release the head.
             noc_semaphore_inc(get_noc_addr(hx, hy, ack_semaphore), 1);
         }
-        const uint32_t buffer = stage + (u % slots) * unit_bytes;
-        const uint32_t column = landing + (u % kt) * unit_bytes;
-        for (uint32_t c = 0; c < chunks; ++c) {
-            const uint32_t offset = c * chunk_bytes;
-            const uint32_t bytes = offset + chunk_bytes <= unit_bytes ? chunk_bytes : unit_bytes - offset;
-            const uint64_t dst = get_noc_addr(hx, hy, column + offset);
-            volatile tt_l1_ptr PACKET_HEADER_TYPE* hdr = hdrs[u % slots][c];
-            // 1D routing: the connection leaves towards the successor's side of the line (2D ignores the hops).
-            if (c + 1 == chunks) {
-                fabric_unicast_noc_fused_unicast_with_atomic_inc(
-                    to_successor,
-                    hdr,
-                    buffer + offset,
-                    bytes,
-                    NocUnicastAtomicIncFusedCommandHeader{dst, get_noc_addr(hx, hy, landed_semaphore), 1, true},
-                    successor_hops);
-            } else {
-                fabric_unicast_noc_unicast_write(
-                    to_successor, hdr, buffer + offset, bytes, NocUnicastCommandHeader{dst}, successor_hops);
-            }
-        }
+        // 1D routing: the connection leaves towards the successor's side of the line (2D ignores the hops).
+        send_column(
+            to_successor,
+            hdrs[u % slots],
+            stage + (u % slots) * unit_bytes,
+            landing + (u % kt) * unit_bytes,
+            landed_semaphore,
+            hx,
+            hy,
+            successor_hops);
     }
     noc_async_writes_flushed();
 
@@ -318,18 +320,10 @@ void kernel_main() {
         const auto peer_header = [&](uint32_t peer, uint32_t i) {
             const uint32_t h = (peer % peer_groups) * kt + i;
             volatile tt_l1_ptr PACKET_HEADER_TYPE* hdr = hdrs[h / chunks][h % chunks];
-#if defined(FABRIC_2D)
-            fabric_set_unicast_route(
-                hdr,
-                static_cast<uint16_t>(get_arg_val<uint32_t>(peer_args + 3 * peer + 1)),
-                static_cast<uint16_t>(get_arg_val<uint32_t>(peer_args + 3 * peer + 2)));
-#endif
+            set_route(hdr, peer);
             return hdr;
         };
         auto* sender = &fabric.get(0).sender;
-        const auto peer_sender = [&](uint32_t peer) {
-            return &fabric.get(get_arg_val<uint32_t>(peer_args + 3 * peer)).sender;
-        };
         const auto carry = TensorAccessor(carry_args, get_common_arg_val<uint32_t>(2));
         // The head's writer counts compute's carry columns, on the relay's sender after the relay's kt; a ready
         // column is read into stage slot u % 2 while the previous one is on the fabric.
@@ -400,7 +394,7 @@ void kernel_main() {
                     }
                     for (uint32_t r = 0; r < kt; ++r) {
                         fabric_unicast_noc_unicast_write(
-                            peer_sender(peer),
+                            route_sender(peer),
                             peer_header(peer, r),
                             buffer + r * tile_bytes,
                             tile_bytes,
@@ -437,7 +431,7 @@ void kernel_main() {
                     noc_async_writes_flushed();
                 }
                 fabric_unicast_noc_unicast_atomic_inc(
-                    peer_sender(peer), peer_header(peer, 0), NocUnicastAtomicIncCommandHeader{arrival, 1, true}, 1);
+                    route_sender(peer), peer_header(peer, 0), NocUnicastAtomicIncCommandHeader{arrival, 1, true}, 1);
             }
         } else {
             fabric_multicast_noc_unicast_atomic_inc_with_state<UnicastAtomicIncUpdateMask::DstAddr>(

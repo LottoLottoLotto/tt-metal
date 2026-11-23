@@ -132,8 +132,8 @@ tt::tt_metal::ProgramDescriptor build_program(
     const bool unicast_peers = fabric_2d && !ttnn::ccl::is_axis_straight(*mesh, axis);
     struct CarrySender {
         std::vector<tt::tt_fabric::FabricNodeId> connections;  // the node each connection is opened towards
-        std::vector<uint32_t> peer_args;                       // per rank: its connection, chip and mesh
-        std::vector<uint32_t> steps;                           // per rank: (rank - sp_rank) mod sp_size
+        // Per rank, the sender's route table (see `add_route` below): its step, connection, chip, mesh and 1D hops.
+        std::vector<uint32_t> routes;
         uint32_t peers = 0;
     };
     std::array<CarrySender, 2> carry_senders;  // the relay's sender, then the second
@@ -179,10 +179,9 @@ tt::tt_metal::ProgramDescriptor build_program(
                 found = {s, static_cast<uint32_t>(carry_senders[s].connections.size() - 1)};
             }
             auto& sender = carry_senders[found->first];
-            sender.peer_args.insert(
-                sender.peer_args.end(),
-                {found->second, static_cast<uint32_t>(peer.chip_id), static_cast<uint32_t>(*peer.mesh_id)});
-            sender.steps.push_back(step);
+            sender.routes.insert(
+                sender.routes.end(),
+                {step, found->second, static_cast<uint32_t>(peer.chip_id), static_cast<uint32_t>(*peer.mesh_id), 1u});
             ++sender.peers;
         }
     }
@@ -503,10 +502,11 @@ tt::tt_metal::ProgramDescriptor build_program(
             sender_rt.push_back(uint32_t(!backward));
             sender_rt.push_back(backward ? back_range : relay_range);
             // An idle second sender is given the relay's connection, which it never opens.
+            const bool connected = !backward || back_sender;
             std::vector<tt::tt_fabric::FabricNodeId> nodes = {backward ? back_node : connection_node};
             std::vector<uint32_t> node_links = {backward ? back_links[link] : links[link]};
             const auto& carry_sender = carry_senders[direction];
-            if (unicast_peers && (!backward || back_sender)) {
+            if (unicast_peers && connected) {
                 // The further connections, each on this link's index among its direction's links.
                 for (size_t c = 1; c < carry_sender.connections.size(); ++c) {
                     const auto& node = carry_sender.connections[c];
@@ -522,49 +522,44 @@ tt::tt_metal::ProgramDescriptor build_program(
                     node_links.push_back(extra_links[link]);
                 }
             }
-            sender_rt.push_back(!backward || back_sender ? static_cast<uint32_t>(nodes.size()) : 0u);
+            sender_rt.push_back(connected ? static_cast<uint32_t>(nodes.size()) : 0u);
+            // Every rank this sender reaches as a unicast, before the connection args (which the kernel consumes only
+            // for the connections it opens): its step (rank - sp_rank) mod sp_size, connection, chip, mesh and 1D
+            // hops. A turning SP axis sends the carry along it; the sharded slab also sends the owner's heads to the
+            // first rank and the first rank's carry to each head's owner along it.
+            std::vector<uint32_t> routes;
+            const auto add_route = [&](uint32_t step, uint32_t connection, uint32_t hops) {
+                auto peer_coord = coord;
+                peer_coord[axis] = (sp_rank + step) % sp_size;
+                const auto peer = mesh->get_fabric_node_id(peer_coord);
+                routes.insert(
+                    routes.end(),
+                    {step,
+                     connection,
+                     static_cast<uint32_t>(peer.chip_id),
+                     static_cast<uint32_t>(*peer.mesh_id),
+                     hops});
+            };
+            if (unicast_peers) {
+                if (connected) {
+                    routes = carry_sender.routes;
+                }
+            } else if (slab && !backward) {
+                // The relay's connection: forward to the ranks ahead, or (a line's last rank) back to the rest.
+                for (uint32_t k = 1; k <= relay_range; ++k) {
+                    add_route(successor_forward ? k : sp_size - k, 0, k);
+                }
+            } else if (slab && back_sender) {
+                for (uint32_t k = 1; k <= back_range; ++k) {
+                    add_route(sp_size - k, 0, k);
+                }
+            }
+            sender_rt.push_back(static_cast<uint32_t>(routes.size() / 5));
+            sender_rt.append(routes);
             std::vector<uint32_t> fabric_args;
             tt::tt_fabric::append_routing_plane_connection_manager_rt_args(
                 *mesh, source_node, nodes, node_links, desc, sender_kernel, core, fabric_args);
             sender_rt.append(fabric_args);
-            // Unicast: per rank this sender carries to, its connection, chip and mesh.
-            sender_rt.append(carry_sender.peer_args);
-            if (slab) {
-                // Sharded: every rank this sender reaches, as a unicast route: its step (rank - sp_rank) mod sp_size,
-                // connection, chip, mesh and 1D hops. The owner's heads go to the first rank, the first rank's carry to
-                // each head's owner, along it.
-                std::vector<uint32_t> routes;
-                const auto add_route = [&](uint32_t step, uint32_t connection, uint32_t hops) {
-                    auto peer_coord = coord;
-                    peer_coord[axis] = (sp_rank + step) % sp_size;
-                    const auto peer = mesh->get_fabric_node_id(peer_coord);
-                    routes.insert(
-                        routes.end(),
-                        {step,
-                         connection,
-                         static_cast<uint32_t>(peer.chip_id),
-                         static_cast<uint32_t>(*peer.mesh_id),
-                         hops});
-                };
-                if (unicast_peers) {
-                    if (!backward || back_sender) {
-                        for (uint32_t p = 0; p < carry_sender.peers; ++p) {
-                            add_route(carry_sender.steps[p], carry_sender.peer_args[3 * p], 1);
-                        }
-                    }
-                } else if (!backward) {
-                    // The relay's connection: forward to the ranks ahead, or (a line's last rank) back to the rest.
-                    for (uint32_t k = 1; k <= relay_range; ++k) {
-                        add_route(successor_forward ? k : sp_size - k, 0, k);
-                    }
-                } else if (back_sender) {
-                    for (uint32_t k = 1; k <= back_range; ++k) {
-                        add_route(sp_size - k, 0, k);
-                    }
-                }
-                sender_rt.push_back(static_cast<uint32_t>(routes.size() / 5));
-                sender_rt.append(routes);
-            }
             desc.kernels[sender_kernel].emplace_runtime_args(core, sender_rt);
         }
     }
