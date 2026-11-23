@@ -24,6 +24,7 @@ from .operations import (
     split_qkv_heads_prefill,
 )
 from .weights import AttentionWeights
+from models.demos.gemma4.tt.precision import norm_compute_config
 
 # Cache for the L1 height-sharded ``MemoryConfig`` that
 # ``nlp_create_qkv_heads_decode`` produces. The spec only depends on shape
@@ -47,6 +48,50 @@ def _q_sharded_mem_key(B, qkv_dim, config, weights, tp):
         bool(weights.is_global),
         bool(weights.kv_replicated),
         int(tp),
+    )
+
+
+def _position_modulo_kwargs(config):
+    """cache_position_modulo for the paged decode ops: the bounded-sliding modulo, or the ring size of
+    a ring-buffered sliding cache (tt/single_user.py); {} for unbounded caches (unchanged programs)."""
+    if config.cache_position_modulo is not None:
+        return {"cache_position_modulo": config.cache_position_modulo}
+    if config.ring_tokens is not None:
+        return {"cache_position_modulo": config.ring_tokens}
+    return {}
+
+
+def verify_sdpa_rows():
+    """Largest P of the batched verify SDPA (``GEMMA4_VERIFY_SDPA=batched``, rows
+    ``GEMMA4_VERIFY_ROWS``, default 6 = K 5 + 1; every P up to it is batched), else 0 (exact per-row
+    verify)."""
+    if os.environ.get("GEMMA4_VERIFY_SDPA") != "batched":
+        return 0
+    return int(os.environ.get("GEMMA4_VERIFY_ROWS", "6"))
+
+
+def _decode_sdpa_program_config(config, batch_size, mesh_device):
+    device_grid = mesh_device.compute_with_storage_grid_size()
+    if config.head_dim >= 512 and batch_size == 1:
+        # Single-user global layers: smaller grid — head_dim=512 needs more L1 per core.
+        sdpa_grid = ttnn.CoreCoord(8, 4)
+    else:
+        # Sliding layers, and all batched decode: use the full device compute grid.
+        sdpa_grid = ttnn.CoreCoord(device_grid.x, device_grid.y)
+    max_cph = 16  # the op's default
+    rows = verify_sdpa_rows()
+    if rows > 1 and 1 <= batch_size <= rows:
+        # Batched verify: every row must see the same flash-decode split (cores per KV head, hence
+        # KV chunk ranges and reduction tree) as a batch=1 decode, so speculative == non-speculative
+        # greedy. Cap batch=1 and every P <= rows at what the largest (rows) call gets on the full grid.
+        nkv = config.num_key_value_heads
+        max_cph = max(1, min(16 * rows * nkv, device_grid.x * device_grid.y) // rows // nkv)
+    return ttnn.SDPAProgramConfig(
+        compute_with_storage_grid_size=sdpa_grid,
+        q_chunk_size=32,
+        k_chunk_size=64,
+        exp_approx_mode=False,
+        max_cores_per_head_batch=max_cph,
     )
 
 
@@ -169,16 +214,27 @@ def decode_forward(
     # ``None`` = legacy unbounded behavior (set on full-attention layers or when the
     # bounded-cache mode isn't wired up). Empty kwargs dict on the legacy path keeps
     # kernel signatures and program-cache keys for existing callers byte-identical.
-    paged_modulo_kwargs = (
-        {"cache_position_modulo": config.cache_position_modulo} if config.cache_position_modulo is not None else {}
-    )
+    paged_modulo_kwargs = _position_modulo_kwargs(config)
     if kv_cache is not None:
         k_cache, v_cache = kv_cache
-        if not is_kv_shared:
+        if (
+            not is_kv_shared
+            and page_table is not None
+            and os.environ.get("GEMMA4_DECODE_KV_ROWS") == "1"
+            and tp == 1
+            and not paged_modulo_kwargs
+            and tt_k.shape[1] == 1
+            and position_idx is not None
+            and position_idx.dtype == ttnn.uint32
+            and k_cache.dtype == ttnn.bfloat16
+        ):
+            # One DMA-only launch writes this row's K and V (bit copy; same kernel as the verify rows)
+            # instead of two reshards + two paged_update_cache calls.
+            kv_rows_write(tt_k, tt_v, k_cache, v_cache, position_idx, page_table, 1, k_row_major=True, v_row_major=True)
+        elif not is_kv_shared:
             # After HF-style RoPE, tensors may be in DRAM. Move to HEIGHT_SHARDED for cache update.
             tt_k = ttnn.to_memory_config(tt_k, q_sharded_mem)
             tt_v = ttnn.to_memory_config(tt_v, q_sharded_mem)
-
             if page_table is not None:
                 # Per-device kv-head count of the layer's input view. When the cache
                 # was allocated for a different layer type under HMA cross-group
@@ -282,21 +338,7 @@ def decode_forward(
     # Batched Q is height-sharded row-major across the device grid (one user per
     # core), so the SDPA grid must cover those cores — an 8-wide grid would miss
     # users on columns 8..10 of an 11-wide Blackhole grid and corrupt the output.
-    batch_size = tt_q.shape[1]
-    device_grid = mesh_device.compute_with_storage_grid_size()
-    if config.head_dim >= 512 and batch_size == 1:
-        # Single-user global layers: smaller grid — head_dim=512 needs more L1 per core.
-        sdpa_grid = ttnn.CoreCoord(8, 4)
-    else:
-        # Sliding layers, and all batched decode: use the full device compute grid.
-        sdpa_grid = ttnn.CoreCoord(device_grid.x, device_grid.y)
-
-    sdpa_program_config = ttnn.SDPAProgramConfig(
-        compute_with_storage_grid_size=sdpa_grid,
-        q_chunk_size=32,
-        k_chunk_size=64,
-        exp_approx_mode=False,
-    )
+    sdpa_program_config = _decode_sdpa_program_config(config, tt_q.shape[1], mesh_device)
 
     if page_table is not None:
         sdpa_num_local_kv_heads = 1 if weights.kv_replicated else config.num_key_value_heads // tp
@@ -341,6 +383,158 @@ def decode_forward(
     tt_out = apply_allreduce(tt_out, mesh_config, ccl_manager, config.hidden_size)
 
     return tt_out
+
+
+_KV_ROWS_KERNEL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kernels", "kv_rows_write.cpp")
+
+
+def kv_rows_write(k, v, k_cache, v_cache, positions, page_table, P, k_row_major=False, v_row_major=False,
+                  ring_tokens=None):
+    """Write rows 0..P-1 of K/V (BF16 tiled DRAM, head-major [1, Hk, P, D] or, with *_row_major,
+    [1, P, Hk, D]) into the paged BF16 caches at the positions held in ``positions`` ([1, 32] uint32
+    row-major, first P entries) through the user's page table [1, blocks] int32; with ``ring_tokens``
+    positions wrap modulo the ring first (like paged_update_cache's cache_position_modulo). Bit copy
+    (kernels/kv_rows_write.cpp)."""
+    Hk, D = int(k_cache.shape[1]), int(k_cache.shape[3])
+    if not (k_cache.dtype == v_cache.dtype == k.dtype == v.dtype == ttnn.bfloat16) or P > 16:
+        raise ValueError(f"kv_rows_write: BF16 K/V/caches and at most 16 rows, got {k_cache.dtype} {v_cache.dtype} "
+                         f"{k.dtype} {v.dtype} P={P}")
+    block_size = int(k_cache.shape[2])
+    Dt = D // 32
+    tasks = Hk * Dt
+    grid = k.device().compute_with_storage_grid_size()
+    cores = [ttnn.CoreCoord(i % grid.x, i // grid.x) for i in range(tasks)]
+    core_set = ttnn.CoreRangeSet({ttnn.CoreRange(c, c) for c in cores})
+    addrs = [int(t.buffer_address()) for t in (k_cache, v_cache, k, v, positions, page_table)]
+    kernel = ttnn.KernelDescriptor(
+        kernel_source=_KV_ROWS_KERNEL,
+        core_ranges=core_set,
+        compile_time_args=[P, Dt, Hk, block_size, int(positions.padded_shape[-1]) * 4, int(page_table.padded_shape[-1]) * 4,
+                           int(k_row_major), int(v_row_major), int(ring_tokens or 0)],
+        runtime_args=[(c, addrs + [i]) for i, c in enumerate(cores)],
+        config=ttnn.ReaderConfigDescriptor(),
+    )
+    cb = ttnn.CBDescriptor(
+        total_size=1024,
+        core_ranges=core_set,
+        format_descriptors=[ttnn.CBFormatDescriptor(0, ttnn.bfloat16, 1024)],
+    )
+    ttnn.generic_op([k, v, positions, page_table, v_cache, k_cache], ttnn.ProgramDescriptor(kernels=[kernel], cbs=[cb], semaphores=[]))
+
+
+def verify_rows_forward(
+    hidden_states,
+    cos_pos,
+    sin_pos,
+    weights: AttentionWeights,
+    kv_cache,
+    config,
+    mesh_config,
+    mesh_device,
+    pos_rows,
+    page_table,
+    pos_rope,
+    batched=None,
+):
+    """Attention for P consecutive speculative-verify rows of ONE user, bit-identical per row to
+    ``decode_forward`` at batch=1.
+
+    hidden_states: [1, 1, P, hidden]; cos_pos/sin_pos: [1, 1, P, head_dim] cos/sin of the row
+    positions; pos_rows: P int32 [1] device tensors (row positions); pos_rope: [1, 32] uint32 with
+    the row positions in slots 0..P-1; page_table: the user's [1, blocks] page table.
+
+    Everything row-local runs once for all rows: QKV / output projections, head split / concat and
+    per-head RMSNorm in the batched decode layout [1, P, heads, head_dim] (row b = user b), and RoPE
+    via the fused rotary_embedding in its sequence mode on [1, heads, P, head_dim] (bit-identical to
+    its single-position decode mode; a manual mul/add RoPE is not). K/V rows go to the cache with
+    one DMA-only launch (``kv_rows_write``; a batched paged_update_cache races when rows share a
+    cache tile). SDPA runs once per row with exactly the batch=1 decode op and arguments: a batched
+    SDPA splits the KV range over fewer cores per head (a different flash-decode reduction tree).
+    All rows are in the cache before the first SDPA, and row b's SDPA stops at its own position, so
+    row b attends to rows <= b exactly like sequential decode.
+    """
+    assert not (mesh_config and mesh_config.tp > 1), "verify_rows_forward: single device only"
+    assert config.cache_position_modulo is None, "verify_rows_forward: unbounded or ring caches only"
+    P = hidden_states.shape[2]
+    xqkv = apply_qkv_projection(hidden_states, weights)
+    tt_q, tt_k, tt_v = split_qkv_heads_decode(xqkv, config, weights.is_global, kv_replicated=weights.kv_replicated)
+    q = apply_per_head_norm(ttnn.to_memory_config(tt_q, ttnn.DRAM_MEMORY_CONFIG), weights.q_norm_weight,
+                            config.rms_norm_eps, with_scale=True, reshape=False)
+    k = apply_per_head_norm(ttnn.to_memory_config(tt_k, ttnn.DRAM_MEMORY_CONFIG), weights.k_norm_weight,
+                            config.rms_norm_eps, with_scale=True, reshape=False)
+    v = apply_per_head_norm(ttnn.to_memory_config(tt_v, ttnn.DRAM_MEMORY_CONFIG), None, config.rms_norm_eps,
+                            with_scale=False, reshape=False)
+    # [1, P, heads, D] -> [1, heads, P, D]: rows become the sequence of the fused RoPE.
+    q_t = ttnn.transpose(q, 1, 2)
+    k_t = ttnn.transpose(k, 1, 2)
+    q.deallocate(True)
+    k.deallocate(True)
+    q_r = ttnn.experimental.rotary_embedding(q_t, cos_pos, sin_pos)
+    k_r = ttnn.experimental.rotary_embedding(k_t, cos_pos, sin_pos)
+    q_t.deallocate(True)
+    k_t.deallocate(True)
+    k_cache, v_cache = kv_cache
+    kv_rows_write(k_r, v, k_cache, v_cache, pos_rope, page_table, P, v_row_major=True, ring_tokens=config.ring_tokens)
+    k_r.deallocate(True)
+    v.deallocate(True)
+
+    nkv = 1 if weights.kv_replicated else config.num_key_value_heads
+    eff_bs = effective_block_size(k_cache, config.head_dim, nkv)
+    sdpa_cfg = _decode_sdpa_program_config(config, 1, mesh_device)
+    q_rows = ttnn.transpose(q_r, 1, 2)  # [1, P, H, D]
+    q_r.deallocate(True)
+    if batched is not None:
+        # Non-exact fast path (GEMMA4_VERIFY_SDPA=batched): one SDPA launch for all P rows, rows as
+        # batch users sharing the page table; each row stops at its own position (same causality),
+        # but the flash-decode split of the KV range differs from batch=1, so bits may differ.
+        pos_all, pt_rep = batched
+        sdpa = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+            q_rows,
+            k_cache,
+            v_cache,
+            cur_pos_tensor=pos_all,
+            page_table_tensor=pt_rep,
+            scale=1.0,
+            sliding_window_size=config.sliding_window if config.is_sliding else None,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            program_config=_decode_sdpa_program_config(config, P, mesh_device),
+            paged_cache_geometry=ttnn.PagedCacheGeometryOverride(block_size=eff_bs, num_kv_heads=nkv),
+            **_position_modulo_kwargs(config),
+        )
+        q_rows.deallocate(True)
+        out = concat_heads(sdpa, is_decode_mode=True, num_heads=config.num_attention_heads,
+                           head_dim=config.head_dim, mesh_device=mesh_device)
+        return apply_output_projection(out, weights)
+    H, D = q_rows.shape[2], q_rows.shape[3]
+    outs = []
+    for b in range(P):
+        q_b = ttnn.slice(q_rows, [0, b, 0, 0], [1, b + 1, H, D])
+        outs.append(
+            ttnn.transformer.paged_scaled_dot_product_attention_decode(
+                q_b,
+                k_cache,
+                v_cache,
+                cur_pos_tensor=pos_rows[b],
+                page_table_tensor=page_table,
+                scale=1.0,
+                sliding_window_size=config.sliding_window if config.is_sliding else None,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                program_config=sdpa_cfg,
+                paged_cache_geometry=ttnn.PagedCacheGeometryOverride(block_size=eff_bs, num_kv_heads=nkv),
+                **_position_modulo_kwargs(config),
+            )
+        )
+        q_b.deallocate(True)
+    q_rows.deallocate(True)
+    if P == 1:
+        sdpa = outs[0]
+    else:
+        sdpa = ttnn.concat(outs, dim=1)  # [1, P, H, D]
+        for t in outs:
+            t.deallocate(True)
+    out = concat_heads(sdpa, is_decode_mode=True, num_heads=config.num_attention_heads, head_dim=config.head_dim,
+                       mesh_device=mesh_device)
+    return apply_output_projection(out, weights)
 
 
 # ── Packed-query verify decode ─────────────────────────────────────────────

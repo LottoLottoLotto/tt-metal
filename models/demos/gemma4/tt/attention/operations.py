@@ -19,8 +19,10 @@ import os
 
 import ttnn
 from models.demos.gemma4.tt.ccl import ccl_allreduce
+from models.demos.gemma4.tt import decode_mm
 
 from .weights import AttentionWeights
+from models.demos.gemma4.tt.precision import norm_compute_config
 
 # Non-chunked prefill SDPA silently returns WRONG results once the Q sequence
 # exceeds 32768 (2^15) — generation degrades to garbage. Above this length we
@@ -46,7 +48,7 @@ def apply_qkv_projection(hidden_states, weights: AttentionWeights, memory_config
     ``memory_config`` lets the packed-verify decode keep the projection output
     resident on L1; ``None`` keeps the op default (DRAM) for existing callers.
     """
-    return ttnn.linear(hidden_states, weights.wqkv, memory_config=memory_config)
+    return decode_mm.linear(hidden_states, weights.wqkv, weights.compute_config, memory_config=memory_config)
 
 
 def split_qkv_heads_decode(xqkv_fused, config, is_global: bool, tp: int = 1, kv_replicated: bool = False):
@@ -98,7 +100,9 @@ def split_qkv_heads_prefill(
     )
 
 
-def apply_per_head_norm(tensor, weight, eps, with_scale=True, memory_config=None):
+
+
+def apply_per_head_norm(tensor, weight, eps, with_scale=True, memory_config=None, reshape=True):
     """
     Apply RMSNorm per-head on the head_dim dimension.
 
@@ -109,6 +113,13 @@ def apply_per_head_norm(tensor, weight, eps, with_scale=True, memory_config=None
     activation resident on L1 (packed-verify decode path). ``None`` keeps the
     op's default (follows the input's layout).
     """
+    if not reshape:
+        # rms_norm reduces each row over head_dim, so the 4D tensor can be normed in place of its
+        # flattened view; skips the two reshape copies for multi-row decode ([1, P, heads, head_dim]).
+        if with_scale and weight is not None:
+            return ttnn.rms_norm(tensor, weight=weight, epsilon=eps, memory_config=memory_config,
+                                 compute_kernel_config=norm_compute_config())
+        return ttnn.rms_norm(tensor, epsilon=eps, memory_config=memory_config, compute_kernel_config=norm_compute_config())
     orig_shape = tensor.shape
     head_dim = orig_shape[-1]
     if len(orig_shape) == 4 and orig_shape[0] > 1:
@@ -119,9 +130,11 @@ def apply_per_head_norm(tensor, weight, eps, with_scale=True, memory_config=None
         seq_or_batch = orig_shape[2]
         flat = ttnn.reshape(tensor, (1, 1, num_heads * seq_or_batch, head_dim))
     if with_scale and weight is not None:
-        normed = ttnn.rms_norm(flat, weight=weight, epsilon=eps, memory_config=memory_config)
+        normed = ttnn.rms_norm(
+            flat, weight=weight, epsilon=eps, memory_config=memory_config, compute_kernel_config=norm_compute_config()
+        )
     else:
-        normed = ttnn.rms_norm(flat, epsilon=eps, memory_config=memory_config)
+        normed = ttnn.rms_norm(flat, epsilon=eps, memory_config=memory_config, compute_kernel_config=norm_compute_config())
 
     return ttnn.reshape(normed, orig_shape)
 
@@ -481,7 +494,7 @@ def concat_heads(tensor, is_decode_mode: bool, num_heads: int = None, head_dim: 
 
 def apply_output_projection(tensor, weights: AttentionWeights):
     """Apply output projection (no bias for Gemma4)."""
-    out = ttnn.linear(tensor, weights.o_proj)
+    out = decode_mm.linear(tensor, weights.o_proj, weights.compute_config)
     tensor.deallocate(True)
     return out
 

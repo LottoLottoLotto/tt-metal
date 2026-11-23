@@ -145,6 +145,10 @@ HF_MODEL=<path-or-id> pytest models/demos/gemma4/demo/text_demo.py::test_demo_si
 - **Batch size:** `text_demo.py` defaults to batch 1; batched tests support batch-32 (override with `GEMMA4_BATCH_DEMO_SIZE`). `text_demo_v2.py` targets higher batch / long-context scenarios.
 - **Sequence length:** up to 4096 in the standard demo; batched prefill in `text_demo.py` uses a **128k** virtual-token ceiling (`GEMMA4_MAX_BATCHED_PREFILL_SEQ_LEN`) with chunking above that. `text_demo_v2.py` supports longer contexts (up to 256k).
 - **Prefill trace:** enabled for MoE models on ISL buckets up to 4096 when `padded_batch × kernel < 32k`. Above 4k ISL or at/above 32k batched virtual tokens, prefill trace is disabled automatically (no perf gain, OOM risk).
+- **Speed switches (single-device decode; non-bit-exact vs the default path, gated on quality):**
+  - `GEMMA4_VERIFY_SDPA=batched` runs the speculative verify rows as one batched paged SDPA per layer instead of one call per row. `GEMMA4_VERIFY_ROWS` (default 6 = draft length 5 + 1) must equal the verify row count. The batch=1 decode SDPA is capped to the same cores per KV head, so speculative output still equals non-speculative greedy output token for token.
+  - `GEMMA4_FUSE_GELU_MUL=1` computes GELU(gate)·up in the decode MLP with one eltwise launch.
+  - `GEMMA4_DECODE_MM_KB=N` widens `in0_block_w` of the decode matmuls. It is measured as no faster on P150, so it stays off by default.
 - **Architecture:**
   - Mixed attention pattern: `sliding_attention` and `full_attention` layers interleaved per `hf_config.layer_types`.
   - Partial RoPE (factor 0.25) on global layers, full RoPE on sliding-window layers.

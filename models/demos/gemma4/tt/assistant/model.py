@@ -34,7 +34,9 @@ Constraints (first cut):
 import torch
 
 import ttnn
+from models.demos.gemma4.tt import decode_mm
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
+from models.demos.gemma4.tt.precision import dtype_to_str, matmul_compute_config
 from models.demos.gemma4.tt.ccl import ccl_allgather
 from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
 from models.demos.gemma4.tt.rms_norm import RMSNorm
@@ -78,6 +80,7 @@ class Gemma4AssistantModel:
         tensor_cache_path=None,
         mesh_config=None,
         max_local_batch_size=1,
+        lm_head_dtype=None,
     ):
         self.mesh_device = mesh_device
         self.max_local_batch_size = max_local_batch_size
@@ -140,28 +143,31 @@ class Gemma4AssistantModel:
         # all-gathered, mirroring the target.
         col_mapper = mesh_config.column_parallel(mesh_device) if tp > 1 else None
 
-        def _linear(key, mapper, transpose=True):
+        def _linear(key, mapper, transpose=True, w_dtype=None):
             w = state_dict.get(key)
             if w is None:
                 return None
             wt = w.transpose(-2, -1) if transpose else w
             wt = wt.unsqueeze(0).unsqueeze(0)
+            suffix = f"_{dtype_to_str(w_dtype)}" if w_dtype not in (None, dtype) else ""
             return ttnn.as_tensor(
                 wt,
                 device=mesh_device,
-                dtype=dtype,
+                dtype=w_dtype or dtype,
                 layout=ttnn.TILE_LAYOUT,
                 mesh_mapper=mapper if mapper is not None else (replicate if is_mesh else None),
-                cache_file_name=get_cache_file_name(tensor_cache_path, key.replace(".", "_")),
+                cache_file_name=get_cache_file_name(tensor_cache_path, key.replace(".", "_") + suffix),
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
 
+        self.compute_config = matmul_compute_config(dtype)
         self.pre_projection = _linear("pre_projection.weight", None)
         self.post_projection = _linear("post_projection.weight", None)
         # lm_head tied to the assistant's own embed_tokens when a separate
         # lm_head.weight isn't stored.
         lm_key = "lm_head.weight" if "lm_head.weight" in state_dict else "model.embed_tokens.weight"
-        self.lm_head = _linear(lm_key, col_mapper)
+        # lm_head_dtype: a lighter LM head (e.g. BFP4) only changes which tokens are drafted.
+        self.lm_head = _linear(lm_key, col_mapper, w_dtype=lm_head_dtype)
         if self.pre_projection is None or self.post_projection is None or self.lm_head is None:
             raise ValueError("Assistant checkpoint missing pre_projection / post_projection / lm_head weights")
 
@@ -205,7 +211,7 @@ class Gemma4AssistantModel:
         inp = ttnn.concat([tok_embed, target_hidden], dim=-1)
         tok_embed.deallocate(True)
 
-        h = ttnn.linear(inp, self.pre_projection)
+        h = decode_mm.linear(inp, self.pre_projection, self.compute_config)
         inp.deallocate(True)
 
         for i, layer in enumerate(self.layers):
@@ -232,6 +238,6 @@ class Gemma4AssistantModel:
             if self.mesh_config is not None and self.mesh_config.tp > 1:
                 logits = ccl_allgather(logits, self.mesh_config, self.ccl_manager)
 
-        next_hidden = ttnn.linear(normed, self.post_projection)
+        next_hidden = decode_mm.linear(normed, self.post_projection, self.compute_config)
         normed.deallocate(True)
         return logits, next_hidden

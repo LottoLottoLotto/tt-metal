@@ -33,6 +33,7 @@ class AttentionWeights:
     k_norm_weight: ttnn.Tensor  # Replicated across devices
     is_global: bool  # Controls K=V tying and partial RoPE
     kv_replicated: bool = False  # True when KV heads are replicated (not split) across TP devices
+    compute_config: object = None  # Matmul compute kernel config for wqkv / o_proj (per weight dtype)
 
 
 def load_attention_weights(
@@ -139,7 +140,7 @@ def load_attention_weights(
     # ``attention`` precision in precision_overrides.json doesn't reuse a
     # stale cached tensor at the previous dtype. q_norm / k_norm stay at
     # bfloat16 (no override) and don't need the suffix.
-    from models.demos.gemma4.tt.precision import dtype_to_str
+    from models.demos.gemma4.tt.precision import dtype_to_str, matmul_compute_config
 
     dtype_suffix = f"_{dtype_to_str(weight_dtype)}"
 
@@ -187,4 +188,5 @@ def load_attention_weights(
         k_norm_weight=k_norm_weight,
         is_global=is_global,
         kv_replicated=kv_replicated,
+        compute_config=matmul_compute_config(weight_dtype),
     )

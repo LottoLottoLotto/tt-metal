@@ -68,6 +68,8 @@ class Gemma4DecoderLayer:
         attention_dtype=None,
         experts_dtype=None,
         router_dtype=None,
+        mlp_gate_up_dtype=None,
+        mlp_down_dtype=None,
         bounded_sliding_kv_cache: bool = False,
         transformation_mats=None,  # Legacy — ignored (HF-style RoPE needs no transformation mats)
     ):
@@ -149,6 +151,8 @@ class Gemma4DecoderLayer:
             ccl_manager=ccl_manager,
             dtype=shared_mlp_dtype,
             tensor_cache_path=f"{tensor_cache_path}/layer_{layer_idx}/mlp" if tensor_cache_path else None,
+            gate_up_dtype=mlp_gate_up_dtype,
+            down_dtype=mlp_down_dtype,
         )
 
         # MoE block (router + routed experts) — split dtypes between the two
@@ -215,6 +219,7 @@ class Gemma4DecoderLayer:
         packed=None,
         chunk_start_idx=None,
         chunk_page_table=None,
+        verify_pos_rows=None,
     ):
         """
         Decoder layer forward pass.
@@ -260,6 +265,7 @@ class Gemma4DecoderLayer:
             packed=packed,
             chunk_start_idx=chunk_start_idx,
             chunk_page_table=chunk_page_table,
+            verify_pos_rows=verify_pos_rows,
         )
 
         if isinstance(attn_output, torch.Tensor):

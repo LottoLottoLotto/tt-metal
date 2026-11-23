@@ -14,8 +14,12 @@ HF weight shapes:
   down_proj.weight: [hidden_size, intermediate_size] = [2816, 2112]
 """
 
+import os
+
 import ttnn
+from models.demos.gemma4.tt import decode_mm
 from models.demos.gemma4.tt.ccl import ccl_allreduce
+from models.demos.gemma4.tt.precision import dtype_to_str, gelu_fast, matmul_compute_config
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
 
 
@@ -29,6 +33,8 @@ class SharedMLP:
         ccl_manager=None,
         dtype=ttnn.bfloat8_b,
         tensor_cache_path=None,
+        gate_up_dtype=None,
+        down_dtype=None,
     ):
         self.mesh_device = mesh_device
         self.mesh_config = mesh_config
@@ -44,8 +50,12 @@ class SharedMLP:
         # doesn't collide with a previously-cached file that holds the same
         # logical weight at a different dtype. The rest of the model's cache
         # entries are unaffected and stay reusable across runs.
-        _dtype_str = {ttnn.bfloat16: "bf16", ttnn.bfloat8_b: "bfp8"}[dtype]
-        dtype_suffix = f"_{_dtype_str}"
+        gate_up_dtype = gate_up_dtype or dtype
+        down_dtype = down_dtype or dtype
+        gate_up_suffix = f"_{dtype_to_str(gate_up_dtype)}"
+        down_suffix = f"_{dtype_to_str(down_dtype)}"
+        self.gate_up_compute_config = matmul_compute_config(gate_up_dtype)
+        self.down_compute_config = matmul_compute_config(down_dtype)
 
         if tp > 1:
             col_mapper = mesh_config.column_parallel(mesh_device)
@@ -67,29 +77,29 @@ class SharedMLP:
         self.gate_proj = ttnn.as_tensor(
             gate_proj_weight,
             device=mesh_device,
-            dtype=dtype,
+            dtype=gate_up_dtype,
             layout=ttnn.TILE_LAYOUT,
             mesh_mapper=col_mapper,
-            cache_file_name=get_cache_file_name(tensor_cache_path, f"gate_proj.weight{tp_suffix}{dtype_suffix}"),
+            cache_file_name=get_cache_file_name(tensor_cache_path, f"gate_proj.weight{tp_suffix}{gate_up_suffix}"),
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         self.up_proj = ttnn.as_tensor(
             up_proj_weight,
             device=mesh_device,
-            dtype=dtype,
+            dtype=gate_up_dtype,
             layout=ttnn.TILE_LAYOUT,
             mesh_mapper=col_mapper,
-            cache_file_name=get_cache_file_name(tensor_cache_path, f"up_proj.weight{tp_suffix}{dtype_suffix}"),
+            cache_file_name=get_cache_file_name(tensor_cache_path, f"up_proj.weight{tp_suffix}{gate_up_suffix}"),
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         # down: row-parallel (shard input dim, allreduce after)
         self.down_proj = ttnn.as_tensor(
             down_proj_weight,
             device=mesh_device,
-            dtype=dtype,
+            dtype=down_dtype,
             layout=ttnn.TILE_LAYOUT,
             mesh_mapper=row_mapper,
-            cache_file_name=get_cache_file_name(tensor_cache_path, f"down_proj.weight{tp_suffix}{dtype_suffix}"),
+            cache_file_name=get_cache_file_name(tensor_cache_path, f"down_proj.weight{tp_suffix}{down_suffix}"),
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
 
@@ -99,20 +109,22 @@ class SharedMLP:
 
         gate/up are column-parallel, down is row-parallel + allreduce.
         """
-        # gate = GELU(x @ gate_proj)
-        gate = ttnn.linear(hidden_states, self.gate_proj)
-        gate = ttnn.gelu(gate, fast_and_approximate_mode=True)
-
-        # up = x @ up_proj
-        up = ttnn.linear(hidden_states, self.up_proj)
-
-        # hidden = gate * up
-        hidden = ttnn.mul(gate, up)
+        gate = decode_mm.linear(hidden_states, self.gate_proj, self.gate_up_compute_config)
+        up = decode_mm.linear(hidden_states, self.up_proj, self.gate_up_compute_config)
+        if os.environ.get("GEMMA4_FUSE_GELU_MUL") == "1" and not gelu_fast() and hidden_states.padded_shape[-2] <= 32:
+            # hidden = GELU(gate) * up in one eltwise launch (GELU applied to input a in the binary op;
+            # non-exact vs the separate gelu op).
+            hidden = ttnn.mul(gate, up, input_tensor_a_activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.GELU, 0.0)])
+        else:
+            gate_act = ttnn.gelu(gate, fast_and_approximate_mode=gelu_fast())
+            gate.deallocate(True)
+            gate = gate_act
+            hidden = ttnn.mul(gate, up)
         gate.deallocate(True)
         up.deallocate(True)
 
         # output = hidden @ down_proj
-        output = ttnn.linear(hidden, self.down_proj)
+        output = decode_mm.linear(hidden, self.down_proj, self.down_compute_config)
         hidden.deallocate(True)
 
         # Allreduce after row-parallel down_proj

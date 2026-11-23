@@ -17,7 +17,7 @@ from models.demos.gemma4.config import MeshConfig, Mode
 
 from .weights import AttentionWeights, load_attention_weights
 from .kv_cache import init_kv_cache
-from .decode import decode_forward, packed_decode_forward
+from .decode import decode_forward, packed_decode_forward, verify_rows_forward
 from .prefill import prefill_forward
 
 
@@ -58,6 +58,11 @@ class Gemma4AttentionConfig:
         # cache_position_modulo / block_size blocks per sequence; the per-layer
         # page_table is zero-padded out to max_model_len / block_size.
         self.cache_position_modulo = None
+        # Ring-buffered sliding cache (tt/single_user.py): the pool holds ring_tokens positions. Decode
+        # and verify pass it as cache_position_modulo to paged_update_cache / SDPA decode (the wrap
+        # changes only physical addresses; SDPA reads the same logical chunks), with the narrow identity
+        # page table [1, ring_tokens / block_size]. Prefill fills through ring-aliased chunk tables.
+        self.ring_tokens = None
 
 
 class Gemma4Attention:
@@ -143,6 +148,7 @@ class Gemma4Attention:
         packed=None,
         chunk_start_idx=None,
         chunk_page_table=None,
+        verify_pos_rows=None,
     ):
         """
         Attention forward pass — dispatches to on-device decode or prefill.
@@ -171,6 +177,24 @@ class Gemma4Attention:
         # dispatches (packed and ordinary) so neither path retains stale tails.
         if is_decode and getattr(self, "_sliding_prefill_tail", None) is not None:
             self._release_sliding_prefill_tail()
+
+        if is_decode and verify_pos_rows is not None:
+            # Exact multi-row speculative verify: verify_pos_rows = (pos_rope [1,32] uint32, [P] int32 [1]
+            # row positions); rope_mats = the rows' cos/sin [1,1,P,head_dim].
+            return verify_rows_forward(
+                hidden_states=hidden_states,
+                cos_pos=cos_cache,
+                sin_pos=sin_cache,
+                weights=self.weights,
+                kv_cache=cache,
+                config=self.config,
+                mesh_config=self.mesh_config,
+                mesh_device=self.mesh_device,
+                pos_rows=verify_pos_rows[1],
+                page_table=page_table,
+                pos_rope=verify_pos_rows[0],
+                batched=verify_pos_rows[2] if len(verify_pos_rows) > 2 else None,
+            )
 
         if is_decode and packed is not None:
             return packed_decode_forward(

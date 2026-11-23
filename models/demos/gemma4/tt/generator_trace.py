@@ -126,6 +126,17 @@ GEMMA4_LONG_CONTEXT_POLICY = {
             "prefill_chunk": _CHUNK,
             "source": "measured",
         },
+        # Single P150 (1x1, 34 GB DRAM): mixed BFP4/BFP8 weights + BF16 embedding take
+        # ~10.5 GB; unbounded BF16 KV costs ~343 KB/token (40 sliding layers x 8 KB +
+        # 8 global x 2 KB), so unbounded fits ~32k; bounded sliding (1024-token window
+        # pools) drops that to ~16 KB/token + 0.33 GB and reaches 256k.
+        "P150": {
+            "unbounded_isl_max": 32768,
+            "bounded_isl_min": 65536,
+            "chunked_bounded_isl_min": 65536,
+            "prefill_chunk": _CHUNK,
+            "source": "inferred",
+        },
     },
     # MoE 26B-A4B — HF max_pos=256k. QB2: unbounded 64k PASSED (after instruct-clip
     # trim fix); 128k allocated/ran (no OOM, prior 1800s timeout); unbounded 256k OOM.

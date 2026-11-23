@@ -16,6 +16,7 @@ Compatible with tt_transformers Generator interface.
 """
 
 
+import os
 import torch
 from loguru import logger
 from tracy import signpost
@@ -24,6 +25,7 @@ import ttnn
 from models.common.sampling.generator import SamplingGenerator
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
+from models.demos.gemma4.tt.attention.decode import verify_sdpa_rows
 from models.demos.gemma4.tt.rms_norm import RMSNorm
 from models.demos.gemma4.utils.general_utils import cast_host_for_ttnn, get_cache_file_name
 from models.demos.gemma4.utils.substate import substate
@@ -36,6 +38,12 @@ from models.demos.gemma4.utils.substate import substate
 # tt_transformers Generator (the model returns logits in sampling layout),
 # so it is profiled there / by op name (SamplingDeviceOperation, TopK).
 LM_HEAD_SIGNPOST = "gemma4_lm_head"
+
+
+def page_table_for(page_table, layer_type):
+    """A page table may be given per layer type (``{layer_type: table}``) when the sliding-window
+    and full-attention caches use different block pools (ring-buffered sliding caches)."""
+    return page_table[layer_type] if isinstance(page_table, dict) else page_table
 
 
 def _compute_per_device_vocab(vocab_size, num_tp):
@@ -244,6 +252,7 @@ class Gemma4Model:
         create_kv_cache=True,
         precision=None,
         bounded_sliding_kv_cache: bool = False,
+        sliding_ring_tokens: int | None = None,
         # Legacy parameters — ignored
         transformation_mats=None,
     ):
@@ -269,12 +278,11 @@ class Gemma4Model:
 
         if precision is None:
             precision = Gemma4Precision()
-        shared_mlp_dtype = precision.get("shared_mlp", dtype)
-        attention_dtype = precision.get("attention", dtype)
-        experts_dtype = precision.get("experts", dtype)
-        router_dtype = precision.get("router", dtype)
         embedding_dtype = precision.get("embedding", dtype)
         lm_head_dtype = precision.get("lm_head", dtype)
+        from models.demos.gemma4.tt.precision import matmul_compute_config
+
+        self.lm_head_compute_config = matmul_compute_config(lm_head_dtype)
 
         # KV sharing map: layers after (full_n_layers - num_kv_shared_layers) share KV
         # from the last non-shared layer of the same type
@@ -419,56 +427,26 @@ class Gemma4Model:
                 layer_idx=i,
                 ccl_manager=ccl_manager,
                 dtype=dtype,
-                shared_mlp_dtype=shared_mlp_dtype,
-                attention_dtype=attention_dtype,
-                experts_dtype=experts_dtype,
-                router_dtype=router_dtype,
+                shared_mlp_dtype=precision.get("shared_mlp", dtype, layer_idx=i),
+                attention_dtype=precision.get("attention", dtype, layer_idx=i),
+                experts_dtype=precision.get("experts", dtype, layer_idx=i),
+                router_dtype=precision.get("router", dtype, layer_idx=i),
+                mlp_gate_up_dtype=precision.get("mlp_gate_up", dtype, layer_idx=i),
+                mlp_down_dtype=precision.get("mlp_down", dtype, layer_idx=i),
                 tensor_cache_path=tensor_cache_path,
                 mesh_config=mesh_config,
                 max_seq_len=max_seq_len,
                 max_local_batch_size=max_local_batch_size,
                 bounded_sliding_kv_cache=bounded_sliding_kv_cache,
             )
-            # Create KV cache for non-shared layers only
-            # Shared layers will use their source layer's KV cache
-            if create_kv_cache and i not in self.kv_shared_layer_map:
-                from models.demos.gemma4.tt.attention.kv_cache import init_kv_cache
-
-                attn_cfg = Gemma4AttentionConfig(hf_config, i)
-                # Bounded SlidingWindowSpec allocation for sliding layers: only enough
-                # physical blocks to cover one sliding-window-sized region per user,
-                # instead of one max_seq_len-sized region. Mirrors vLLM's hybrid
-                # kv_cache_groups. Full-attention layers keep the existing allocation.
-                max_num_blocks_override = None
-                if (
-                    bounded_sliding_kv_cache
-                    and attn_cfg.is_sliding
-                    and attn_cfg.sliding_window is not None
-                    and paged_attention_config is not None
-                ):
-                    sliding_blocks_per_seq = attn_cfg.sliding_window // paged_attention_config.block_size
-                    max_num_blocks_override = sliding_blocks_per_seq * max_local_batch_size
-                kv_cache = init_kv_cache(
-                    mesh_device=mesh_device,
-                    config=attn_cfg,
-                    max_batch_size=max_local_batch_size,
-                    max_seq_len=max_seq_len,
-                    paged_attention_config=paged_attention_config,
-                    cache_dtype=ttnn.bfloat16,
-                    max_num_blocks_override=max_num_blocks_override,
-                )
-                layer.self_attn.kv_cache = kv_cache
             self.layers.append(layer)
 
-        # Extract KV caches for external access (Generator interface)
-        # Shared layers point to their source layer's cache
+        # KV caches of the non-shared layers (shared layers use their source layer's cache).
         self.tt_kv_cache = []
-        for i, layer in enumerate(self.layers):
-            if i in self.kv_shared_layer_map:
-                source_idx = self.kv_shared_layer_map[i]
-                self.tt_kv_cache.append(self.layers[source_idx].self_attn.kv_cache)
-            else:
-                self.tt_kv_cache.append(layer.self_attn.kv_cache)
+        if create_kv_cache:
+            self.create_kv_caches(paged_attention_config, max_local_batch_size, sliding_ring_tokens)
+        else:
+            self._collect_kv_caches()
 
         # Last layer index of each attention type — these are the layers whose
         # KV the Gemma4 *it-assistant* drafter cross-attends into (HF
@@ -840,7 +818,10 @@ class Gemma4Model:
             elif not is_decode and i in kv_source_indices:
                 keep_kv = True
 
-            layer_page_table = page_tables_per_layer[i] if page_tables_per_layer is not None else page_table
+            layer_type = self.hf_config.layer_types[i]
+            layer_page_table = (
+                page_tables_per_layer[i] if page_tables_per_layer is not None else page_table_for(page_table, layer_type)
+            )
 
             layer_packed = None
             if packed is not None:
@@ -877,7 +858,7 @@ class Gemma4Model:
                 rope_presliced=rope_presliced,
                 packed=layer_packed,
                 chunk_start_idx=chunk_start_idx,
-                chunk_page_table=chunk_page_table,
+                chunk_page_table=page_table_for(chunk_page_table, layer_type),
             )
 
             # For KV source layers during prefill, capture the K/V from the attention
@@ -996,7 +977,12 @@ class Gemma4Model:
                 k=self.hidden_size,
                 n=self.lm_head_weight.shape[-1],
             )
-            logits = ttnn.linear(hidden_states, self.lm_head_weight, program_config=lm_head_pc)
+            logits = ttnn.linear(
+                hidden_states,
+                self.lm_head_weight,
+                program_config=lm_head_pc,
+                compute_kernel_config=self.lm_head_compute_config,
+            )
             hidden_states.deallocate(True)
         else:
             logits = hidden_states
@@ -1055,6 +1041,55 @@ class Gemma4Model:
 
             embeds = ccl_allgather(embeds, self.mesh_config, self.ccl_manager)
         return embeds
+
+    def create_kv_caches(self, paged_attention_config, max_local_batch_size=1, sliding_ring_tokens=None):
+        """Allocate the KV cache of every non-shared layer: full-attention layers get the paged
+        config's pool; sliding layers the bounded window (``bounded_sliding_kv_cache``) or a ring of
+        ``sliding_ring_tokens`` positions (tt/single_user.py). Returns the per-layer cache list
+        (Generator interface; shared layers alias their source layer's cache)."""
+        from models.demos.gemma4.tt.attention.kv_cache import init_kv_cache
+
+        bounded_sliding_kv_cache = self.bounded_sliding_kv_cache
+        for i, layer in enumerate(self.layers):
+            if i in self.kv_shared_layer_map:
+                continue
+            hf_config = self.hf_config
+            attn_cfg = Gemma4AttentionConfig(hf_config, i)
+            # Bounded SlidingWindowSpec allocation for sliding layers: only enough
+            # physical blocks to cover one sliding-window-sized region per user,
+            # instead of one max_seq_len-sized region. Mirrors vLLM's hybrid
+            # kv_cache_groups. Full-attention layers keep the existing allocation.
+            max_num_blocks_override = None
+            if (
+                bounded_sliding_kv_cache
+                and attn_cfg.is_sliding
+                and attn_cfg.sliding_window is not None
+                and paged_attention_config is not None
+            ):
+                sliding_blocks_per_seq = attn_cfg.sliding_window // paged_attention_config.block_size
+                max_num_blocks_override = sliding_blocks_per_seq * max_local_batch_size
+            elif sliding_ring_tokens and attn_cfg.is_sliding and paged_attention_config is not None:
+                # Ring-buffered sliding cache: the pool holds sliding_ring_tokens positions (see
+                # tt/single_user.py and Gemma4AttentionConfig.ring_tokens).
+                max_num_blocks_override = sliding_ring_tokens // paged_attention_config.block_size
+            layer.self_attn.kv_cache = init_kv_cache(
+                mesh_device=self.mesh_device,
+                config=attn_cfg,
+                max_batch_size=max_local_batch_size,
+                max_seq_len=self.max_seq_len,
+                paged_attention_config=paged_attention_config,
+                cache_dtype=ttnn.bfloat16,
+                max_num_blocks_override=max_num_blocks_override,
+            )
+            if max_num_blocks_override is not None and not bounded_sliding_kv_cache:
+                layer.self_attn.config.ring_tokens = sliding_ring_tokens
+        return self._collect_kv_caches()
+
+    def _collect_kv_caches(self):
+        self.tt_kv_cache = [
+            self.layers[self.kv_shared_layer_map.get(i, i)].self_attn.kv_cache for i in range(len(self.layers))
+        ]
+        return self.tt_kv_cache
 
     def get_shared_kv_caches(self):
         """Return the target KV caches the it-assistant drafter cross-attends to.
@@ -1199,6 +1234,66 @@ class Gemma4Model:
             cos_bp.deallocate(True)
             sin_bp.deallocate(True)
         return out
+
+    def ttnn_rows_forward(self, tokens, pos_rope, pos_rows, page_table, kv_cache=None, batched=None):
+        """Exact speculative verify of P consecutive rows of one user (single device).
+
+        tokens: [1, P] uint32 ids at positions pos..pos+P-1; pos_rope: [1, 32] uint32 with those
+        positions in slots 0..P-1; pos_rows: P int32 [1] device tensors (the same positions);
+        page_table: the user's [1, blocks] table (or ``{layer_type: table}``). Every row's logits and post-norm hidden are
+        bit-identical to a batch=1 ``ttnn_decode_forward`` of that token at that position (see
+        ``attention.decode.verify_rows_forward``). Returns (logits [1,1,P,vocab] softcapped,
+        post-norm hidden [1,1,P,hidden]).
+        """
+        caches = kv_cache or self.tt_kv_cache
+        h = self.embed_tokens(tokens)
+        if len(h.shape) == 3:
+            h = ttnn.unsqueeze_to_4D(h)
+        h = ttnn.to_layout(h, ttnn.TILE_LAYOUT)
+        P = tokens.shape[-1]
+        rope = {}
+        for lt in {self.hf_config.layer_types[i] for i in range(len(self.layers))}:
+            cos_2d, sin_2d = self.rope_caches_2d[lt]
+            pair = []
+            for table in (cos_2d, sin_2d):
+                full = ttnn.unsqueeze_to_4D(ttnn.embedding(pos_rope, table, layout=ttnn.TILE_LAYOUT))
+                pair.append(ttnn.slice(full, [0, 0, 0, 0], [1, 1, P, full.shape[-1]]))
+                full.deallocate(True)
+            rope[lt] = tuple(pair)
+        own = []
+        if batched is None and P > 1 and P == verify_sdpa_rows():
+            # One P-row SDPA per layer (see attention.decode.verify_rows_forward); other P keep the
+            # per-row loop (same capped core split as batch=1 decode).
+            pos_all = ttnn.concat(list(pos_rows), dim=0)
+            if isinstance(page_table, dict):
+                rep = {k: ttnn.concat([t] * P, dim=0) for k, t in page_table.items()}
+                own = [pos_all, *rep.values()]
+            else:
+                rep = ttnn.concat([page_table] * P, dim=0)
+                own = [pos_all, rep]
+            batched = (pos_all, rep)
+        for i, layer in enumerate(self.layers):
+            lt = self.hf_config.layer_types[i]
+            # batched = caller-held (positions [P] int32, page table [P, blocks] or {layer_type: ...})
+            # for the one-launch verify SDPA.
+            vpr = (pos_rope, pos_rows) if batched is None else (pos_rope, pos_rows, (batched[0], page_table_for(batched[1], lt)))
+            h = layer(
+                h,
+                rope_mats=rope[lt],
+                position_idx=None,
+                page_table=page_table_for(page_table, lt),
+                kv_cache=caches[i],
+                is_decode=True,
+                verify_pos_rows=vpr,
+            )
+        for t in own:
+            t.deallocate(True)
+        for cos_pos, sin_pos in rope.values():
+            cos_pos.deallocate(True)
+            sin_pos.deallocate(True)
+        h = self.norm.forward(h)
+        hidden = ttnn.clone(h)
+        return self._apply_lm_head(h, is_decode=True), hidden
 
     def compute_host_pli(self, token_id):
         """Compute per-layer input (PLI) on CPU for a single decode token.

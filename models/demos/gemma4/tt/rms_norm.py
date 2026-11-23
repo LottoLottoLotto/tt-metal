@@ -5,6 +5,7 @@ from torch import nn
 
 import ttnn
 from models.demos.gemma4.config import MeshConfig, ModeConfig
+from models.demos.gemma4.tt.precision import norm_compute_config
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
 
 
@@ -94,6 +95,7 @@ class RMSNorm(nn.Module):
             weight=self.tt_weight,
             epsilon=self.eps,
             program_config=self._sharded_cfg[1],
+            compute_kernel_config=norm_compute_config(),
         )
         x_sh.deallocate(True)
         out_interleaved = ttnn.sharded_to_interleaved(out, ttnn.DRAM_MEMORY_CONFIG)
@@ -167,10 +169,12 @@ class RMSNorm(nn.Module):
                     x,
                     weight=self.tt_weight,
                     epsilon=self.eps,
+                    compute_kernel_config=norm_compute_config(),
                 )
             else:
                 tt_output = ttnn.rms_norm(
                     x,
                     epsilon=self.eps,
+                    compute_kernel_config=norm_compute_config(),
                 )
             return tt_output

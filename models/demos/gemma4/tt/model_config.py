@@ -300,7 +300,7 @@ class Gemma4AssistantArgs:
     def weight_cache_path(self, dtype):
         if self.model_cache_path is None:
             raise ValueError("model_cache_path must be initialized before requesting a weight cache path")
-        dtype_str = {ttnn.bfloat16: "bf16", ttnn.bfloat8_b: "bfp8"}[dtype]
+        dtype_str = {ttnn.bfloat16: "bf16", ttnn.bfloat8_b: "bfp8", ttnn.bfloat4_b: "bfp4"}[dtype]
         cache_path = self.model_cache_path / f"assistant_tensor_cache_{dtype_str}"
         cache_path.mkdir(parents=True, exist_ok=True)
         return cache_path
