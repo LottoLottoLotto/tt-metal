@@ -347,7 +347,8 @@ def _scan_sp_chunks(
         actual_end=actual_end,
         sequence_parallel_axis=sequence_parallel_axis,
         memory_config=ttnn.L1_MEMORY_CONFIG,
-        compute_kernel_config=compute_config.preparation,
+        # The summary only feeds the relay: it runs at the relay's fidelity, not preparation's HiFi4.
+        compute_kernel_config=affine_relay.compute_config,
         emit_outputs=True,
         emit_memory_config=affine_relay.terms_memory_config,
     )

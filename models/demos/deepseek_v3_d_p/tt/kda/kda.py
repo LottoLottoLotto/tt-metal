@@ -309,10 +309,10 @@ class ttKDA:
         self.tt_ccl = tt_ccl
         self._tp_num_links = tt_ccl.get_num_links(self._tp_cluster_axis) if self.tensor_parallel_size > 1 else None
         # Ordinary matmuls (input and decay projections) keep packer L1 accumulation; the input
-        # projection takes its fidelity from the program config.
+        # projection takes its fidelity from the program config, the decay projection runs at HiFi3.
         self.compute_config = ttnn.init_device_compute_kernel_config(
             mesh_device.arch(),
-            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_fidelity=ttnn.MathFidelity.HiFi3,
             fp32_dest_acc_en=True,
             packer_l1_acc=True,
         )
