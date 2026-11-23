@@ -288,8 +288,8 @@ def decay_projection_program_config(
         compute_with_storage_grid_size=grid,
         in0_block_w=key_dim // tile,
         out_subblock_h=1,
-        # FP32 accumulation holds four tiles in DST.
-        out_subblock_w=max(w for w in range(1, 5) if out_block_w % w == 0),
+        # FP32 accumulation holds four tiles in DST. With the fused sigmoid, at most two (Kimi-K3: 26.4 -> 24.4 us).
+        out_subblock_w=max(w for w in range(1, 3 if fused_activation else 5) if out_block_w % w == 0),
         out_block_h=out_block_h,
         out_block_w=out_block_w,
         per_core_M=per_core_M,
