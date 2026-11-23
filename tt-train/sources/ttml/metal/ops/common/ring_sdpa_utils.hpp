@@ -17,6 +17,7 @@
 namespace ttml::metal::ops {
 
 // ZigZag: with N = ring_size, device d holds global blocks [d | 2N-1-d]; chunks[0] = block d, chunks[1] = block 2N-1-d.
+// Same device layout as ttnn's ring_joint_sdpa is_balanced and ring_distributed_sdpa chunk_1 / chunk_2.
 // At step >= 1, with src = get_ring_source_device(d, step), the device computes chunk 0 if src < d, chunk 1 if src > d,
 // unmasked. The caller runs step 0 as one causal None call and the chunk-1 Q x chunk-0 K/V block at every step >= 1.
 enum class RingLoadBalancing : uint8_t { None = 0, ZigZag = 1 };
