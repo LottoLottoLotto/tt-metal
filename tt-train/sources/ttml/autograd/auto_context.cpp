@@ -250,6 +250,12 @@ ParallelismContext::ParallelismContext(
         mesh_shape,
         m_cp_axis.value_or(0U),
         m_num_cp_devices);
+
+    m_cp_sharding = config.cp_sharding;
+    TT_FATAL(
+        m_cp_sharding == core::distributed::CpSharding::Contiguous || (m_cp_axis.has_value() && m_num_cp_devices > 1U),
+        "Zig-zag CP sharding needs context parallelism over more than one device (mesh shape {})",
+        mesh_shape);
 }
 
 [[nodiscard]] const ParallelismContext& AutoContext::get_parallelism_context() const {

@@ -27,7 +27,7 @@
 
 namespace {
 
-using ttml::ops::distributed::RingAttentionLayout;
+using ttml::core::distributed::CpSharding;
 
 struct Config {
     uint32_t batch = 1U;
@@ -46,7 +46,8 @@ xt::xarray<float> zigzag_permute(const xt::xarray<float>& x, uint32_t cp_size, b
     xt::xarray<float> out = xt::empty<float>(x.shape());
     for (size_t bh = 0; bh < B * H; ++bh) {
         for (size_t pos = 0; pos < S; ++pos) {
-            const size_t global = ttml::ops::distributed::zigzag_global_position(pos, S, cp_size);
+            const size_t global = ttml::core::distributed::cp_global_position(
+                ttml::core::distributed::CpSharding::ZigZag, pos, S, cp_size);
             const size_t from = to_device ? global : pos;
             const size_t to = to_device ? pos : global;
             std::copy_n(x.data() + (bh * S + from) * D, D, out.data() + (bh * S + to) * D);
@@ -104,7 +105,7 @@ struct RunResult {
 };
 
 RunResult run_layout(
-    RingAttentionLayout layout,
+    CpSharding layout,
     const std::string& name,
     uint32_t seq,
     const Config& cfg,
@@ -117,7 +118,7 @@ RunResult run_layout(
     const auto& pctx = autograd::ctx().get_parallelism_context();
     const uint32_t cp_axis = pctx.get_cp_axis().value();
     const uint32_t ring_size = pctx.get_cp_size();
-    const bool zigzag = layout == RingAttentionLayout::ZigZag;
+    const bool zigzag = layout == CpSharding::ZigZag;
     const auto to_device_order = [&](const xt::xarray<float>& x) {
         return zigzag ? zigzag_permute(x, ring_size, /*to_device=*/true) : x;
     };
@@ -233,7 +234,7 @@ int main(int argc, char** argv) {
         std::vector<std::pair<std::string, RunResult>> results;
         for (const std::string& name : cfg.layouts) {
             TT_FATAL(name == "contiguous" || name == "zigzag", "Unknown layout '{}'", name);
-            const auto layout = name == "zigzag" ? RingAttentionLayout::ZigZag : RingAttentionLayout::Contiguous;
+            const auto layout = name == "zigzag" ? CpSharding::ZigZag : CpSharding::Contiguous;
             auto result = run_layout(layout, name, seq, cfg, q_host, k_host, v_host, do_host);
             fmt::print(
                 "[RING_ATTN_BENCH] layout={} S={} S_local={} fw_ms={:.2f} bw_ms={:.2f} fw_all={{{:.2f}}} "

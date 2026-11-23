@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "core/distributed/ccl_resources.hpp"
+#include "core/distributed/cp_sharding.hpp"
 #include "core/distributed/socket_manager.hpp"
 #include "core/mesh_device.hpp"
 #include "core/tt_profiler.hpp"
@@ -25,6 +26,7 @@ struct DistributedConfig {
     bool enable_ddp = false;
     bool enable_tp = false;
     bool enable_cp = false;
+    core::distributed::CpSharding cp_sharding = core::distributed::CpSharding::Contiguous;
 };
 
 class ParallelismContext {
@@ -60,6 +62,9 @@ public:
     [[nodiscard]] const bool is_cp_enabled() const {
         return m_cp_axis.has_value();
     }
+    [[nodiscard]] core::distributed::CpSharding get_cp_sharding() const {
+        return m_cp_sharding;
+    }
 
 private:
     std::optional<uint32_t> m_ddp_axis = std::nullopt;
@@ -68,6 +73,7 @@ private:
     uint32_t m_num_cp_devices = 1U;
     uint32_t m_num_ddp_devices = 1U;
     uint32_t m_num_tp_devices = 1U;
+    core::distributed::CpSharding m_cp_sharding = core::distributed::CpSharding::Contiguous;
 };
 
 class AutoContext {

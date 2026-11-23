@@ -82,8 +82,9 @@ PipelineParallelLlama::PipelineParallelLlama(
     fmt::print("    Positional embedding type: RoPE\n");
     fmt::print("    Runner type: {}\n", runner_type == RunnerType::Default ? "Default" : "Memory efficient");
     fmt::print("    Theta: {}\n", theta);
-    if (config.cp_layout != ops::distributed::RingAttentionLayout::Contiguous) {
-        throw std::logic_error("cp_layout: zigzag is not supported with pipeline parallelism");
+    if (autograd::ctx().is_parallelism_context_initialized() &&
+        autograd::ctx().get_parallelism_context().get_cp_sharding() != core::distributed::CpSharding::Contiguous) {
+        throw std::logic_error("Zig-zag CP sharding is not supported with pipeline parallelism");
     }
 
     fmt::println("  Pipeline parallel configuration:");

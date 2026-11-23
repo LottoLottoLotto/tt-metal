@@ -431,7 +431,7 @@ autograd::TensorPtr ring_attention_sdpa(
     const std::optional<autograd::TensorPtr>& mask,
     const ttml::metal::AttentionMaskType mask_type,
     const bool reuse_forward_kv,
-    const RingAttentionLayout layout) {
+    const std::optional<core::distributed::CpSharding> cp_sharding) {
     if (!autograd::ctx().is_parallelism_context_initialized() ||
         !autograd::ctx().get_parallelism_context().is_cp_enabled()) {
         return ttml::ops::scaled_dot_product_attention(query, key, value, mask);
@@ -450,10 +450,10 @@ autograd::TensorPtr ring_attention_sdpa(
         mask_type != ttml::metal::AttentionMaskType::Arbitrary,
         "Arbitrary attention mask is not supported in CP mode, use None or Causal");
 
-    if (layout == RingAttentionLayout::ZigZag) {
+    if (cp_sharding.value_or(pctx.get_cp_sharding()) == core::distributed::CpSharding::ZigZag) {
         TT_FATAL(
             mask_type == ttml::metal::AttentionMaskType::Causal,
-            "The zig-zag CP layout balances causal attention; use the contiguous layout without a causal mask");
+            "Zig-zag CP sharding balances causal attention; use contiguous CP sharding without a causal mask");
         return ring_attention_sdpa_zigzag(query, key, value, ring_size, cp_axis_value, reuse_forward_kv);
     }
 

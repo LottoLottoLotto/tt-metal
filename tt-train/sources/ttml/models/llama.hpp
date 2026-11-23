@@ -13,7 +13,6 @@
 #include "modules/llama_block.hpp"
 #include "modules/module_base.hpp"
 #include "modules/rms_norm_module.hpp"
-#include "ops/distributed/ring_attention_utils.hpp"
 #include "ops/rope_op.hpp"
 #include "yaml-cpp/yaml.h"
 
@@ -39,8 +38,6 @@ struct LlamaConfig {
     float high_freq_factor = 4.0F;
     float low_freq_factor = 1.0F;
     uint32_t original_context_length = 0U;
-    // ZigZag requires the training data in zig-zag order (ops::distributed::zigzag_global_position).
-    ops::distributed::RingAttentionLayout cp_layout = ops::distributed::RingAttentionLayout::Contiguous;
 };
 
 class Llama : public BaseTransformer {

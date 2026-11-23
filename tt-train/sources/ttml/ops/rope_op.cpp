@@ -346,11 +346,7 @@ ttnn::Tensor gen_trans_mat() {
 }
 
 RotaryEmbeddingParams build_rope_params(
-    uint32_t sequence_length,
-    uint32_t head_dim,
-    float theta,
-    RopeScalingParams scaling_params,
-    distributed::RingAttentionLayout cp_layout) {
+    uint32_t sequence_length, uint32_t head_dim, float theta, RopeScalingParams scaling_params) {
     if (head_dim % 32U != 0U) {
         throw std::invalid_argument(fmt::format("RoPE head_dim must be divisible by 32, but is {}", head_dim));
     }
@@ -382,16 +378,15 @@ RotaryEmbeddingParams build_rope_params(
 
             auto* device = &autograd::ctx().get_device();
             mapper = ttnn::distributed::shard_tensor_to_mesh_mapper(*device, /*dim=*/2, cp_axis.value());
-            if (cp_layout == distributed::RingAttentionLayout::ZigZag) {
-                TT_FATAL(
-                    sequence_length % (2U * cp_size) == 0,
-                    "The zig-zag CP layout needs sequence_length ({}) divisible by 2 * cp_size ({})",
-                    sequence_length,
-                    2U * cp_size);
-                for (uint32_t i = 0; i < sequence_length; ++i) {
-                    positions(i) =
-                        static_cast<float>(distributed::zigzag_global_position(i, sequence_length, cp_size));
-                }
+            const auto sharding = pctx.get_cp_sharding();
+            TT_FATAL(
+                sharding == core::distributed::CpSharding::Contiguous || sequence_length % (2U * cp_size) == 0,
+                "Zig-zag CP sharding needs sequence_length ({}) divisible by 2 * cp_size ({})",
+                sequence_length,
+                2U * cp_size);
+            for (uint32_t i = 0; i < sequence_length; ++i) {
+                positions(i) =
+                    static_cast<float>(core::distributed::cp_global_position(sharding, i, sequence_length, cp_size));
             }
         }
     }

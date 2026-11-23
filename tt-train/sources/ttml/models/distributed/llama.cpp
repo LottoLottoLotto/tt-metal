@@ -71,11 +71,6 @@ DistributedLlama::DistributedLlama(const LlamaConfig& config) {
     fmt::print("    Positional embedding type: RoPE\n");
     fmt::print("    Runner type: {}\n", runner_type == RunnerType::Default ? "Default" : "Memory efficient");
     fmt::print("    Theta: {}\n", theta);
-    const bool cp_zigzag = config.cp_layout == ops::distributed::RingAttentionLayout::ZigZag;
-    fmt::print("    CP layout: {}\n", cp_zigzag ? "zigzag" : "contiguous");
-    if (cp_zigzag && !(pctx.is_cp_enabled() && pctx.get_cp_size() > 1U)) {
-        throw std::logic_error("cp_layout: zigzag requires context parallelism (enable_cp with more than one CP device)");
-    }
 
     uint32_t vocab_size_divisible_by_32 = (vocab_size + 31) / 32 * 32;
     if (max_sequence_length % 32 != 0) {
@@ -111,12 +106,11 @@ DistributedLlama::DistributedLlama(const LlamaConfig& config) {
         /*sequence_length=*/max_sequence_length,
         /*head_dim=*/embedding_dim / num_heads,
         /*theta=*/theta,
-        /*rope_scaling_params=*/rope_scaling_params,
-        /*cp_layout=*/config.cp_layout);
+        /*rope_scaling_params=*/rope_scaling_params);
     blocks.reserve(num_blocks);
     for (uint32_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
         blocks.push_back(std::make_shared<modules::distributed::DistributedLlamaBlock>(
-            embedding_dim, num_heads, num_groups, m_rope_params, dropout_prob, intermediate_dim, config.cp_layout));
+            embedding_dim, num_heads, num_groups, m_rope_params, dropout_prob, intermediate_dim));
     }
     ln_fc = std::make_shared<ttml::modules::RMSNormLayer>(embedding_dim);
     if (use_tp) {

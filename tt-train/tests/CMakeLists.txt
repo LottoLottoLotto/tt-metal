@@ -57,6 +57,7 @@ set(SOURCES
     ops/layernorm_composite_test.cpp
     ops/distributed/comm_ops_test.cpp
     ops/distributed/ring_shift_test.cpp
+    ops/distributed/cp_sharding_test.cpp
     ops/distributed/ring_sdpa_test.cpp
     ops/distributed/ring_sdpa_schedule_test.cpp
     ops/distributed/ring_attention_merge_test.cpp

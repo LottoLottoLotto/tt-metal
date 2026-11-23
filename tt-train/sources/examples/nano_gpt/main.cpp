@@ -237,6 +237,7 @@ struct DeviceConfig {
     bool enable_ddp = false;
     bool enable_tp = false;
     bool enable_cp = false;
+    ttml::core::distributed::CpSharding cp_sharding = ttml::core::distributed::CpSharding::Contiguous;
 };
 
 DeviceConfig parse_device_config(const YAML::Node &yaml_config) {
@@ -249,6 +250,12 @@ DeviceConfig parse_device_config(const YAML::Node &yaml_config) {
     config.enable_ddp = device_node["enable_ddp"].as<bool>(false);
     config.enable_tp = device_node["enable_tp"].as<bool>(false);
     config.enable_cp = device_node["enable_cp"].as<bool>(false);
+    const auto cp_sharding = device_node["cp_sharding"].as<std::string>("contiguous");
+    if (cp_sharding != "contiguous" && cp_sharding != "zigzag") {
+        throw std::runtime_error(fmt::format("cp_sharding must be 'contiguous' or 'zigzag', got '{}'", cp_sharding));
+    }
+    config.cp_sharding = cp_sharding == "zigzag" ? ttml::core::distributed::CpSharding::ZigZag
+                                                 : ttml::core::distributed::CpSharding::Contiguous;
 
     auto mesh_shape_node = device_node["mesh_shape"];
     bool multidevice = config.enable_ddp || config.enable_tp || config.enable_cp;
@@ -437,6 +444,9 @@ int main(int argc, char **argv) {
         fmt::println("Device config:");
         fmt::println("  Tensor parallel enabled: {}", device_config.enable_tp);
         fmt::println("  Context parallel enabled: {}", device_config.enable_cp);
+        fmt::println(
+            "  CP sharding: {}",
+            device_config.cp_sharding == ttml::core::distributed::CpSharding::ZigZag ? "zigzag" : "contiguous");
         fmt::println("  Distributed data-parallel enabled: {}", device_config.enable_ddp);
         fmt::println("  Mesh shape: {}", device_config.mesh_shape);
         fmt::println("  Device IDs: {}", device_config.device_ids);
@@ -444,7 +454,8 @@ int main(int argc, char **argv) {
         ttml::autograd::ctx().initialize_parallelism_context(
             {.enable_ddp = device_config.enable_ddp,
              .enable_tp = device_config.enable_tp,
-             .enable_cp = device_config.enable_cp});
+             .enable_cp = device_config.enable_cp,
+             .cp_sharding = device_config.cp_sharding});
     }
 
     if (multihost_config.enable_mpi) {
@@ -566,11 +577,8 @@ int main(int argc, char **argv) {
     CachedHostData cached_data;
 
     uint32_t zigzag_cp_size = 0U;
-    if (const auto *llama_config = std::get_if<ttml::models::llama::LlamaConfig>(&model_config.transformer_config);
-        llama_config != nullptr && llama_config->cp_layout == ttml::ops::distributed::RingAttentionLayout::ZigZag) {
-        if (!is_pctx_initialized() || !ttml::autograd::ctx().get_parallelism_context().is_cp_enabled()) {
-            throw std::runtime_error("cp_layout: zigzag requires device_config.enable_cp");
-        }
+    if (is_pctx_initialized() && ttml::autograd::ctx().get_parallelism_context().get_cp_sharding() ==
+                                     ttml::core::distributed::CpSharding::ZigZag) {
         zigzag_cp_size = ttml::autograd::ctx().get_parallelism_context().get_cp_size();
     }
 
@@ -589,8 +597,8 @@ int main(int argc, char **argv) {
             for (auto &[features, target_span] : samples) {
                 if (zigzag_cp_size > 0U) {
                     for (uint32_t pos = 0; pos < sequence_length; ++pos) {
-                        const uint32_t global =
-                            ttml::ops::distributed::zigzag_global_position(pos, sequence_length, zigzag_cp_size);
+                        const uint32_t global = ttml::core::distributed::cp_global_position(
+                            ttml::core::distributed::CpSharding::ZigZag, pos, sequence_length, zigzag_cp_size);
                         data.push_back(features[global]);
                         targets.push_back(target_span[global]);
                     }

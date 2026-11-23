@@ -294,7 +294,8 @@ static xt::xarray<float> zigzag_permute(const xt::xarray<float>& x, uint32_t cp_
     xt::xarray<float> out = xt::empty<float>(x.shape());
     for (size_t bh = 0; bh < B * H; ++bh) {
         for (size_t pos = 0; pos < S; ++pos) {
-            const size_t global = ttml::ops::distributed::zigzag_global_position(pos, S, cp_size);
+            const size_t global = ttml::core::distributed::cp_global_position(
+                ttml::core::distributed::CpSharding::ZigZag, pos, S, cp_size);
             const size_t from = to_device ? global : pos;
             const size_t to = to_device ? pos : global;
             std::copy_n(x.data() + (bh * S + from) * D, D, out.data() + (bh * S + to) * D);
@@ -311,10 +312,10 @@ static void TestRingAttention(
     const bool test_backward = false,
     const float rtol = 1e-2F,
     const float atol = 5e-1F,
-    const ttml::ops::distributed::RingAttentionLayout layout =
-        ttml::ops::distributed::RingAttentionLayout::Contiguous) {
+    const ttml::core::distributed::CpSharding layout =
+        ttml::core::distributed::CpSharding::Contiguous) {
     using namespace ttml;
-    const bool zigzag = layout == ops::distributed::RingAttentionLayout::ZigZag;
+    const bool zigzag = layout == core::distributed::CpSharding::ZigZag;
 
     auto* device = &autograd::ctx().get_device();
     auto mesh_shape = device->shape();
@@ -549,7 +550,7 @@ TEST_F(GalaxyRingSDPATest, LargerSequenceCausalMaskBackward) {
 // Backward with the forward's K/V handles must give the very same bits as re-shifting K/V:
 // a ring shift only moves data, so both paths feed identical tensors to the kernels.
 static void ExpectReuseMatchesReshiftBitExact(
-    const size_t seq_len, const ttml::ops::distributed::RingAttentionLayout layout) {
+    const size_t seq_len, const ttml::core::distributed::CpSharding layout) {
     using namespace ttml;
 
     auto* device = &autograd::ctx().get_device();
@@ -595,7 +596,7 @@ static void ExpectReuseMatchesReshiftBitExact(
 }
 
 TEST_F(GalaxyRingSDPATest, ReuseMatchesReshiftBitExact) {
-    ExpectReuseMatchesReshiftBitExact(/*seq_len=*/256, ttml::ops::distributed::RingAttentionLayout::Contiguous);
+    ExpectReuseMatchesReshiftBitExact(/*seq_len=*/256, ttml::core::distributed::CpSharding::Contiguous);
 }
 
 // CP8 zig-zag fw+bw matches non-ring causal SDPA on inputs permuted into zig-zag order.
@@ -608,7 +609,7 @@ TEST_F(GalaxyRingSDPATest, ZigZagCausalMaskBackward) {
         /*test_backward=*/true,
         /*rtol=*/1e-2F,
         /*atol=*/5e-1F,
-        ttml::ops::distributed::RingAttentionLayout::ZigZag);
+        ttml::core::distributed::CpSharding::ZigZag);
 }
 
 // Same with batch 2, 8 heads and 512 rows per device.
@@ -621,12 +622,12 @@ TEST_F(GalaxyRingSDPATest, ZigZagLargerBatchSequenceBackward) {
         /*test_backward=*/true,
         /*rtol=*/1e-2F,
         /*atol=*/5e-1F,
-        ttml::ops::distributed::RingAttentionLayout::ZigZag);
+        ttml::core::distributed::CpSharding::ZigZag);
 }
 
 // Zig-zag backward gives bit-identical grads with kept forward K/V and with re-shifted K/V.
 TEST_F(GalaxyRingSDPATest, ZigZagReuseMatchesReshiftBitExact) {
-    ExpectReuseMatchesReshiftBitExact(/*seq_len=*/1024, ttml::ops::distributed::RingAttentionLayout::ZigZag);
+    ExpectReuseMatchesReshiftBitExact(/*seq_len=*/1024, ttml::core::distributed::CpSharding::ZigZag);
 }
 
 // CP2: step 0 is the diagonal block on both devices; at step 1 device 0 skips (its K/V come from later in the
@@ -669,5 +670,5 @@ TEST_F(Mesh1x2RingSDPATest, ZigZagBackward) {
         /*test_backward=*/true,
         /*rtol=*/1e-2F,
         /*atol=*/5e-1F,
-        ttml::ops::distributed::RingAttentionLayout::ZigZag);
+        ttml::core::distributed::CpSharding::ZigZag);
 }

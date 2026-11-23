@@ -5,9 +5,9 @@
 #pragma once
 
 #include "autograd/tensor.hpp"
+#include "core/distributed/cp_sharding.hpp"
 #include "metal/ops/ring_sdpa_bw/ring_sdpa_bw.hpp"
 #include "metal/ops/ring_sdpa_fw/ring_sdpa_fw.hpp"
-#include "ops/distributed/ring_attention_utils.hpp"
 
 namespace ttml::ops::distributed {
 
@@ -45,7 +45,8 @@ namespace ttml::ops::distributed {
  *             Costs 2 * (cp_size - 2) K-sized tensors per device, held until this node's backward has run.
  *             Pass false when those copies, summed over all layers, do not fit; the memory-efficient runner
  *             already limits them to one block at a time.
- * @param layout ZigZag requires mask_type Causal, S_local % 64 == 0, and tokens and RoPE positions in zig-zag order.
+ * @param cp_sharding How the sequence is split over the CP axis; nullopt takes the ParallelismContext's.
+ *             ZigZag requires mask_type Causal, S_local % 64 == 0, and tokens in zig-zag order.
  * @return Attention output tensor (B, H, S_local, D)
  *
  * Note: KV is passed in the ring (rather than Q) because in GQA, num_groups << num_heads,
@@ -58,6 +59,6 @@ autograd::TensorPtr ring_attention_sdpa(
     const std::optional<autograd::TensorPtr>& mask = std::nullopt,
     const ttml::metal::AttentionMaskType mask_type = ttml::metal::AttentionMaskType::Causal,
     bool reuse_forward_kv = true,
-    RingAttentionLayout layout = RingAttentionLayout::Contiguous);
+    std::optional<core::distributed::CpSharding> cp_sharding = std::nullopt);
 
 }  // namespace ttml::ops::distributed
