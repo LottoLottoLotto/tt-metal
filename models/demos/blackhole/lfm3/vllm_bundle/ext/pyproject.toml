@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: © 2026 Lottolabs
+# SPDX-License-Identifier: Apache-2.0
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lfm3-vllm-config"
+version = "1.0"
+description = "LFM3 config class for vLLM without remote code (vLLM general plugin)"
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+lfm3_config = "lfm3_vllm_config:register"
+
+[tool.setuptools]
+py-modules = ["lfm3_vllm_config"]
