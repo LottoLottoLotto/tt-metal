@@ -317,8 +317,19 @@ void kernel_main() {
                         PACK((pack_reconfig_data_format(mm_partials_dfb_id)));
                     }
 
+#ifdef QWEN_GATEUP_PIPELINE_INSTRUMENT
+                    {
+                        DeviceZoneScopedN("QWEN_COMPUTE_WAIT_IN0");
+                        in0_dfb.wait_front(in0_block_num_tiles);
+                    }
+                    {
+                        DeviceZoneScopedN("QWEN_COMPUTE_WAIT_IN1");
+                        in1_dfb.wait_front(in1_block_num_tiles);
+                    }
+#else
                     in0_dfb.wait_front(in0_block_num_tiles);
                     in1_dfb.wait_front(in1_block_num_tiles);
+#endif
 
                     int in0_index_subblock_offset = 0;
                     for (uint32_t in0_subblock = 0; in0_subblock < in0_num_subblocks; in0_subblock++) {
@@ -355,6 +366,10 @@ void kernel_main() {
                             uint32_t in0_index = in0_index_subblock_offset;  // offset into in0 block
                             uint32_t in1_index = in1_index_subblock_offset;  // offset into in1 block
                             // inner dim that we accumulate is the inner dim of in0/in1, which is in0_block_w
+#ifdef QWEN_GATEUP_PIPELINE_INSTRUMENT
+                            {
+                                DeviceZoneScopedN("QWEN_BF4_UNPACK_MATMUL");
+#endif
                             for (uint32_t inner_dim_idx = 0; inner_dim_idx < in0_block_w; ++inner_dim_idx) {
                                 // matmul outer product of (out_subblock_h x out_subblock_w) tiles that fill dst
                                 // accumulation is done by iterating matmul_block across inner dim
@@ -374,6 +389,9 @@ void kernel_main() {
                                 in1_index += in1_block_w;  // to stride down by 1 need to stride by in_per_core_w
                                                            // (should be called in1_block_w)
                             }
+#ifdef QWEN_GATEUP_PIPELINE_INSTRUMENT
+                            }
+#endif
 
 #endif  // SKIP_COMPUTE
 
@@ -405,6 +423,9 @@ void kernel_main() {
 #else
                                 PACK((llk_pack_reconfig_l1_acc(0)));
 #endif
+#endif
+#ifdef QWEN_GATEUP_PIPELINE_INSTRUMENT
+                                DeviceZoneScopedN("QWEN_OUTPUT_PACK");
 #endif
                                 uint32_t start_dst_index = 0;
                                 pack_block(start_dst_index, mm_out_dfb_id, out_subblock_num_tiles);
@@ -474,7 +495,14 @@ void kernel_main() {
 #endif
 
                     in0_dfb.pop_front(in0_block_num_tiles);
+#ifdef QWEN_GATEUP_PIPELINE_INSTRUMENT
+                    {
+                        DeviceZoneScopedN("QWEN_COMPUTE_POP_IN1");
+                        in1_dfb.pop_front(in1_block_num_tiles);
+                    }
+#else
                     in1_dfb.pop_front(in1_block_num_tiles);
+#endif
                 }
 
 #ifdef FUSE_BIAS

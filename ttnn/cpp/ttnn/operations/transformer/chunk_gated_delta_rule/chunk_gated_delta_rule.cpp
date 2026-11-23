@@ -31,6 +31,10 @@ namespace ttnn::transformer {
 
 namespace {
 
+ttnn::Tensor as_bf16_tensor(const ttnn::Tensor& t) {
+    return t.dtype() == DataType::BFLOAT16 ? t : ttnn::typecast(t, DataType::BFLOAT16);
+}
+
 // [B,T,Hh,D] -> [B*Hh, T, D], TILE bf16 (head-major).
 ttnn::Tensor head_split_tile(const ttnn::Tensor& x, uint32_t B, uint32_t T, uint32_t Hh, uint32_t D) {
     // TILE-native head-split (permute on TILE via the transpose engine — avoids the
@@ -55,6 +59,18 @@ ttnn::Tensor headvec_split_tile(const ttnn::Tensor& x, uint32_t B, uint32_t T, u
     t = ttnn::permute(t, ttnn::SmallVector<int64_t>{0, 2, 1});  // [B, Hn, T] TILE
     t = ttnn::reshape(t, ttnn::Shape({B * Hn, T}));             // [BH, T] TILE
     return t;
+}
+
+// Keep the head axis outside the two tiled dimensions. In particular, 48
+// heads must become 48 scalar tiles, not a padded [64,32] head-by-time matrix.
+ttnn::Tensor headvec_split_recurrent(const ttnn::Tensor& x, uint32_t B, uint32_t Hn) {
+    auto t = x.dtype() == DataType::BFLOAT16 ? x : ttnn::typecast(x, DataType::BFLOAT16);
+    if (t.logical_shape() == ttnn::Shape({B * Hn, 1, 1})) {
+        return t;
+    }
+    t = ttnn::reshape(t, ttnn::Shape({B, 1, 1, Hn}));
+    t = ttnn::permute(t, ttnn::SmallVector<int64_t>{0, 3, 1, 2});
+    return ttnn::reshape(t, ttnn::Shape({B * Hn, 1, 1}));
 }
 
 // Pad TILE [BH, T, D] to [BH, L, D] along the time dim with zeros.
@@ -144,7 +160,10 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_gated_delta_rule(
     const std::optional<ttnn::Tensor>& eye,
     const std::optional<ttnn::Tensor>& tril,
     const std::optional<ttnn::Tensor>& ones,
-    const std::optional<ttnn::Tensor>& masks) {
+    const std::optional<ttnn::Tensor>& masks,
+    bool fuse_decode_frontend,
+    const std::optional<ttnn::Tensor>& decay_bias,
+    const std::optional<ttnn::Tensor>& decay_scale) {
     TT_FATAL(!use_qk_l2norm, "chunk_gated_delta_rule: use_qk_l2norm not yet supported; pre-normalize q/k on host");
 
     auto* dev = q_in.device();
@@ -175,6 +194,67 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_gated_delta_rule(
     const uint32_t pad = (C - (T % C)) % C;
     const uint32_t L = T + pad;
     const uint32_t NC = L / C;
+    const bool fused_recurrent = T == 1 && [] {
+        const char* value = std::getenv("QWEN_GDN_RECURRENT_FUSED");
+        return value != nullptr && value[0] == '1';
+    }();
+    // Batch-one fused-frontend decode: q/k/v [1,1,HV,D] (already GQA-expanded by the
+    // frontend) and raw a/b [1,1,HV] feed the recurrence as-is; its reader gathers
+    // each head's row, so none of the head-split permutes below run.
+    if (fused_recurrent && fuse_decode_frontend && B == 1 && !flat_qk && !flat_v && H == HV) {
+        TT_FATAL(initial_state.has_value(), "fused recurrent decode requires an explicit state tensor");
+        TT_FATAL(
+            decay_bias.has_value() && decay_scale.has_value(),
+            "fused decode front end requires decay_bias and decay_scale");
+        auto as_rows = [&](const ttnn::Tensor& t, uint32_t D) {
+            return ttnn::reshape(as_bf16_tensor(t), ttnn::Shape({1, 1, HV, D}));
+        };
+        auto as_scalars = [&](const ttnn::Tensor& t) {
+            return ttnn::reshape(as_bf16_tensor(t), ttnn::Shape({1, 1, HV}));
+        };
+        ttnn::Tensor state = *initial_state;
+        TT_FATAL(
+            state.dtype() == DataType::BFLOAT16 && state.layout() == Layout::ROW_MAJOR &&
+                state.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED &&
+                state.memory_config().buffer_type() == BufferType::L1,
+            "fused recurrent decode requires compact BF16 row-major height-sharded live L1 state");
+        TT_FATAL(
+            state.logical_shape() == ttnn::Shape({B, HV, K, V}) || state.logical_shape() == ttnn::Shape({BH, K, V}),
+            "fused recurrent decode state shape must match [B,HV,K,V]");
+        state = ttnn::reshape(state, ttnn::Shape({BH, K, V}));
+        const auto kernel_cfg = init_device_compute_kernel_config(
+            dev->arch(),
+            compute_kernel_config,
+            MathFidelity::HiFi2,
+            /*default_approx_mode=*/false,
+            /*default_fp32_acc=*/true,
+            /*default_l1_acc=*/true);
+        auto results = ttnn::prim::recurrent_gated_delta_rule(
+            as_rows(q_in, K),
+            as_rows(k_in, K),
+            as_rows(v_in, V),
+            as_scalars(g_in),
+            as_scalars(beta_in),
+            /*fuse_decode_frontend=*/true,
+            headvec_split_recurrent(*decay_bias, 1, HV),
+            headvec_split_recurrent(*decay_scale, 1, HV),
+            ones,
+            state,
+            memory_config.value_or(ttnn::L1_MEMORY_CONFIG),
+            kernel_cfg,
+            /*gather_head_rows=*/true);
+        std::optional<ttnn::Tensor> final_opt;
+        if (output_final_state) {
+            final_opt = ttnn::reshape(results[1], ttnn::Shape({B, HV, K, V}));
+        }
+        if (output_head_major) {
+            return {results[0], final_opt};
+        }
+        ttnn::Tensor o = ttnn::to_layout(results[0], Layout::ROW_MAJOR);
+        o = ttnn::reshape(o, ttnn::Shape({B, HV, T, V}));
+        o = ttnn::permute(o, ttnn::SmallVector<int64_t>{0, 2, 1, 3});
+        return {o, final_opt};
+    }
 
     // Head-split (row-major fp32). OPT-A: flat q/k stay token-major [B,T,H*K] (just bf16-cast); the
     // prep reader tile-addresses head hk's chunk c and does the GQA head-map itself.
@@ -187,8 +267,10 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_gated_delta_rule(
     // Otherwise head-split to [BH,T,V] as usual.
     ttnn::Tensor v = flat_v ? (v_in.dtype() != DataType::BFLOAT16 ? ttnn::typecast(v_in, DataType::BFLOAT16) : v_in)
                             : head_split_tile(v_in, B, T, HV, V);
-    ttnn::Tensor g = headvec_split_tile(g_in, B, T, HV);        // [B*HV, T] TILE
-    ttnn::Tensor beta = headvec_split_tile(beta_in, B, T, HV);  // [B*HV, T] TILE
+    ttnn::Tensor g = fused_recurrent ? headvec_split_recurrent(g_in, B, HV)
+                                    : headvec_split_tile(g_in, B, T, HV);
+    ttnn::Tensor beta = fused_recurrent ? headvec_split_recurrent(beta_in, B, HV)
+                                       : headvec_split_tile(beta_in, B, T, HV);
 
     // GQA expand q,k from H heads to HV heads (repeat_interleave along head-major dim 0).
     // OPT-A: for flat q/k the reader maps value-head hv -> key-head hk=hv/G at read time, so no expand.
@@ -202,9 +284,72 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_gated_delta_rule(
     // in flat" (Ct==1 only; the in-kernel norm uses cb_supd/cb_stmp, free only at chunk_size==32). When
     // NOT flat, q/k are already host-normalized, so we fold scale into q here as before.
     const bool qk_norm = flat_qk && (C == 32);
-    if (!qk_norm) {
+    if (!qk_norm && !fuse_decode_frontend) {
         q = ttnn::multiply(q, scale);
     }
+    if (fused_recurrent) {
+        TT_FATAL(initial_state.has_value(), "fused recurrent decode requires an explicit state tensor");
+        TT_FATAL(!flat_qk && !flat_v, "fused recurrent decode requires rank-4 q/k/v tensors");
+        const auto& g_bf16 = g;
+        const auto& beta_bf16 = beta;
+        std::optional<ttnn::Tensor> decay_bias_bf16;
+        std::optional<ttnn::Tensor> decay_scale_bf16;
+        if (fuse_decode_frontend) {
+            TT_FATAL(B == 1, "fused decode front end currently requires batch size 1");
+            TT_FATAL(
+                decay_bias.has_value() && decay_scale.has_value(),
+                "fused decode front end requires decay_bias and decay_scale");
+            decay_bias_bf16 = headvec_split_recurrent(*decay_bias, 1, HV);
+            decay_scale_bf16 = headvec_split_recurrent(*decay_scale, 1, HV);
+        }
+        ttnn::Tensor state = *initial_state;
+        TT_FATAL(
+            state.dtype() == DataType::BFLOAT16 && state.layout() == Layout::ROW_MAJOR &&
+                state.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED &&
+                state.memory_config().buffer_type() == BufferType::L1,
+            "fused recurrent decode requires compact BF16 row-major height-sharded live L1 state");
+        TT_FATAL(
+            state.logical_shape() == ttnn::Shape({B, HV, K, V}) ||
+                state.logical_shape() == ttnn::Shape({BH, K, V}),
+            "fused recurrent decode state shape must match [B,HV,K,V]");
+        state = ttnn::reshape(state, ttnn::Shape({BH, K, V}));
+
+        const auto out_mem = memory_config.value_or(ttnn::L1_MEMORY_CONFIG);
+        const auto kernel_cfg = init_device_compute_kernel_config(
+            dev->arch(),
+            compute_kernel_config,
+            MathFidelity::HiFi2,
+            /*default_approx_mode=*/false,
+            /*default_fp32_acc=*/true,
+            /*default_l1_acc=*/true);
+        auto results = ttnn::prim::recurrent_gated_delta_rule(
+            q,
+            k,
+            v,
+            g_bf16,
+            beta_bf16,
+            fuse_decode_frontend,
+            decay_bias_bf16,
+            decay_scale_bf16,
+            ones,
+            state,
+            out_mem,
+            kernel_cfg);
+
+        std::optional<ttnn::Tensor> final_opt;
+        if (output_final_state) {
+            final_opt = ttnn::reshape(results[1], ttnn::Shape({B, HV, K, V}));
+        }
+        if (output_head_major) {
+            return {results[0], final_opt};
+        }
+
+        ttnn::Tensor o = ttnn::to_layout(results[0], Layout::ROW_MAJOR);
+        o = ttnn::reshape(o, ttnn::Shape({B, HV, T, V}));
+        o = ttnn::permute(o, ttnn::SmallVector<int64_t>{0, 2, 1, 3});
+        return {o, final_opt};
+    }
+
 
     // Pad time to a multiple of C (q/k/v are TILE; g/beta are RM). Flat tensors require pad==0
     // (asserted below), so no padding for the flat q/k/v.
@@ -378,6 +523,39 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_gated_delta_rule(
     // NOTE: returned in ROW_MAJOR. Tilizing [B,T,HV,V] with HV in the tile dim is avoided
     // here (a TILE round-trip on the small HV tile-dim was problematic); callers can tilize.
     return {o, final_opt};
+}
+
+std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor> verify_two_gated_delta_rule(
+    const ttnn::Tensor& q,
+    const ttnn::Tensor& k,
+    const ttnn::Tensor& v,
+    const ttnn::Tensor& a,
+    const ttnn::Tensor& b,
+    const ttnn::Tensor& decay_bias,
+    const ttnn::Tensor& decay_scale,
+    const ttnn::Tensor& norm_ones,
+    const ttnn::Tensor& state) {
+    auto* dev = q.device();
+    const auto kernel_cfg = init_device_compute_kernel_config(
+        dev->arch(),
+        std::nullopt,
+        MathFidelity::HiFi2,
+        /*default_approx_mode=*/false,
+        /*default_fp32_acc=*/true,
+        /*default_l1_acc=*/true);
+    auto results = ttnn::prim::verify_two_gated_delta_rule(
+        q,
+        k,
+        v,
+        a,
+        b,
+        decay_bias,
+        decay_scale,
+        norm_ones,
+        state,
+        ttnn::L1_MEMORY_CONFIG,
+        kernel_cfg);
+    return {std::move(results[0]), std::move(results[1]), std::move(results[2])};
 }
 
 }  // namespace ttnn::transformer

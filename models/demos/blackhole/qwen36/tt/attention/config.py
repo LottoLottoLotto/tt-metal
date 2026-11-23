@@ -1,6 +1,14 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
+import os
+
+
+def optimized_27b_attention():
+    return (
+        os.environ.get("QWEN36_OPTIMIZED_27B") == "1"
+        and os.environ.get("QWEN36_GENERIC_BASELINE") != "1"
+    )
 
 
 @dataclass(frozen=True)

@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
+import os
+
 import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.tt_transformers.tt.common import Mode
@@ -61,6 +63,15 @@ class RMSNorm(LightweightModule):
         self.is_distributed = is_distributed
         self.ccl_topology = ccl_topology
         self.tt_ccl = tt_ccl
+        # The single-P150 27B runtime keeps recurrent state resident in L1.
+        # Bound every interleaved full-hidden norm here, not just decoder
+        # layers: final prefill norms and MTP's framework norms share this path.
+        self._bounded_27b_norm = (
+            dim == 5120
+            and not is_distributed
+            and os.environ.get("QWEN36_OPTIMIZED_27B") == "1"
+            and os.environ.get("QWEN36_GENERIC_BASELINE") != "1"
+        )
 
         if state_dict_prefix:
             weight_name = f"{state_dict_prefix}{weight_key}.weight"
@@ -143,7 +154,7 @@ class RMSNorm(LightweightModule):
 
         # If input is sharded do sharded RMSNorm and optionally return sharded output
         program_config = sharded_program_config if in_sharded else None
-        memory_config = sharded_output_config if out_sharded else None
+        memory_config = sharded_output_config if out_sharded else output_mem_config
         distributed = self.is_distributed and self.is_distributed(mode)
         weight = self.weight_distributed if distributed else self.weight
 
@@ -160,6 +171,10 @@ class RMSNorm(LightweightModule):
                 compute_kernel_config=self.compute_kernel_config_hifi2,
                 output_memory_config=distributed_out_mc,
             )
+        elif self._bounded_27b_norm and not in_sharded:
+            from models.demos.blackhole.qwen36.tt.rms_norm import bounded_rms_norm
+
+            x = bounded_rms_norm(x, weight, self.eps, self.compute_kernel_config_hifi2)
         else:
             x = ttnn.rms_norm(
                 x,
@@ -173,7 +188,7 @@ class RMSNorm(LightweightModule):
         if in_sharded and not out_sharded:
             return ttnn.sharded_to_interleaved(x)
         else:
-            if output_mem_config is not None:
+            if output_mem_config is not None and x.memory_config() != output_mem_config:
                 x = ttnn.to_memory_config(x, output_mem_config)
             return x
 

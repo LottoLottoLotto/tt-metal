@@ -8,6 +8,7 @@
 
 #include "chunk_gated_delta_rule_program_factory.hpp"
 
+#include <bit>
 #include <algorithm>
 #include <set>
 #include <vector>
@@ -200,6 +201,318 @@ tt::tt_metal::ProgramDescriptor ChunkGatedDeltaRuleProgramFactory::create_descri
             core, {h, NC, q_buf, k_buf, v_buf, g_buf, beta_buf, eye_buf, tril_buf, ones_buf, s0_buf});
         writer.emplace_runtime_args(core, {h, NC, o_buf, fs_buf});
         compute.emplace_runtime_args(core, {NC});
+    }
+
+    desc.kernels.push_back(std::move(reader));
+    desc.kernels.push_back(std::move(writer));
+    desc.kernels.push_back(std::move(compute));
+    return desc;
+}
+
+tt::tt_metal::ProgramDescriptor RecurrentGatedDeltaRuleProgramFactory::create_descriptor(
+    const RecurrentGatedDeltaRuleParams& attrs,
+    const RecurrentGatedDeltaRuleInputs& in,
+    std::vector<Tensor>& outputs) {
+    const uint32_t BH = attrs.BH;
+    const uint32_t Kt = attrs.key_dim / TILE_WIDTH;
+    const uint32_t Vt = attrs.val_dim / TILE_WIDTH;
+    const uint32_t kv = Kt * Vt;
+    const tt::DataFormat df = tt::DataFormat::Float16_b;
+
+    auto* device = in.q.device();
+    const CoreCoord grid = device->compute_with_storage_grid_size();
+    TT_FATAL(BH <= grid.x * grid.y, "num_heads {} exceeds compute cores {}", BH, grid.x * grid.y);
+
+    std::vector<CoreCoord> head_cores(BH);
+    std::set<CoreRange> core_set;
+    for (uint32_t h = 0; h < BH; h++) {
+        head_cores[h] = CoreCoord{h / grid.y, h % grid.y};
+        core_set.insert(CoreRange{head_cores[h], head_cores[h]});
+    }
+    CoreRangeSet cores{core_set};
+
+    ProgramDescriptor desc;
+    auto add_cb = [&](uint32_t idx, uint32_t tiles) {
+        const uint32_t ts = tt::tile_size(df);
+        desc.cbs.push_back(CBDescriptor{
+            .total_size = tiles * ts,
+            .core_ranges = cores,
+            .format_descriptors = {
+                {CBFormatDescriptor{.buffer_index = static_cast<uint8_t>(idx), .data_format = df, .page_size = ts}}}});
+    };
+    auto add_aliased_cbs = [&](std::initializer_list<uint32_t> indices, uint32_t tiles) {
+        const uint32_t ts = tt::tile_size(df);
+        CBDescriptor::FormatDescriptors formats;
+        formats.reserve(indices.size());
+        for (const uint32_t idx : indices) {
+            formats.push_back(CBFormatDescriptor{
+                .buffer_index = static_cast<uint8_t>(idx), .data_format = df, .page_size = ts});
+        }
+        desc.cbs.push_back(CBDescriptor{
+            .total_size = tiles * ts, .core_ranges = cores, .format_descriptors = std::move(formats)});
+    };
+
+    add_cb(0, Kt);   // q
+    add_cb(1, Kt);   // k
+    add_cb(2, Vt);   // v
+    add_cb(3, 1);    // g or raw a
+    add_cb(4, 1);    // beta or raw b
+    // The input state is consumed before the final state is produced. Give both
+    // logical CBs one physical region, saving kv BF16 tiles (32 KiB at K=V=128).
+    add_aliased_cbs({5, 17}, kv);  // input state / final state
+    add_cb(16, Vt);                // output
+    add_cb(8, Vt);                 // row-major state staging: one tile row of sticks
+    add_cb(18, kv);  // decayed state
+    add_cb(19, Vt);  // state read
+    add_cb(20, Vt);  // delta
+    add_cb(21, Vt);  // beta * delta
+    add_cb(22, Kt);  // transposed key
+    add_cb(23, kv);  // outer product
+    add_cb(24, kv);  // updated state before write
+    add_cb(25, 1);   // exp(g)
+    if (attrs.fuse_decode_frontend) {
+        add_cb(6, 1);    // decay bias
+        add_cb(7, 1);    // decay scale
+        add_cb(26, 1);   // all-ones reduction tile / gate product
+        add_cb(27, Kt);  // squared vector / gate sum
+        add_cb(28, 1);   // row sum / sigmoid beta
+        add_cb(29, 1);   // inverse norm / softplus
+        add_cb(30, Kt);  // normalized and scaled q
+        add_cb(31, Kt);  // normalized k
+    }
+    const std::vector<uint32_t> ct_args = {
+        Kt,
+        Vt,
+        static_cast<uint32_t>(attrs.fuse_decode_frontend),
+        std::bit_cast<uint32_t>(attrs.q_scale),
+        std::bit_cast<uint32_t>(1.0e-6f)};
+
+    std::vector<uint32_t> reader_ct = ct_args;
+    TensorAccessorArgs(*in.q.buffer()).append_to(reader_ct);
+    TensorAccessorArgs(*in.k.buffer()).append_to(reader_ct);
+    TensorAccessorArgs(*in.v.buffer()).append_to(reader_ct);
+    TensorAccessorArgs(*in.g.buffer()).append_to(reader_ct);
+    TensorAccessorArgs(*in.beta.buffer()).append_to(reader_ct);
+    TensorAccessorArgs(*in.state.buffer()).append_to(reader_ct);
+    auto* decay_bias_buf =
+        attrs.fuse_decode_frontend ? in.decay_bias->buffer() : in.q.buffer();
+    auto* decay_scale_buf =
+        attrs.fuse_decode_frontend ? in.decay_scale->buffer() : in.q.buffer();
+    TensorAccessorArgs(*decay_bias_buf).append_to(reader_ct);
+    TensorAccessorArgs(*decay_scale_buf).append_to(reader_ct);
+    auto* norm_ones_buf =
+        attrs.fuse_decode_frontend ? in.norm_ones->buffer() : in.q.buffer();
+    TensorAccessorArgs(*norm_ones_buf).append_to(reader_ct);
+
+    std::vector<uint32_t> writer_ct = {Kt, Vt};
+    TensorAccessorArgs(*outputs[0].buffer()).append_to(writer_ct);
+    TensorAccessorArgs(*outputs[1].buffer()).append_to(writer_ct);
+
+    const std::string kdir =
+        "ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/";
+
+    KernelDescriptor reader;
+    reader.kernel_source = kdir + "dataflow/reader_recurrent_gated_delta_rule.cpp";
+    reader.source_type = KernelDescriptor::SourceType::FILE_PATH;
+    reader.core_ranges = cores;
+    reader.compile_time_args = reader_ct;
+    reader.config = ReaderConfigDescriptor{};
+    if (attrs.gather_head_rows) {
+        reader.defines = {{"GATHER_HEAD_ROWS", "1"}};
+    }
+    reader.runtime_args.reserve(BH);
+
+    KernelDescriptor writer;
+    writer.kernel_source = kdir + "dataflow/writer_recurrent_gated_delta_rule.cpp";
+    writer.source_type = KernelDescriptor::SourceType::FILE_PATH;
+    writer.core_ranges = cores;
+    writer.compile_time_args = writer_ct;
+    writer.config = WriterConfigDescriptor{};
+    writer.runtime_args.reserve(BH);
+
+    KernelDescriptor compute;
+    compute.kernel_source = kdir + "compute/recurrent_gated_delta_rule.cpp";
+    compute.source_type = KernelDescriptor::SourceType::FILE_PATH;
+    compute.core_ranges = cores;
+    compute.compile_time_args = ct_args;
+    compute.config = ComputeConfigDescriptor{
+        .math_fidelity = MathFidelity::HiFi2, .fp32_dest_acc_en = true, .math_approx_mode = false};
+
+    auto* q_buf = in.q.buffer();
+    auto* k_buf = in.k.buffer();
+    auto* v_buf = in.v.buffer();
+    auto* g_buf = in.g.buffer();
+    auto* beta_buf = in.beta.buffer();
+    auto* state_buf = in.state.buffer();
+    auto* out_buf = outputs[0].buffer();
+    auto* final_buf = outputs[1].buffer();
+
+    for (uint32_t h = 0; h < BH; h++) {
+        const auto& core = head_cores[h];
+        reader.emplace_runtime_args(
+            core,
+            {h, q_buf, k_buf, v_buf, g_buf, beta_buf, state_buf, decay_bias_buf, decay_scale_buf, norm_ones_buf});
+        writer.emplace_runtime_args(core, {h, out_buf, final_buf});
+    }
+
+    desc.kernels.push_back(std::move(reader));
+    desc.kernels.push_back(std::move(writer));
+    desc.kernels.push_back(std::move(compute));
+    return desc;
+}
+
+tt::tt_metal::ProgramDescriptor VerifyTwoGatedDeltaRuleProgramFactory::create_descriptor(
+    const VerifyTwoGatedDeltaRuleParams& attrs,
+    const VerifyTwoGatedDeltaRuleInputs& in,
+    std::vector<Tensor>& outputs) {
+    const uint32_t BH = attrs.BH;
+    const uint32_t Kt = attrs.key_dim / TILE_WIDTH;
+    const uint32_t Vt = attrs.val_dim / TILE_WIDTH;
+    const uint32_t kv = Kt * Vt;
+    const tt::DataFormat df = tt::DataFormat::Float16_b;
+
+    auto* device = in.q.device();
+    const CoreCoord grid = device->compute_with_storage_grid_size();
+    TT_FATAL(BH <= grid.x * grid.y, "num_heads {} exceeds compute cores {}", BH, grid.x * grid.y);
+
+    std::vector<CoreCoord> head_cores(BH);
+    std::set<CoreRange> core_set;
+    for (uint32_t h = 0; h < BH; ++h) {
+        head_cores[h] = CoreCoord{h / grid.y, h % grid.y};
+        core_set.insert(CoreRange{head_cores[h], head_cores[h]});
+    }
+    CoreRangeSet cores{core_set};
+
+    ProgramDescriptor desc;
+    auto add_cb = [&](uint32_t idx, uint32_t tiles) {
+        const uint32_t ts = tt::tile_size(df);
+        desc.cbs.push_back(CBDescriptor{
+            .total_size = tiles * ts,
+            .core_ranges = cores,
+            .format_descriptors = {
+                {CBFormatDescriptor{.buffer_index = static_cast<uint8_t>(idx), .data_format = df, .page_size = ts}}}});
+    };
+    auto add_aliased_cbs = [&](std::initializer_list<uint32_t> indices, uint32_t tiles) {
+        const uint32_t ts = tt::tile_size(df);
+        CBDescriptor::FormatDescriptors formats;
+        formats.reserve(indices.size());
+        for (const uint32_t idx : indices) {
+            formats.push_back(CBFormatDescriptor{
+                .buffer_index = static_cast<uint8_t>(idx), .data_format = df, .page_size = ts});
+        }
+        desc.cbs.push_back(CBDescriptor{
+            .total_size = tiles * ts, .core_ranges = cores, .format_descriptors = std::move(formats)});
+    };
+
+    // Two tokens' worth of q/k/v/a/b: the reader lands token 1's gathered rows while
+    // compute still works on token 0 instead of waiting for it to pop the one slot.
+    add_cb(0, 2 * Kt);             // q stream
+    add_cb(1, 2 * Kt);             // k stream
+    add_cb(2, 2 * Vt);             // v stream
+    add_cb(3, 2);                  // raw a stream
+    add_cb(4, 2);                  // raw b stream
+    add_aliased_cbs({5, 17}, kv);  // input state, then candidate-state stream
+    add_cb(8, Vt);                 // row-major state staging: one tile row of sticks
+    add_cb(16, Vt);                // output stream
+    add_cb(18, kv);                // decayed state
+    add_cb(19, Vt);                // state read
+    add_cb(20, Vt);                // delta
+    add_cb(21, Vt);                // beta * delta
+    add_cb(22, Kt);                // transposed key
+    add_cb(23, kv);                // outer product
+    add_cb(24, kv);                // current updated state
+    add_cb(25, 1);                 // exp(g)
+    add_cb(6, 1);                  // decay bias, resident across both tokens
+    add_cb(7, 1);                  // decay scale, resident across both tokens
+    add_cb(26, 1);                 // all-ones reduction tile, resident across both tokens
+    add_cb(27, Kt);                // squared vector
+    add_cb(28, 1);                 // row sum / sigmoid beta
+    add_cb(29, 1);                 // inverse norm / softplus
+    add_cb(30, Kt);                // normalized and scaled q
+    add_cb(31, Kt);                // normalized k
+
+    const std::vector<uint32_t> ct_args = {
+        Kt,
+        Vt,
+        1,
+        std::bit_cast<uint32_t>(attrs.q_scale),
+        std::bit_cast<uint32_t>(1.0e-6f)};
+
+    std::vector<uint32_t> reader_ct = ct_args;
+    TensorAccessorArgs(*in.q.buffer()).append_to(reader_ct);
+    TensorAccessorArgs(*in.k.buffer()).append_to(reader_ct);
+    TensorAccessorArgs(*in.v.buffer()).append_to(reader_ct);
+    TensorAccessorArgs(*in.a.buffer()).append_to(reader_ct);
+    TensorAccessorArgs(*in.b.buffer()).append_to(reader_ct);
+    TensorAccessorArgs(*in.state.buffer()).append_to(reader_ct);
+    TensorAccessorArgs(*in.decay_bias.buffer()).append_to(reader_ct);
+    TensorAccessorArgs(*in.decay_scale.buffer()).append_to(reader_ct);
+    TensorAccessorArgs(*in.norm_ones.buffer()).append_to(reader_ct);
+
+    std::vector<uint32_t> writer_ct = {Kt, Vt};
+    TensorAccessorArgs(*outputs[0].buffer()).append_to(writer_ct);
+    TensorAccessorArgs(*outputs[1].buffer()).append_to(writer_ct);
+    TensorAccessorArgs(*outputs[2].buffer()).append_to(writer_ct);
+
+    const std::string kdir =
+        "ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/";
+
+    KernelDescriptor reader;
+    reader.kernel_source = kdir + "dataflow/reader_recurrent_gated_delta_rule.cpp";
+    reader.source_type = KernelDescriptor::SourceType::FILE_PATH;
+    reader.core_ranges = cores;
+    reader.compile_time_args = reader_ct;
+    reader.defines = {{"VERIFY_TWO", "1"}};
+    reader.config = ReaderConfigDescriptor{};
+    reader.runtime_args.reserve(BH);
+
+    KernelDescriptor writer;
+    writer.kernel_source = kdir + "dataflow/writer_recurrent_gated_delta_rule.cpp";
+    writer.source_type = KernelDescriptor::SourceType::FILE_PATH;
+    writer.core_ranges = cores;
+    writer.compile_time_args = writer_ct;
+    writer.defines = {{"VERIFY_TWO", "1"}};
+    writer.config = WriterConfigDescriptor{};
+    writer.runtime_args.reserve(BH);
+
+    KernelDescriptor compute;
+    compute.kernel_source = kdir + "compute/recurrent_gated_delta_rule.cpp";
+    compute.source_type = KernelDescriptor::SourceType::FILE_PATH;
+    compute.core_ranges = cores;
+    compute.compile_time_args = ct_args;
+    compute.defines = {{"VERIFY_TWO", "1"}};
+    compute.config = ComputeConfigDescriptor{
+        .math_fidelity = MathFidelity::HiFi2, .fp32_dest_acc_en = true, .math_approx_mode = false};
+
+    auto* q_buf = in.q.buffer();
+    auto* k_buf = in.k.buffer();
+    auto* v_buf = in.v.buffer();
+    auto* a_buf = in.a.buffer();
+    auto* b_buf = in.b.buffer();
+    auto* state_buf = in.state.buffer();
+    auto* decay_bias_buf = in.decay_bias.buffer();
+    auto* decay_scale_buf = in.decay_scale.buffer();
+    auto* norm_ones_buf = in.norm_ones.buffer();
+    auto* out_buf = outputs[0].buffer();
+    auto* state1_buf = outputs[1].buffer();
+    auto* state2_buf = outputs[2].buffer();
+
+    for (uint32_t h = 0; h < BH; ++h) {
+        const auto& core = head_cores[h];
+        reader.emplace_runtime_args(
+            core,
+            {h,
+             q_buf,
+             k_buf,
+             v_buf,
+             a_buf,
+             b_buf,
+             state_buf,
+             decay_bias_buf,
+             decay_scale_buf,
+             norm_ones_buf,
+             BH});
+        writer.emplace_runtime_args(core, {h, out_buf, state1_buf, state2_buf, BH});
     }
 
     desc.kernels.push_back(std::move(reader));

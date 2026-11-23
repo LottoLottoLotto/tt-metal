@@ -33,6 +33,9 @@ GatedDeltaAttnSeqProgramFactory::cached_program_t GatedDeltaAttnSeqProgramFactor
     const uint32_t C = attrs.chunk_size;
     const uint32_t Dk = attrs.key_dim;
     const uint32_t Dv = attrs.val_dim;
+    TT_FATAL(
+        C == 128 && Dk == 128 && Dv == 128 && NC > 0,
+        "gated_delta_attn_seq requires positive chunks with C=K=V=128 for its phase-shared buffers");
 
     const uint32_t Ct = C / TILE_HEIGHT;  // e.g. 4
     const uint32_t Kt = Dk / TILE_WIDTH;  // e.g. 4
@@ -40,9 +43,7 @@ GatedDeltaAttnSeqProgramFactory::cached_program_t GatedDeltaAttnSeqProgramFactor
 
     const uint32_t state_tiles = Kt * Vt;
     const uint32_t out_tiles = Ct * Vt;
-    const uint32_t in_kv_tiles = Ct * Kt;
     const uint32_t attn_tiles = Ct * Ct;
-    const uint32_t kdt_tiles = Kt * Ct;
 
     // Build per-head core coordinates (column-major to avoid harvested NOC columns).
     auto* device = in.L_unit.device();
@@ -80,16 +81,18 @@ GatedDeltaAttnSeqProgramFactory::cached_program_t GatedDeltaAttnSeqProgramFactor
         CreateCircularBuffer(program, cores, cfg);
     };
 
-    // Per-chunk inputs — single-buffered to stay within L1 budget (1.5 MB).
-    make_cb(0, df_f32, attn_tiles, 1);   // L_unit [C,C]
-    make_cb(1, df_f32, out_tiles, 1);    // v_beta_sc [C,Dv]
-    make_cb(2, df_f32, in_kv_tiles, 1);  // k_bd_sc [C,Dk]
-    make_cb(3, df_f32, attn_tiles, 1);   // intra_attn [C,C]
-    make_cb(4, df_f32, in_kv_tiles, 1);  // q_decay [C,Dk]
-    make_cb(5, df_f32, kdt_tiles, 1);    // k_decay_t [Dk,C]
-    make_cb(6, df_f32, 1, 1);            // dl_exp (fp32 scalar)
-    // CB7: unused (was identity_32)
-    make_cb(8, df_f32, state_tiles, 1);  // S — persistent state
+    // Two phase streams replace six simultaneously resident input matrices.
+    // Reader and compute use the same CB ids, so reserve/pop backpressure
+    // protects each value even when the reader advances into the next chunk.
+    make_cb(0, df_f32, attn_tiles);  // L_unit -> q_decay -> intra_attn -> k_decay_t
+    make_cb(1, df_f32, out_tiles);   // v_beta_sc -> k_bd_sc
+    make_cb(6, df_f32, 1);           // dl_exp
+    // The final sum replaces S only after its last scalar-multiply consumer
+    // has popped CB8. CB27 is produced once, and only the writer consumes it.
+    CircularBufferConfig state_cfg(state_tiles * tt::tile_size(df_f32), {{8, df_f32}, {27, df_f32}});
+    state_cfg.set_page_size(8, tt::tile_size(df_f32));
+    state_cfg.set_page_size(27, tt::tile_size(df_f32));
+    CreateCircularBuffer(program, cores, state_cfg);
 
     // Forward-substitution scratch
     // CBs 9-11 hold max(Vt, Kt) tiles for fwd_sub rows.
@@ -105,19 +108,19 @@ GatedDeltaAttnSeqProgramFactory::cached_program_t GatedDeltaAttnSeqProgramFactor
     make_cb(16, df_f32, 1, 1);  // L_inv2
     make_cb(17, df_f32, 1, 1);  // L_inv3
 
-    // Forward-substitution outputs
-    make_cb(18, df_f32, out_tiles, 1);    // v_cor = L^{-1} @ v_beta_sc
-    make_cb(19, df_f32, in_kv_tiles, 1);  // k_cum = L^{-1} @ k_bd_sc
-
-    // 7-step scratch
-    make_cb(20, df_f32, out_tiles, 1);    // v_prime
+    // Phase-lifetime aliases. Ct == Kt == Vt == 4, so all hold 16 fp32 tiles:
+    // c18: v_cor -> intra_v
+    // c19: k_cum -> S_tmp
+    // c20: v_prime -> o_inter -> s_upd
+    make_cb(18, df_f32, out_tiles, 1);
+    make_cb(19, df_f32, out_tiles, 1);
+    make_cb(20, df_f32, out_tiles, 1);
     make_cb(21, df_f32, out_tiles, 1);    // v_new
-    make_cb(22, df_f32, out_tiles, 1);    // o_inter
-    make_cb(23, df_f32, out_tiles, 1);    // intra_v
-    make_cb(24, df_f32, out_tiles, 2);    // out (writer pops, double-buffered)
-    make_cb(25, df_f32, state_tiles, 1);  // s_upd
-    make_cb(26, df_f32, state_tiles, 1);  // S_tmp
-    make_cb(27, df_f32, state_tiles, 1);  // final_state (writer reads once)
+    // Single-buffered: persistent batch-one GDN state occupies the top of L1.
+    // Writer backpressure is acceptable on the prefill-only path.
+    make_cb(24, df_f32, out_tiles, 1);    // out (writer pops)
+    // Total: 2*16 input + 1 scalar + 16 state/final + 3*4 scratch +
+    // 4 inverse + 4*16 phase + 16 output = 145 FP32 tiles = 593920 bytes/core.
 
     // -----------------------------------------------------------------------
     // Kernel paths

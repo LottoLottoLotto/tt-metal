@@ -125,7 +125,9 @@ def prime_decode_trace(generator, model, tokens, current_pos, page_table):
     ``tokens`` [B,1], ``current_pos`` a [B] tensor, ``page_table`` host tensor.
     """
     saved = model._save_deltanet_states()
-    generator.decode_forward(
-        tokens, current_pos, page_table=page_table, kv_cache=None, enable_trace=True, read_from_device=True
-    )
-    model._restore_deltanet_states(saved, model.mesh_device)
+    try:
+        generator.decode_forward(
+            tokens, current_pos, page_table=page_table, kv_cache=None, enable_trace=True, read_from_device=True
+        )
+    finally:
+        model._restore_deltanet_states(saved, model.mesh_device)
