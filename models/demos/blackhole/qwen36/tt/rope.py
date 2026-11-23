@@ -70,23 +70,39 @@ class Qwen36RoPESetup:
         self._req_sin = None
         self.rope_delta = 0  # mrope_position_delta: decode rope_pos = kv_pos + rope_delta
 
-        # Pre-compute full RoPE table on device for fast decode lookups
-        # Shape: [1, max_seq_len, head_dim] on device
-        # mesh_mapper replicates to all devices; on a 1-device mesh this is a no-op.
-        self.cos_device = ttnn.from_torch(
-            self.cos_cpu.unsqueeze(0),  # [1, max_seq_len, head_dim]
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
-        )
-        self.sin_device = ttnn.from_torch(
-            self.sin_cpu.unsqueeze(0),  # [1, max_seq_len, head_dim]
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
-        )
+        # Single-device decode keeps only one stable device row. Refreshing it
+        # avoids per-token device allocation while the full long-context table
+        # remains on host. Multi-device prefill keeps replicated full tables.
+        self._full_device_table = getattr(args, "num_devices", 1) > 1
+        if self._full_device_table:
+            self.cos_device = ttnn.from_torch(
+                self.cos_cpu.unsqueeze(0),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+            )
+            self.sin_device = ttnn.from_torch(
+                self.sin_cpu.unsqueeze(0),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+            )
+        else:
+            initial_cos = ttnn.from_torch(
+                self.cos_cpu[:1].unsqueeze(0),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+            )
+            initial_sin = ttnn.from_torch(
+                self.sin_cpu[:1].unsqueeze(0),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+            )
+            self.cos_device = ttnn.to_device(initial_cos, device)
+            self.sin_device = ttnn.to_device(initial_sin, device)
+
 
     def get_rot_mats(self, position_ids: torch.Tensor):
         """Get cos/sin matrices for given positions.
@@ -103,12 +119,15 @@ class Qwen36RoPESetup:
 
         B, T = position_ids.shape
 
-        # Fast path for single-position decode: slice from pre-computed device table
+        # Fast path for single-position decode.
         if T == 1 and B == 1:
             pos = position_ids.item()
-            cos = self.cos_device[:, pos : pos + 1, :]
-            sin = self.sin_device[:, pos : pos + 1, :]
-            return cos, sin
+            if self._full_device_table:
+                return self.cos_device[:, pos : pos + 1, :], self.sin_device[:, pos : pos + 1, :]
+            cos_host, sin_host = self.get_cos_sin_host(pos)
+            ttnn.copy_host_to_device_tensor(cos_host, self.cos_device)
+            ttnn.copy_host_to_device_tensor(sin_host, self.sin_device)
+            return self.cos_device, self.sin_device
 
         # General path for prefill (variable positions)
         flat_pos = position_ids.reshape(-1)

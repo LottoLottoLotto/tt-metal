@@ -889,25 +889,40 @@ class TTMoEDecode:
             (tt_dispatch_input_expert_scores_tensor, dealloc_scores),
         ) = self._format_dispatch_inputs(tt_x, tt_indices, tt_scores)
 
-        (
-            tt_dispatch_output_sparse_buffer,
-            tt_dispatch_output_expert_indices,
-            tt_dispatch_output_expert_scores,
-        ) = ttnn.experimental.all_to_all_dispatch_metadata(
-            tt_dispatch_input_tensor,
-            tt_dispatch_input_expert_indices_tensor,
-            tt_dispatch_input_expert_scores_tensor,
-            self.expert_state.tt_expert_mapping,
-            **self.config.dispatch.model_dump(),
-            # shared_expert_ids
-            # cluster_axi
-            # num_links
-            # drain_sync_tilizer_core
-            # worker_mode
-            # dispatch_algorithm
-            output_tensors=self.buffers.tt_dispatch_output_tensors,
-            cross_device_semaphore=self.buffers.dispatch_global_semaphore,
-        )
+        if self.config.mesh_shape == (1, 1):
+            # No fabric exists on a one-chip mesh. Dispatch is identity: copy the
+            # local token and global expert IDs into moe_compute's stable buffers.
+            batch = int(tt_dispatch_input_tensor.shape[-2])
+            sparse_view = ttnn.reshape(
+                tt_dispatch_input_tensor, (1, batch, self.config.hidden_size)
+            )
+            effective_k = self.config.select_experts_k + self.config.num_shared_experts
+            index_view = ttnn.reshape(
+                tt_dispatch_input_expert_indices_tensor, (1, batch, effective_k)
+            )
+            score_view = ttnn.reshape(
+                tt_dispatch_input_expert_scores_tensor, (1, batch, effective_k)
+            )
+            tt_dispatch_output_sparse_buffer, tt_dispatch_output_expert_indices, tt_dispatch_output_expert_scores = (
+                self.buffers.tt_dispatch_output_tensors
+            )
+            ttnn.copy(sparse_view, tt_dispatch_output_sparse_buffer)
+            ttnn.copy(index_view, tt_dispatch_output_expert_indices)
+            ttnn.copy(score_view, tt_dispatch_output_expert_scores)
+        else:
+            (
+                tt_dispatch_output_sparse_buffer,
+                tt_dispatch_output_expert_indices,
+                tt_dispatch_output_expert_scores,
+            ) = ttnn.experimental.all_to_all_dispatch_metadata(
+                tt_dispatch_input_tensor,
+                tt_dispatch_input_expert_indices_tensor,
+                tt_dispatch_input_expert_scores_tensor,
+                self.expert_state.tt_expert_mapping,
+                **self.config.dispatch.model_dump(),
+                output_tensors=self.buffers.tt_dispatch_output_tensors,
+                cross_device_semaphore=self.buffers.dispatch_global_semaphore,
+            )
 
         if dealloc_input:
             ttnn.deallocate(tt_dispatch_input_tensor)
@@ -915,6 +930,11 @@ class TTMoEDecode:
         if dealloc_scores:
             ttnn.deallocate(tt_dispatch_input_expert_scores_tensor)
 
+        compute_kwargs = self.config.compute.model_dump()
+        local_compute = self.config.mesh_shape == (1, 1)
+        if local_compute:
+            compute_kwargs["cluster_axis"] = None
+            compute_kwargs["mux_core_range_set"] = None
         (
             _,
             _,
@@ -930,14 +950,11 @@ class TTMoEDecode:
             self.expert_state.tt_w0_w1,
             self.expert_state.tt_w2,
             layer_id=layer_id,
-            # output_height_shard_dim
-            # cluster_axis
-            # mux_core_range_set
-            # has_bias
-            # activation_type
-            **self.config.compute.model_dump(),
+            **compute_kwargs,
             optional_output_tensor=self.buffers.tt_combine_output,
-            optional_cross_device_semaphore=self.buffers.combine_global_semaphore,
+            optional_cross_device_semaphore=(
+                None if local_compute else self.buffers.combine_global_semaphore
+            ),
         )
         ttnn.deallocate(tt_l1_compute_output)
 

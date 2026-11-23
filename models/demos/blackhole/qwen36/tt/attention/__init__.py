@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Gated full-attention for Qwen3.5-9B, split into config/weights/prefill/decode.
+"""Gated full-attention for Qwen, split into config/weights/prefill/decode.
 
 The orchestrating layer lives in ``gated_attention.py``; this package re-exports it
 (and ``AttentionConfig``) as the public API.
