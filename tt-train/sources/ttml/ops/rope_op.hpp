@@ -85,7 +85,6 @@ RotaryEmbeddingParams build_rope_params(
     uint32_t head_dim,
     float theta = 10000.0F,
     RopeScalingParams rope_scaling_params = RopeScalingParams{},
-    // With CP enabled: the sequence layout across the CP ring. ZigZag permutes the positions to match.
     distributed::RingAttentionLayout cp_layout = distributed::RingAttentionLayout::Contiguous);
 // Throws an exception if the input is bad, parameters are bad, or the two are
 // incompatible with one another.

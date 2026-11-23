@@ -276,7 +276,6 @@ autograd::TensorPtr rope(
 
 namespace {
 
-// cos/sin caches [1, 1, L, head_dim] for the token positions `pos` (L of them, in tensor row order).
 std::pair<ttnn::Tensor, ttnn::Tensor> gen_freqs_at(
     uint32_t head_dim,
     xt::xarray<float> pos,
@@ -366,8 +365,6 @@ RotaryEmbeddingParams build_rope_params(
     // If ParallelismContext is initialized and CP is enabled, shard freqs across the CP axis.
     std::shared_ptr<ttnn::distributed::TensorToMesh> mapper;
     uint32_t local_seq_len = sequence_length;
-    // Token position of every row of the (unsharded) caches; sharding them over the CP axis gives each rank
-    // the positions of the tokens it holds.
     xt::xarray<float> positions = xt::arange<float>(static_cast<float>(sequence_length));
 
     if (autograd::ctx().is_parallelism_context_initialized()) {

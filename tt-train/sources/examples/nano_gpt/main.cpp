@@ -565,8 +565,6 @@ int main(int argc, char **argv) {
     };
     CachedHostData cached_data;
 
-    // With the zig-zag CP layout every sample's tokens and targets are reordered so that sharding the sequence
-    // dim over the CP axis gives rank d the chunks [d | 2N-1-d] (the model's RoPE positions match this order).
     uint32_t zigzag_cp_size = 0U;
     if (const auto *llama_config = std::get_if<ttml::models::llama::LlamaConfig>(&model_config.transformer_config);
         llama_config != nullptr && llama_config->cp_layout == ttml::ops::distributed::RingAttentionLayout::ZigZag) {

@@ -19,7 +19,6 @@ struct GQAConfig {
     uint32_t num_groups{};
     float dropout_prob{};
     std::reference_wrapper<const ops::RotaryEmbeddingParams> rope_params;
-    // Sequence layout across the CP ring; must match the data order and the RoPE params.
     ops::distributed::RingAttentionLayout cp_layout = ops::distributed::RingAttentionLayout::Contiguous;
 };
 
