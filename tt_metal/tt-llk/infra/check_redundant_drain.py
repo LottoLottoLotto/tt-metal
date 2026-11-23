@@ -76,7 +76,7 @@ DRAIN_ONLY = re.compile(
 # A statement that pushes a Tensix instruction (or is plain code) and touches nothing the RISC
 # must wait for. `TT_` covers the runtime-encoded pushes, `TTI_` the immediates.
 TENSIX_PUSH = re.compile(
-    r"^\s*(?:ckernel::)?(?:TTI?_[A-Z0-9_]+\b|cfg_reg_rmw_tensix\b|lltt::|"
+    r"^\s*(?:ckernel::)?(?:TTI?_[A-Z0-9_]+\b|cfg_reg_rmw_tensix\b|"
     r"[A-Za-z_][\w:]*\.run\s*\(|t6_mutex_(?:acquire|release)\b)"
 )
 # A statement the RISC performs against state a drain can order. The names are the LLK's own

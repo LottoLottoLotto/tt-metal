@@ -351,7 +351,7 @@ def test_default_scan_includes_ttnn_kernel_includes_copies():
 
 
 def test_exec_record_is_still_checked(tmp_path):
-    """`lltt::Exec` issues the instructions as it records them."""
+    """issues the instructions as it records them."""
     f = hdr(
         tmp_path,
         "exec.h",

@@ -355,7 +355,7 @@ def _assert_records_bracketed(elf_path):
     assert not unbracketed, (
         f"{elf_path.name}: replay record(s) not bracketed by disable_gathering()/"
         "enable_gathering() with ENABLE_GATHERING defined; record through "
-        "ckernel::load_replay_buf instead of a raw lltt::record / TTI_REPLAY:\n  "
+        "ckernel::load_replay_buf instead of a raw TT_REPLAY / TTI_REPLAY:\n  "
         + "\n  ".join(unbracketed)
     )
     return records
@@ -764,7 +764,7 @@ def test_kernel_replay_records_are_gathering_bracketed(
     assert not unbracketed, (
         f"{kernel}: replay record(s) not bracketed by disable_gathering()/enable_gathering() with "
         "ENABLE_GATHERING defined; record through ckernel::load_replay_buf instead of a raw "
-        "lltt::record / TTI_REPLAY:\n  " + "\n  ".join(unbracketed)
+        "TT_REPLAY / TTI_REPLAY:\n  " + "\n  ".join(unbracketed)
     )
 
 

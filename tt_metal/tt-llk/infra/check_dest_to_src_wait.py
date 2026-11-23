@@ -22,7 +22,7 @@ Moves inside a file-local `#define` count at the macro's use site.
 
 This is a WARNING, never a failure: the exit status is always 0. A wait can legitimately live
 in a caller, or precede a MOP/replay run that holds the move, and a lexical check cannot see
-either. Moves that are only recorded into a replay buffer (`load_replay_buf` / `lltt::record`
+either. Moves that are only recorded into a replay buffer (`load_replay_buf`
 without `Exec`) and `TT_OP_MOVD2A` / `TT_OP_MOVD2B` instruction words built for a MOP are not
 issued where they are written, so a missing wait there is not reported: the wait belongs before
 the replay or MOP run. A recording that carries its own valid-bit wait ahead of the moves is
@@ -60,9 +60,9 @@ _DEFINE = re.compile(
 )
 _FN_NAME = re.compile(r"(\w+)\s*(?:<[^;{}()]*>)?\s*\([^;{}]*$")
 _RECORD = re.compile(
-    r"\b(?P<fn>lltt::record|load_replay_buf)\s*(?:<(?P<targs>[^;{}()]*(?:\([^()]*\))?[^;{}()]*)>)?\s*\("
+    r"\b(?P<fn>load_replay_buf)\s*(?:<(?P<targs>[^;{}()]*(?:\([^()]*\))?[^;{}()]*)>)?\s*\("
 )
-# A recorder that also issues what it records: `<lltt::Exec>`, `ExecBool(Exec)`, or Quasar's
+# A recorder that also issues what it records: `ExecBool(Exec)`, or Quasar'sOD
 # `exec_while_loading = true` passed as a template or call argument.
 _EXECUTES = re.compile(r"(?<!No)\bExec\b|\btrue\b")
 
@@ -120,7 +120,7 @@ def _recorded_spans(body):
 
     Both recorders default to load-only (`ExecBool E = NoExec`; Quasar's `exec_while_loading =
     false`). `load_replay_buf` records what its callable emits, so the span is the call's
-    argument list. `lltt::record` records the next N instructions, which a lexical check cannot
+    argument list. TT_REPLAY records the next N instructions, which a lexical check cannot
     count, so the span runs to the end of the enclosing block.
     """
     spans = []
