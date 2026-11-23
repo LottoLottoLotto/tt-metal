@@ -241,10 +241,17 @@ class Inkling2ForCausalLM:
 
     @staticmethod
     def device_sampling_eligible(params, num_output_tokens=0):
-        """vllm_tt_plugin (patched, src/docker/vllm-tt-plugin-eligible.patch): requests the device samples exactly."""
+        """vllm_tt_plugin: requests the device samples exactly (fast/sampling.py, incl. the full vocabulary)."""
         from .fast.sampling import device_eligible
 
         return device_eligible(params, num_output_tokens)
+
+    @staticmethod
+    def device_row_sampling(params, seed):
+        """vllm_tt_plugin: the device sampler's parameters of one request (fast/sampling.RowSampling)."""
+        from .fast.sampling import row_sampling
+
+        return row_sampling(params, seed)
 
     # ------------------------------------------------------------------ vLLM model-protocol shims
     def embed_input_ids(self, input_ids):  # pragma: no cover - protocol shim (the TT runner never calls it)
@@ -299,6 +306,7 @@ class Inkling2ForCausalLM:
             p = plan(int(max_seq_len), **batched)
         except PlanError as e:
             raise ValueError(f"Inkling-2-Mini: {e}") from None
+        logger.info(f"Loading weights from {path}")
         logger.info(f"Inkling-2-Mini: weights {path}, {p.summary()}\n{p.table()}")
         # the model picks its attention decode path from INK_ATTN (tt/model.py): follow the plan unless set
         os.environ.setdefault("INK_ATTN", "fast" if p.attn_decode == "fused" else "stock")
@@ -458,6 +466,7 @@ class Inkling2ForCausalLM:
         traced."""
         if self.already_warmed_up_prefill:
             return
+        logger.info(f"Warming up prefill (Inkling-2-Mini: every chunk shape of {self.model.prefill_chunk} rows)")
         t0 = time.perf_counter()
         self.model.warmup_prefill(log=logger.info)
         logger.info(f"Inkling-2-Mini: prefill warmup (chunk {self.model.prefill_chunk}) "
@@ -481,9 +490,9 @@ class Inkling2ForCausalLM:
         if self.batch is not None:  # batched: the BatchDecoder's bucket traces (compiled and captured in capture())
             if enable_trace and not self.traced:
                 if self.bspec is not None:
-                    logger.info("Inkling-2-Mini: compiling the batched drafter programs")
+                    logger.info("Warming up decode (Inkling-2-Mini: compiling the batched drafter programs)")
                     self.bspec.compile()  # before any capture
-                logger.info("Inkling-2-Mini: capturing the batched decode traces")
+                logger.info("Inkling-2-Mini: Capturing the batched decode traces")
                 self.batch.capture()  # ends with model.reset()
                 if self.bspec is not None:
                     self.bspec.capture()
@@ -497,13 +506,13 @@ class Inkling2ForCausalLM:
             self.spec.compile()  # every spec program before any trace capture
         if enable_trace:
             if not self.traced:
-                logger.info("Inkling-2-Mini: capturing the decode traces")
+                logger.info("Inkling-2-Mini: Capturing the decode traces")
                 if self.decoder is not None:
                     self.decoder.capture()
                 else:
                     model.capture_decode_trace()
                 if self.spec is not None:
-                    logger.info("Inkling-2-Mini: capturing the speculative verify / commit / draft traces")
+                    logger.info("Inkling-2-Mini: Capturing the speculative verify / commit / draft traces")
                     self.spec.capture()
                 model.capture_reset_trace()  # each request's reset: one replay instead of ~400 dispatched ops
                 self.traced = True
