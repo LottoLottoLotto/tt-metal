@@ -168,13 +168,17 @@ void DispatchSKernel::GenerateStaticConfigs() {
     // Configuration for DEVICE_PRINT dispatch.
     static_config_.device_print_dispatch_enabled = 0;
     // Under an ATT map dispatch_s cannot compose the aggregator's raw NOC_XY / DRAM operands, so
-    // DPRINT stays on per-core L1 polling there.
-    const bool aggregation_enabled = !descriptor_.rtoptions().get_noc_att_map().has_value();
+    // DPRINT stays on per-core L1 polling there. A simulator only runs while the host accesses it, so the
+    // aggregator's next pass may never come before DPrintServer::await() gives up; poll L1 there too.
+    const bool att_map = descriptor_.rtoptions().get_noc_att_map().has_value();
+    const bool simulator = descriptor_.rtoptions().get_simulator_enabled();
+    const bool aggregation_enabled = !att_map && !simulator;
     if (cq_id_ == 0 && !aggregation_enabled && descriptor_.metal_context().dprint_server()) {
         log_debug(
             tt::LogMetal,
-            "DPRINT dispatch_s DRAM aggregation disabled on device {}: an ATT NoC map is active",
-            device_->id());
+            "DPRINT dispatch_s DRAM aggregation disabled on device {}: {}",
+            device_->id(),
+            att_map ? "an ATT NoC map is active" : "running on a simulator");
     }
     // With multiple CQs there is one dispatch_s per CQ, but they all read the same per-core
     // DEVICE_PRINT L1 buffers. Only enable the DRAM-aggregation work on cq_id 0 so the buffers
