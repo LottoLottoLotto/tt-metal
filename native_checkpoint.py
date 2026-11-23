@@ -293,6 +293,71 @@ def runtime_support_identity(runtime_root):
     return {"sources": sources, "binaries": binaries}
 
 
+# Source installs of this runtime (e.g. a tt-model container package) put the same files at other paths and compile
+# the TTNN libraries from this tree, so the release image's absolute paths and binary digests cannot match.  This
+# variable names a relocation file (qwen-runtime-relocation.json) that maps the release install prefixes to this
+# install and lists every proof-bound file whose bytes legitimately differ; every other file is still compared.
+RELOCATION_ENV = "QWEN36_RUNTIME_RELOCATION"
+
+
+def runtime_relocation():
+    path = os.environ.get(RELOCATION_ENV)
+    return json.loads(Path(path).read_text()) if path else None
+
+
+def relocated_path(name, relocation, metal_root):
+    for prefix in sorted(relocation["prefixes"], key=len, reverse=True):
+        if name.startswith(prefix):
+            target = relocation["prefixes"][prefix]
+            if target.startswith("module:"):
+                import importlib.util
+
+                spec = importlib.util.find_spec(target[len("module:"):])
+                if spec is None or not spec.submodule_search_locations:
+                    raise ValueError(f"Relocation target package is not installed: {target}")
+                base = Path(next(iter(spec.submodule_search_locations)))
+            elif target == "metal:":
+                base = metal_root
+            else:
+                raise ValueError(f"Unsupported relocation target: {target}")
+            return base / name[len(prefix):]
+    raise ValueError(f"No relocation prefix covers the runtime file: {name}")
+
+
+def relocated_digest(name, recorded, relocation):
+    """The digest the relocated file must have; None for a library compiled from this tree (not comparable)."""
+    entry = relocation["files"].get(name)
+    if entry is None:
+        return recorded
+    if entry.get("release_sha256") != recorded:
+        raise ValueError(f"Relocation entry does not describe the proof-bound file: {name}")
+    return entry.get("sha256")
+
+
+def validate_relocated_runtime(runtime_root, proof, relocation):
+    """validate_runtime's source and library checks for a relocated source install."""
+    metal_root = Path(runtime_root).resolve().parents[3]
+    support = proof.get("runtime_support") or {}
+    if json.loads((metal_root / "qwen-runtime-support.json").read_text()) != support.get("sources"):
+        raise ValueError("Installed runtime support inventory differs from native equivalence")
+    for name, value in proof["runtime_sources"].items():
+        expected = relocated_digest(relocation["runtime_root"] + name, value, relocation)
+        if expected is not None and digest(local_file(runtime_root, name)) != expected:
+            raise ValueError(f"Runtime source differs from native equivalence: {name}")
+    rebuilt = []
+    for name, value in {**support.get("sources", {}), **support.get("binaries", {})}.items():
+        expected = relocated_digest(name, value, relocation)
+        if expected is None:
+            rebuilt.append(name)
+        elif digest(relocated_path(name, relocation, metal_root)) != expected:
+            raise ValueError(f"Installed runtime support source differs: {name}")
+    from loguru import logger
+
+    logger.info("Native equivalence: relocated runtime verified ({} files by digest; compiled from source, not "
+                "digest-compared: {})", len(proof["runtime_sources"]) + len(support.get("sources", {}))
+                + len(support.get("binaries", {})) - len(rebuilt), ", ".join(sorted(rebuilt)))
+
+
 def validate_runtime(root, runtime_root, num_devices):
     """Reject using equivalence evidence under a different execution contract."""
     if num_devices != 1:
@@ -312,6 +377,10 @@ def validate_runtime(root, runtime_root, num_devices):
             continue
         if current != value:
             raise ValueError(f"Runtime environment differs from native equivalence: {name}")
+    relocation = runtime_relocation()
+    if relocation is not None:
+        validate_relocated_runtime(runtime_root, proof, relocation)
+        return
     for name, value in proof["runtime_sources"].items():
         if digest(local_file(runtime_root, name)) != value:
             raise ValueError(f"Runtime source differs from native equivalence: {name}")

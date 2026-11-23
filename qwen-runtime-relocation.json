@@ -1,0 +1,41 @@
+{
+ "description": "Maps the Qwen3.8-27B P150 release image's install paths to a source install of the same runtime (set QWEN36_RUNTIME_RELOCATION to this file).  Every proof-bound file not listed under files must match the release digest byte for byte.",
+ "runtime_root": "/home/container_app_user/tt-metal/models/demos/blackhole/qwen36/",
+ "prefixes": {
+  "/home/container_app_user/tt-metal/": "metal:",
+  "/home/container_app_user/vllm/plugins/vllm-tt-plugin/src/vllm_tt_plugin/": "module:vllm_tt_plugin",
+  "/home/container_app_user/vllm/vllm/": "module:vllm"
+ },
+ "files": {
+  "/home/container_app_user/tt-metal/native_checkpoint.py": {
+   "release_sha256": "14138c43afd112ddc64ef943e361747d66cf6d43c29cf29b16dc2ef294f38719",
+   "sha256": "4cd221ba88dfc0fd063a70382444401fdd5b18fb198a642a7eb723ebe053ad25",
+   "reason": "SPDX header; relocatable runtime-support check (this file)"
+  },
+  "/home/container_app_user/tt-metal/models/demos/blackhole/qwen36/tt/shared_serving.py": {
+   "release_sha256": "f8cd050e45cc8195680a194e4125a330754556bcaddc3944bbf963718dc49d35",
+   "sha256": "b6f685f34627a4d50dfcc661d26f9e21f85223685177e3ac0a561be10a41ef6c",
+   "reason": "comment only: an internal path removed"
+  },
+  "/home/container_app_user/tt-metal/build/lib/_ttnn.so": {
+   "release_sha256": "72446dcea0b262582d070e63561247ada40f25dd850cf66e249769b669991333",
+   "sha256": null,
+   "reason": "compiled from this tree"
+  },
+  "/home/container_app_user/tt-metal/build/lib/_ttnncpp.so": {
+   "release_sha256": "12c7957c1301e88a62b17611c2cf7bfbcc3fd9d4d8a9da9add5ae1374c01133d",
+   "sha256": null,
+   "reason": "compiled from this tree"
+  },
+  "/home/container_app_user/tt-metal/build/lib/libtt_metal.so": {
+   "release_sha256": "850ba3d3343e19a6dd93bf159eabcb6d69267fae535aeaef7d2922a97907970c",
+   "sha256": null,
+   "reason": "compiled from this tree"
+  },
+  "/home/container_app_user/tt-metal/ttnn/ttnn/_ttnn.so": {
+   "release_sha256": "72446dcea0b262582d070e63561247ada40f25dd850cf66e249769b669991333",
+   "sha256": null,
+   "reason": "compiled from this tree"
+  }
+ }
+}
