@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Decode forward pass for Qwen3.5-9B gated attention.
+"""Decode forward pass for Qwen gated attention.
 
 Branch B: paged decode — uses memory_config=mc and cur_pos_tensor=position_tensor.
 """
@@ -20,6 +20,8 @@ def decode_forward(
     page_table=None,
     paged_kv_cache_key=None,
     paged_kv_cache_value=None,
+    program_configs=None,
+    qkv_fused_weight=None,
 ):
     """Branch B — paged decode: paged_update_cache + paged_sdpa_decode via page_table."""
     output, _, _ = gated_attention_forward_ttnn(
@@ -45,5 +47,13 @@ def decode_forward(
         page_table=page_table,
         paged_kv_cache_key=paged_kv_cache_key,
         paged_kv_cache_value=paged_kv_cache_value,
+        q_decode_program_config=(program_configs or {}).get("q"),
+        k_decode_program_config=(program_configs or {}).get("k"),
+        v_decode_program_config=(program_configs or {}).get("v"),
+        o_decode_program_config=(program_configs or {}).get("o"),
+        qkv_fused_weight=qkv_fused_weight,
+        qkv_fused_q_dim=2 * config.num_heads * config.head_dim,
+        qkv_fused_k_dim=config.num_kv_heads * config.head_dim,
+        qkv_fused_program_config=(program_configs or {}).get("qkv"),
     )
     return output

@@ -24,6 +24,9 @@ struct SparseMatmulParams {
     std::optional<const tt::tt_metal::Tile> output_tile;
     std::optional<const tt::tt_metal::experimental::GlobalCircularBuffer> global_cb;
     std::optional<tt::tt_metal::SubDeviceId> sub_device_id;
+    // Zero the output before the matmul. Skipped rows (sparse entries) are otherwise left
+    // uninitialized; callers that read only the computed rows can skip this full-output pass.
+    bool zero_output = true;
 };
 
 struct SparseMatmulInputs {

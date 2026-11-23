@@ -17,4 +17,18 @@ struct ChunkGatedDeltaRuleProgramFactory {
         const ChunkGatedDeltaRuleParams& attrs, const ChunkGatedDeltaRuleInputs& in, std::vector<Tensor>& outputs);
 };
 
+struct RecurrentGatedDeltaRuleProgramFactory {
+    static tt::tt_metal::ProgramDescriptor create_descriptor(
+        const RecurrentGatedDeltaRuleParams& attrs,
+        const RecurrentGatedDeltaRuleInputs& in,
+        std::vector<Tensor>& outputs);
+};
+
+struct VerifyTwoGatedDeltaRuleProgramFactory {
+    static tt::tt_metal::ProgramDescriptor create_descriptor(
+        const VerifyTwoGatedDeltaRuleParams& attrs,
+        const VerifyTwoGatedDeltaRuleInputs& in,
+        std::vector<Tensor>& outputs);
+};
+
 }  // namespace ttnn::prim

@@ -1,0 +1,206 @@
+{
+ "source": "dense-BFP8 plan (d8, 2026-10-03): every GDN in/out and attention projection and the LM head at BFP8, i.e. exactly the BFP8 values the native checkpoint stores (no load-time BFP4 re-quantization); CPU fake-quant all-corpora dPPL +2.7% vs +6.7% for the 2026-09-24 mixed plan. Routed and shared experts stay BFP4.",
+ "lm_head": "bfp8",
+ "layers": {
+  "0": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "1": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "2": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "3": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "4": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "5": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "6": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "7": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "8": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "9": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "10": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "11": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "12": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "13": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "14": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "15": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "16": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "17": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "18": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "19": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "20": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "21": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "22": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "23": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "24": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "25": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "26": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "27": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "28": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "29": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "30": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "31": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "32": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "33": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "34": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "35": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "36": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "37": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "38": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  },
+  "39": {
+   "gdn": "bfp8",
+   "gdn_output": "bfp8",
+   "attention": "bfp8"
+  }
+ }
+}

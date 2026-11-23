@@ -8,6 +8,7 @@ FLA layout: q,k [B,T,H,K]; v [B,T,H,V]; beta,g [B,T,H]; state [B,H,K,V].
 """
 
 import math
+import os
 
 import torch
 import ttnn
@@ -29,6 +30,8 @@ def _chunk_eye(size):
 
 def _recurrent_read_query_program_config(device, K, V):
     """Progcfg for read/query matmul: [B*H,1,K] @ [B*H,K,V] -> [B*H,1,V]. N == per_core_N."""
+    if os.environ.get("QWEN36_GENERIC_BASELINE") == "1":
+        return None
     grid = device.compute_with_storage_grid_size()
     N_tiles = (V + _TILE_W - 1) // _TILE_W
     K_tiles = (K + _TILE_W - 1) // _TILE_W
@@ -230,7 +233,7 @@ def l2_norm_ttnn(x, dim=-1, eps=1e-6):
     # L1 for T<=512; DRAM otherwise
     T = x.shape[1] if len(x.shape) >= 3 else x.shape[0]
     mc = ttnn.L1_MEMORY_CONFIG if T <= 512 else ttnn.DRAM_MEMORY_CONFIG
-    if dim in (-1, len(x.shape) - 1):
+    if (os.environ.get("QWEN36_GENERIC_BASELINE") != "1" or T == 1) and dim in (-1, len(x.shape) - 1):
         K = x.shape[-1]
         normed = ttnn.rms_norm(x, epsilon=eps / K)
         return ttnn.multiply(normed, K**-0.5, memory_config=mc)
@@ -255,19 +258,22 @@ def fused_decay_and_write_ttnn(
     K = h.shape[2]
     V = h.shape[3]
 
+    # A 32-slot recurrent state is 32 MiB per intermediate and cannot coexist
+    # with the decode trace's circular buffers in P150 L1. Keep the low-latency
+    # L1 path through batch 16 and spill larger fixed batches to DRAM.
+    state_mc = ttnn.L1_MEMORY_CONFIG if int(B) <= 16 else ttnn.DRAM_MEMORY_CONFIG
+
     # decay_t: [B,H] -> [B,H,1,1] (already exp(g) in BF16)
-    decay = ttnn.reshape(decay_t, [B, H, 1, 1], memory_config=ttnn.L1_MEMORY_CONFIG)
+    decay = ttnn.reshape(decay_t, [B, H, 1, 1], memory_config=state_mc)
 
     # beta: [B,H] -> [B,H,1,1]
-    beta_expanded = ttnn.reshape(beta_t, [B, H, 1, 1], memory_config=ttnn.L1_MEMORY_CONFIG)
+    beta_expanded = ttnn.reshape(beta_t, [B, H, 1, 1], memory_config=state_mc)
 
-    # Decode opt: keep state-write operands in L1 (tiny at B=1).
-    _L1 = ttnn.L1_MEMORY_CONFIG
-    k_col = ttnn.reshape(k_t, [B, H, K, 1], memory_config=_L1)
-    d_row = ttnn.reshape(delta, [B, H, 1, V], memory_config=_L1)
+    k_col = ttnn.reshape(k_t, [B, H, K, 1], memory_config=state_mc)
+    d_row = ttnn.reshape(delta, [B, H, 1, V], memory_config=state_mc)
 
-    k_col = ttnn.to_memory_config(k_col, _L1)
-    d_row = ttnn.to_memory_config(d_row, _L1)
+    k_col = ttnn.to_memory_config(k_col, state_mc)
+    d_row = ttnn.to_memory_config(d_row, state_mc)
 
     matmul_compute_cfg = ttnn.WormholeComputeKernelConfig(
         math_fidelity=ttnn.MathFidelity.HiFi2,
@@ -279,7 +285,7 @@ def fused_decay_and_write_ttnn(
     outer = ttnn.matmul(
         k_col,
         d_row,
-        memory_config=_L1,
+        memory_config=state_mc,
         compute_kernel_config=matmul_compute_cfg,
         program_config=None,
     )
@@ -288,13 +294,13 @@ def fused_decay_and_write_ttnn(
     outer = ttnn.multiply(
         outer,
         beta_expanded,
-        memory_config=_L1,
+        memory_config=state_mc,
     )
 
     # apply_decay=False: h already decayed (decay->read->write order).
     if apply_decay:
-        h = ttnn.multiply(h, decay, memory_config=_L1)
-    h = ttnn.add(h, outer, memory_config=_L1)
+        h = ttnn.multiply(h, decay, memory_config=state_mc)
+    h = ttnn.add(h, outer, memory_config=state_mc)
 
     return h
 
@@ -397,6 +403,10 @@ def recurrent_gated_delta_rule_decode_ttnn(
     K = q.shape[3]
     V = v.shape[3]
 
+    # Normalize BF16 projections before promoting recurrence arithmetic, as in
+    # the prefill adapter/reference. Casting first changes the normalization.
+    q = l2_norm_ttnn(q, dim=-1)
+    k = l2_norm_ttnn(k, dim=-1)
     # high_precision: fp32 step avoids bf16 decay quantization error over long decode.
     if high_precision:
         q = ttnn.typecast(q, ttnn.float32)
@@ -405,9 +415,6 @@ def recurrent_gated_delta_rule_decode_ttnn(
         beta = ttnn.typecast(beta, ttnn.float32)
         g = ttnn.typecast(g, ttnn.float32)
 
-    # L2 norm
-    q = l2_norm_ttnn(q, dim=-1)
-    k = l2_norm_ttnn(k, dim=-1)
 
     if scale is None:
         scale = K**-0.5

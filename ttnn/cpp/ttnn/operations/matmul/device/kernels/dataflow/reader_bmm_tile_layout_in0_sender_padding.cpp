@@ -366,15 +366,20 @@ void kernel_main() {
                              .noc_x_end = in0_mcast_dest_noc_end_x,
                              .noc_y_end = in0_mcast_dest_noc_end_y,
                              .addr = in0_start_address},
-                            true);
+                            noc_mode == DM_DEDICATED_NOC);
 
-                        // Note: no need for write barrier, since these two multicasts are done on the same noc id, same
-                        // vc, same cmd_buf Also, this only works because we are setting VCs statically (using
-                        // NOC_CMD_STATIC_VC).
+                        if constexpr (noc_mode == DM_DYNAMIC_NOC) {
+                            // Linked multicast forbids unicast on ANY command buffer of
+                            // this NoC, including the other RISC's packed DRAM reads.
+                            // Complete unlinked data before publishing its VALID flag.
+                            noc.async_write_barrier();
+                        }
 #ifdef ARCH_BLACKHOLE
-                        // On Blackhole the flush is needed because NoC latency is higher than L1 <-> RISCV
-                        // latency which means data could be changed before write is issued.
-                        noc.async_writes_flushed();
+                        else {
+                            // Dedicated mode retains linked data/flag multicast on the
+                            // same static VC and the existing source-reuse flush.
+                            noc.async_writes_flushed();
+                        }
 #endif  // ARCH_BLACKHOLE
 
                         // We should also multicast the flag to destinations

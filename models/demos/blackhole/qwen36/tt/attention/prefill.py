@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Prefill forward passes for Qwen3.5-9B gated attention.
+"""Prefill forward passes for Qwen gated attention.
 
 Branch A: paged prefill (chunk_page_table is not None) — no memory_config, no cur_pos_tensor.
 Branch C: concat prefill (else) — uses memory_config, past_key/past_value; returns new_key/new_value.
@@ -55,6 +55,9 @@ def prefill_forward(
             chunk_page_table=chunk_page_table,
             chunk_start_idx=chunk_start_idx,
             chunk_start_idx_tensor=chunk_start_idx_tensor,
+            qkv_fused_weight=weights.qkv_fused if weights.q_proj is None else None,
+            qkv_fused_q_dim=2 * config.num_heads * config.head_dim,
+            qkv_fused_k_dim=config.num_kv_heads * config.head_dim,
         )
         return output
     else:
@@ -81,5 +84,8 @@ def prefill_forward(
             use_optimized_concat=True,
             memory_config=mc,
             norm_weights_pre_offset=True,
+            qkv_fused_weight=weights.qkv_fused if weights.q_proj is None else None,
+            qkv_fused_q_dim=2 * config.num_heads * config.head_dim,
+            qkv_fused_k_dim=config.num_kv_heads * config.head_dim,
         )
         return output, new_key, new_value

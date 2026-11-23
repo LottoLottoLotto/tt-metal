@@ -1322,6 +1322,13 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             # under concurrency). Pair the device token with the device position.
             for i, tok_chunk in enumerate(tokens):
                 trace_in = self.trace_inputs_decode[on_device_sampling][i]
+                # Without token feedback this is the previous INPUT, not the
+                # sampled next token. A coincident position (even across two
+                # requests) cannot make it authoritative over the host input.
+                if self._decode_token_feedback_buffer(self.model[i], trace_in) is None:
+                    new_tokens.append(tok_chunk)
+                    new_start_pos.append(start_pos[i])
+                    continue
                 dev_toks = (
                     ttnn.to_torch(ttnn.get_device_tensors(trace_in[0])[0])
                     .reshape(-1)[: tok_chunk.shape[0]]
