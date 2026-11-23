@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC.
 
 # SPDX-License-Identifier: Apache-2.0
+import os
+
 import ttnn
 from models.common.lightweightmodule import LightweightModule
 
@@ -55,6 +57,24 @@ class LayerNorm(LightweightModule):
             mesh_mapper=ttnn.ReplicateTensorToMesh(device) if is_mesh_device else None,
         )
 
+        # QWEN36_VISION_L1_LEAN=1: the vision tower shares L1 with the native text runtime's resident
+        # state, so the interleaved norm runs as streamed ops (see _lean_forward) on [1, 1, 1, dim] rows.
+        self.lean = os.environ.get("QWEN36_VISION_L1_LEAN") == "1"
+        if self.lean:
+            row = lambda t: t.reshape(1, 1, 1, dim)
+            self.lean_weight = ttnn.as_tensor(
+                row(state_dict[f"{state_dict_prefix}.weight"]), device=device, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT, memory_config=weight_memory_config,
+                cache_file_name=cache_name("lean_weight"),
+                mesh_mapper=ttnn.ReplicateTensorToMesh(device) if is_mesh_device else None,
+            )
+            self.lean_bias = ttnn.as_tensor(
+                row(state_dict[f"{state_dict_prefix}.bias"]), device=device, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT, memory_config=weight_memory_config,
+                cache_file_name=cache_name("lean_bias"),
+                mesh_mapper=ttnn.ReplicateTensorToMesh(device) if is_mesh_device else None,
+            )
+
         if model_config:
             self.sharded_input_config = model_config["SHARDED_NORM_INPUT_MEMCFG"]
             self.sharded_program_config = model_config["SHARDED_NORM_PRGM_CFG"]
@@ -100,6 +120,8 @@ class LayerNorm(LightweightModule):
             return x_interleaved
         else:  # Interleaved rmsnorm does not need program or memory configs
             assert not out_sharded, "Non-sharded version of RMSNorm cannot output a sharded tensor"
+            if self.lean:
+                return self._lean_forward(x)
             x = ttnn.layer_norm(
                 x,
                 weight=self.weight,
@@ -113,3 +135,25 @@ class LayerNorm(LightweightModule):
                 ),
             )
             return x
+
+    def _lean_forward(self, x):
+        """LayerNorm from reductions and elementwise ops. ttnn.layer_norm keeps whole rows (dim/32
+        tiles) in each of its ~6 circular buffers, which overruns the L1 left free beside the text
+        model's resident GDN state; these ops stream a few tiles at a time."""
+        cfg = ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=False
+        )
+        mean = ttnn.mean(x, dim=-1, keepdim=True, compute_kernel_config=cfg)
+        xc = ttnn.subtract(x, mean)
+        ttnn.deallocate(mean)
+        sq = ttnn.multiply(xc, xc)
+        var = ttnn.mean(sq, dim=-1, keepdim=True, compute_kernel_config=cfg)
+        ttnn.deallocate(sq)
+        inv = ttnn.rsqrt(ttnn.add(var, self.eps))
+        ttnn.deallocate(var)
+        y = ttnn.multiply(xc, inv)
+        ttnn.deallocate(xc)
+        ttnn.deallocate(inv)
+        out = ttnn.add(ttnn.multiply(y, self.lean_weight), self.lean_bias)
+        ttnn.deallocate(y)
+        return out

@@ -69,7 +69,39 @@ void bind_chunk_gated_delta_rule(nb::module_& mod) {
         nb::arg("eye") = nb::none(),
         nb::arg("tril") = nb::none(),
         nb::arg("ones") = nb::none(),
-        nb::arg("masks") = nb::none());
+        nb::arg("masks") = nb::none(),
+        nb::arg("fuse_decode_frontend") = false,
+        nb::arg("decay_bias") = nb::none(),
+        nb::arg("decay_scale") = nb::none());
+    const auto* verify_two_doc =
+        R"doc(
+        Verify one committed token and one validated MTP draft token with the
+        fused recurrent Gated Delta Rule front end in one Tensix program.
+
+        q, k, and v contain two token-head rows shaped [2*BH, 1, D]. a and b
+        are raw front-end gates shaped [2*BH, 1, 1]. state is the production
+        row-major BF16 L1 height-sharded [BH, K, V] tensor.
+
+        Returns:
+            tuple[ttnn.Tensor, ttnn.Tensor, ttnn.Tensor]:
+                output [2*BH, 1, V], state after token 0, state after token 1.
+                Candidate states are compact row-major BF16 in interleaved DRAM;
+                both are independent and the input L1 state is not modified.
+        )doc";
+
+    ttnn::bind_function<"verify_two_gated_delta_rule", "ttnn.transformer.">(
+        mod,
+        verify_two_doc,
+        &ttnn::transformer::verify_two_gated_delta_rule,
+        nb::arg("q").noconvert(),
+        nb::arg("k").noconvert(),
+        nb::arg("v").noconvert(),
+        nb::arg("a").noconvert(),
+        nb::arg("b").noconvert(),
+        nb::arg("decay_bias").noconvert(),
+        nb::arg("decay_scale").noconvert(),
+        nb::arg("norm_ones").noconvert(),
+        nb::arg("state").noconvert());
 }
 
 }  // namespace ttnn::operations::transformer

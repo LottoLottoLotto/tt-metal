@@ -111,7 +111,7 @@ def test_bucket_warmup_compiles_all_widths_before_capture(monkeypatch):
 
     monkeypatch.setattr(ttnn, "synchronize_device", lambda *_: None)
     monkeypatch.setenv("TT_DECODE_BUCKETING", "1")
-    generator = SimpleNamespace(mesh_device=object())
+    generator = SimpleNamespace(mesh_device=object(), decode_bucket_widths=lambda _: [1, 2, 4, 8])
 
     warmup_decode_buckets(
         generator,

@@ -231,8 +231,8 @@ def _process_prompt(processor, messages):
     return input_ids, None, 0
 
 
-def _compute_vision_tokens(model, vision_inputs):
-    """Run the TT vision tower; returns (packed embeddings (ttnn), warm_runtime_s).
+def _compute_vision_tokens(model, vision_inputs, token_ids):
+    """Run the TT vision tower; returns (packed host embeddings, warm_runtime_s).
 
     Returns (None, 0.0) for a text-only request.
 
@@ -241,25 +241,24 @@ def _compute_vision_tokens(model, vision_inputs):
     text_demo's warmup/compile split, we run one throwaway warmup call to compile + cache the
     programs, then time a second (warm) call whose runtime reflects actual device compute. Both
     calls run BEFORE any prefill/decode trace is captured, so the eager compile never clobbers a
-    parked trace. The vision forward is identical for image and video; dispatching to
-    ``get_video_features`` (vs ``get_image_features``) is what tells the model to splice into
+    parked trace. Passing the pixels as videos (vs images) is what tells the model to splice into
     ``video_token_id`` placeholders and build the video M-RoPE for this request.
     """
     if vision_inputs is None:
         return None, 0.0
-    fn = model.get_video_features if vision_inputs["modality"] == "video" else model.get_image_features
-    pixel_values, grid_thw = vision_inputs["pixel_values"], vision_inputs["grid_thw"]
+    item = (vision_inputs["pixel_values"], vision_inputs["grid_thw"])
+    kind = "videos" if vision_inputs["modality"] == "video" else "images"
+    fn = lambda: model.get_visual_features(token_ids.reshape(-1), **{kind: item})  # noqa: E731
 
     # Warmup: compile the vision programs, then discard the result.
     t0 = time.time()
-    warmup = fn(pixel_values, grid_thw)
+    fn()
     ttnn.synchronize_device(model.mesh_device)
     compile_time = time.time() - t0
-    ttnn.deallocate(warmup)
 
     # Timed (warm) run — programs are now cached, so this is device compute only.
     t0 = time.time()
-    vision_tokens = fn(pixel_values, grid_thw)
+    vision_tokens = fn()
     ttnn.synchronize_device(model.mesh_device)
     vis_time = time.time() - t0
 
@@ -377,7 +376,7 @@ def _run_traced_vision_generation(model, tokenizer, device, token_ids, vision_in
 
     # Vision tower BEFORE trace capture (its compile must not clobber a parked trace). The returned
     # time is the WARM (post-compile) runtime, so TTFT below reflects vision compute, not compilation.
-    vision_tokens, t_vis = _compute_vision_tokens(model, vision_inputs)
+    vision_tokens, t_vis = _compute_vision_tokens(model, vision_inputs, token_ids)
 
     # Capture the per-chunk prefill trace (warmup; allocates the vision splice buffers). Warm ALL
     # masked buckets: a short prompt (T < chunk) runs entirely through a masked bucket, and a long
@@ -438,7 +437,7 @@ def _run_paged_vision_generation(model, tokenizer, device, token_ids, vision_inp
 
     # TTFT includes the (warm) vision-tower runtime: a multimodal request can't emit its first
     # token until the image/video embeddings are spliced into the prompt.
-    vision_tokens, t_vis = _compute_vision_tokens(model, vision_inputs)
+    vision_tokens, t_vis = _compute_vision_tokens(model, vision_inputs, token_ids)
 
     t0 = time.time()
     logits = model.prefill_paged(token_ids, page_table, vision_tokens=vision_tokens)
@@ -497,7 +496,7 @@ def _run_tp_vision_generation(model, tokenizer, token_ids, vision_inputs, max_ge
     # Vision tower BEFORE trace capture (its eager compile must not clobber a parked trace). The
     # returned time is the WARM (post-compile) runtime and is folded into TTFT below, since a
     # multimodal request can't emit its first token until the vision embeddings are spliced in.
-    vision_tokens, t_vis = _compute_vision_tokens(model, vision_inputs)
+    vision_tokens, t_vis = _compute_vision_tokens(model, vision_inputs, token_ids)
 
     t_cap = time.time()
     model.capture_prefill_trace_chunked(mesh, page_table, chunk_size=PREFILL_CHUNK)

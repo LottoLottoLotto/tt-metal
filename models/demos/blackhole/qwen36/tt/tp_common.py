@@ -6,6 +6,7 @@ Used only when num_devices > 1. DRAM-sharded matmul cfgs, prefill progcfgs,
 mesh shard/replicate, FP8 dequant, HF weight reorder for per-device sharding.
 """
 import math
+import os
 
 import torch
 
@@ -164,6 +165,56 @@ def create_matmul_1d_decode_progcfg(m, k, n, num_cores, fused_activation=None, f
         fused_activation=fused_activation,
         mcast_in0=True,
     )
+
+
+def proj_o_rotating_pack(weight, dtype):
+    """GDN out / attention o_proj ([6144, 5120] BF8, [in, out]): rotating worker-bank page order when
+    QWEN36_PROJ_O_ROTATING_COLS is set (the matmul factory keys the same layout on shape, dtype and
+    that variable). Returns (weight, cache-name suffix); tile-local, so quantized tiles are unchanged."""
+    import ttnn
+
+    cols = int(os.environ.get("QWEN36_PROJ_O_ROTATING_COLS", "0") or 0)
+    if cols == 0 or dtype != ttnn.bfloat8_b or tuple(weight.shape) != (6144, 5120):
+        return weight, ""
+    return repack_for_worker_banks(weight, workers=5120 // 32 // cols, full_cols=cols), f".packed-worker-bank.o{cols}"
+
+
+def proj_o_decode_cores(default):
+    """Worker count for [6144, 5120] BF8 output projections: one worker per packed column group."""
+    cols = int(os.environ.get("QWEN36_PROJ_O_ROTATING_COLS", "0") or 0)
+    return 5120 // 32 // cols if cols else default
+
+
+def repack_for_worker_banks(weight, *, workers, full_cols, group_k_tiles=4, banks=8):
+    """Permute whole 32x32 tiles into the packed decode reader's worker-bank pages.
+
+    Source page: k*n_tiles + worker*full_cols + column.
+    Target page: bank + banks*(worker*pages_per_worker_per_bank
+                 + (group//banks)*group_k_tiles*valid_cols + h*valid_cols + column).
+    bank=(worker+group)%banks, k=group*group_k_tiles+h.
+    Block-float quantization is tile-local, so quantizing the permuted matrix yields
+    the same tiles. The tensor shape is unchanged but its tile IDs are not standard
+    matrix order; the matmul factory selects the matching reader/page map by shape.
+    """
+    k_tiles, n_tiles = weight.shape[0] // 32, weight.shape[1] // 32
+    if k_tiles % (group_k_tiles * banks) or workers != (n_tiles + full_cols - 1) // full_cols:
+        raise ValueError("packed weight geometry does not match worker-bank groups")
+    last_cols = n_tiles - (workers - 1) * full_cols
+    pages_per_worker_per_bank = (k_tiles // banks) * full_cols
+    target_to_source = torch.empty(k_tiles * n_tiles, dtype=torch.int64)
+    for worker in range(workers):
+        valid_cols = last_cols if worker == workers - 1 else full_cols
+        for group in range(k_tiles // group_k_tiles):
+            bank = (worker + group) % banks
+            bank_page = worker * pages_per_worker_per_bank + (group // banks) * group_k_tiles * valid_cols
+            for h in range(group_k_tiles):
+                targets = bank + banks * torch.arange(bank_page + h * valid_cols, bank_page + (h + 1) * valid_cols)
+                source_page = (group * group_k_tiles + h) * n_tiles + worker * full_cols
+                target_to_source[targets] = torch.arange(source_page, source_page + valid_cols)
+    source_tiles = weight.reshape(k_tiles, 32, n_tiles, 32).permute(0, 2, 1, 3).contiguous().reshape(-1, 32, 32)
+    packed_tiles = source_tiles[target_to_source]
+    return packed_tiles.reshape(k_tiles, n_tiles, 32, 32).permute(0, 2, 1, 3).contiguous().reshape(weight.shape)
+
 
 
 def matmul_1d_decode(x, weight, decode_1d_progcfg, compute_cfg, out_memory_config=ttnn.L1_MEMORY_CONFIG):

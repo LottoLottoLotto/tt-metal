@@ -25,6 +25,8 @@ from models.common.lightweightmodule import LightweightModule
 from models.tt_transformers.tt.ccl import tt_all_reduce
 from models.tt_transformers.tt.common import Mode, pad_to_size
 
+from . import lean
+
 
 class MLP(LightweightModule):
     def __init__(
@@ -70,7 +72,7 @@ class MLP(LightweightModule):
         # Shape: [1, 1, dim, hidden_dim]; shard dim=-1 across cluster axis 1.
         self.linear_fc1_weight = ttnn.as_tensor(
             fc1_w,
-            dtype=ttnn.bfloat4_b if args.optimizations.bfp4_mlp else ttnn.bfloat8_b,
+            dtype=lean.WEIGHT_DTYPE or (ttnn.bfloat4_b if args.optimizations.bfp4_mlp else ttnn.bfloat8_b),
             device=self.mesh_device,
             mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh_device, dims=(None, -1), mesh_shape=self.cluster_shape),
             layout=ttnn.TILE_LAYOUT,
@@ -97,7 +99,7 @@ class MLP(LightweightModule):
         # Shape: [1, 1, hidden_dim, dim]; shard dim=-2 across cluster axis 1.
         self.linear_fc2_weight = ttnn.as_tensor(
             fc2_w,
-            dtype=ttnn.bfloat8_b,
+            dtype=lean.WEIGHT_DTYPE or ttnn.bfloat8_b,
             device=self.mesh_device,
             mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh_device, dims=(None, -2), mesh_shape=self.cluster_shape),
             layout=ttnn.TILE_LAYOUT,
@@ -124,12 +126,12 @@ class MLP(LightweightModule):
         HF reference: self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
         """
         seq_len = x.shape[-2]
-        if seq_len >= 1024:
+        if seq_len >= 1024 and not lean.LEAN:  # the lean path batches rows itself (any multiple of 128)
             x = ttnn.reshape(x, [1, seq_len // 1024, 1024, -1])
 
         # fc1: column-sharded matmul + bias + GELU. Output is column-sharded
         # along the intermediate dim; no comm yet.
-        w1_out = ttnn.linear(
+        w1_out = lean.mm(
             x,
             self.linear_fc1_weight,
             bias=self.linear_fc1_bias,
@@ -142,7 +144,7 @@ class MLP(LightweightModule):
 
         # fc2: row-sharded matmul. Each device computes a partial sum of the
         # full output dim. We fold the bias in *after* the all-reduce.
-        w2_partial = ttnn.linear(
+        w2_partial = lean.mm(
             w1_out,
             self.linear_fc2_weight,
             compute_kernel_config=self.args.compute_kernel_config_lofi

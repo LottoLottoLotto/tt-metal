@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
+from pathlib import Path
 
 from loguru import logger
 
@@ -137,11 +139,19 @@ class VisionModelArgs(ModelArgs):
         return layer_prefix + module_map[module_name]
 
     def reference_vision_model(self, depth=None):
+        """The HF vision tower (patch embed, positional interpolation and weights for the TT blocks).
+
+        With QWEN36_VISION_WEIGHTS set to a directory holding the ``model.visual.*`` tensors (safetensors,
+        any file split) only the vision tower is built and loaded; otherwise the whole multimodal model
+        is loaded from CKPT_DIR and its tower returned (needs the full HF checkpoint, ~55 GB of host RAM).
+        """
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration as AutoModelForCausalLM
 
-        print("Loading Qwen3.5 model: ", AutoModelForCausalLM)
         config = AutoModelForCausalLM.config_class.from_pretrained(self.CKPT_DIR)
         config.vision_config.depth = depth if depth is not None else config.vision_config.depth
+        weights = os.environ.get("QWEN36_VISION_WEIGHTS")
+        if weights:
+            return load_vision_tower(config.vision_config, weights)
         model = AutoModelForCausalLM.from_pretrained(self.CKPT_DIR, config=config)
         return model.model.visual
 
@@ -162,3 +172,26 @@ class VisionModelArgs(ModelArgs):
 
     def reference_patch_embed(self):
         return self.reference_vision_model().patch_embed
+
+
+def load_vision_tower(vision_config, directory):
+    """Build Qwen3_5VisionModel and load its ``model.visual.*`` tensors from ``directory`` (BF16)."""
+    import torch
+    from safetensors import safe_open
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
+
+    prefix = "model.visual."
+    state = {}
+    for path in sorted(Path(directory).glob("*.safetensors")):
+        with safe_open(str(path), framework="pt") as f:
+            for key in f.keys():
+                if key.startswith(prefix):
+                    state[key[len(prefix) :]] = f.get_tensor(key)
+    tower = Qwen3_5VisionModel(vision_config).to(torch.bfloat16)
+    # Blocks past the configured depth (a debug depth override) are simply not loaded.
+    state = {k: v for k, v in state.items() if not k.startswith("blocks.") or int(k.split(".")[1]) < vision_config.depth}
+    missing, unexpected = tower.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        raise ValueError(f"vision weights in {directory}: missing {sorted(missing)[:8]}, unexpected {sorted(unexpected)[:8]}")
+    logger.info(f"loaded the vision tower ({len(state)} tensors) from {directory}")
+    return tower.eval()

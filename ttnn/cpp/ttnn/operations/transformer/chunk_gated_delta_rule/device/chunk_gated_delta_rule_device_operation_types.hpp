@@ -39,4 +39,47 @@ struct ChunkGatedDeltaRuleInputs {
     std::optional<Tensor> initial_state;  // [BH, K, V] or absent (zeros)
 };
 
+struct RecurrentGatedDeltaRuleParams {
+    uint32_t BH;
+    uint32_t key_dim;
+    uint32_t val_dim;
+    tt::tt_metal::MemoryConfig output_mem_config;
+    DeviceComputeKernelConfig compute_kernel_config;
+    bool fuse_decode_frontend;
+    float q_scale;
+};
+
+struct RecurrentGatedDeltaRuleInputs {
+    Tensor q;      // [BH, 1, K], normalized and scaled
+    Tensor k;      // [BH, 1, K], normalized
+    Tensor v;      // [BH, 1, V]
+    Tensor g;      // [BH, 1], log-space decay
+    Tensor beta;   // [BH, 1]
+    std::optional<Tensor> decay_bias;   // [BH, 1, 1], required by fused front end
+    std::optional<Tensor> decay_scale;  // [BH, 1, 1], -exp(A_log), required by fused front end
+    std::optional<Tensor> norm_ones;     // [1, 32, 32], required by fused front end
+    Tensor state;  // [BH, K, V]
+};
+
+struct VerifyTwoGatedDeltaRuleParams {
+    uint32_t BH;       // Exactly 48 heads, one per Tensix core
+    uint32_t key_dim;  // K
+    uint32_t val_dim;  // V
+    tt::tt_metal::MemoryConfig output_mem_config;
+    DeviceComputeKernelConfig compute_kernel_config;
+    float q_scale;
+};
+
+struct VerifyTwoGatedDeltaRuleInputs {
+    Tensor q;            // [2, 1, BH, K], raw, head dimension padded to a tile
+    Tensor k;            // [2, 1, BH, K], raw
+    Tensor v;            // [2, 1, BH, V]
+    Tensor a;            // [1, 1, 2, BH], raw decay gate
+    Tensor b;            // [1, 1, 2, BH], raw update gate
+    Tensor decay_bias;   // [BH, 1, 1]
+    Tensor decay_scale;  // [BH, 1, 1], precomputed -exp(A_log)
+    Tensor norm_ones;    // one BF16 all-ones tile
+    Tensor state;        // [BH,K,V] or [1,BH,K,V], row-major L1 height-sharded
+};
+
 }  // namespace ttnn::prim

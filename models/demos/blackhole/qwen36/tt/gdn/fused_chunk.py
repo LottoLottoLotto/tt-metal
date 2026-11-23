@@ -30,6 +30,7 @@ from loguru import logger
 
 import ttnn
 from models.experimental.gated_attention_gated_deltanet.tt.ttnn_delta_rule_ops import l2_norm_ttnn
+from models.experimental.gated_attention_gated_deltanet.tt.ttnn_delta_rule_seq import prefill_mask_bank
 
 # The chunk size the fused op runs at (same math as 128, different internal tiling).
 _FUSED_CHUNK_SIZE = 32
@@ -149,23 +150,38 @@ def chunk_gated_delta_rule_fused_adapter(
     _is_per_row = isinstance(valid_len, (list, tuple))
     if _is_per_row or (valid_len is not None and valid_len < T):
         _dram = ttnn.DRAM_MEMORY_CONFIG  # op CBs clash with L1 inputs at small buckets
-        _mt = torch.zeros(B, T, 1, dtype=torch.float32)
-        if _is_per_row:
-            for _b in range(B):
-                _mt[_b, : int(valid_len[_b]), :] = 1.0
+
+        def _mask_host(length_or_lengths, shape):
+            _mt = torch.zeros(B, T, 1, dtype=torch.float32)
+            if isinstance(length_or_lengths, (list, tuple)):
+                for _b in range(B):
+                    _mt[_b, : int(length_or_lengths[_b]), :] = 1.0
+            else:
+                _mt[:, :length_or_lengths, :] = 1.0
+            return _mt.reshape(shape)
+
+        _mq_shape = (B, T, 1) if len(q.shape) == 3 else (B, T, 1, 1)
+        bank = prefill_mask_bank()
+        if bank is not None:
+            # Traced masked bucket: fixed-address masks refreshed per replay (no host upload).
+            if _is_per_row or int(valid_len) != bank.valid_len:
+                raise ValueError("persistent prefill masks serve one scalar valid_len per forward")
+            _m = bank.get(("fused_bg", B, T), lambda n: _mask_host(n, (B, T, 1)), ttnn.float32)
+            _mq = bank.get(("fused_qkv", B, T, len(_mq_shape), q.dtype), lambda n: _mask_host(n, _mq_shape), q.dtype)
         else:
-            _mt[:, :valid_len, :] = 1.0
-        _m = ttnn.from_torch(_mt, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+            _m = ttnn.from_torch(_mask_host(valid_len, (B, T, 1)), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+                                 device=device)
+            _mq = ttnn.from_torch(_mask_host(valid_len, _mq_shape), dtype=q.dtype, layout=ttnn.TILE_LAYOUT,
+                                  device=device)
         beta = ttnn.multiply(beta, _m, memory_config=_dram)  # beta/g fp32 (op contract) — load-bearing
         g = ttnn.multiply(g, _m, memory_config=_dram)
         # Also mask q/k/v for bit-parity with seq (beta/g alone is enough for correctness).
-        _mq_t = _mt if len(q.shape) == 3 else _mt.reshape(B, T, 1, 1)
-        _mq = ttnn.from_torch(_mq_t, dtype=q.dtype, layout=ttnn.TILE_LAYOUT, device=device)
         q = ttnn.multiply(q, _mq, memory_config=_dram)
         k = ttnn.multiply(k, _mq, memory_config=_dram)
         v = ttnn.multiply(v, _mq, memory_config=_dram)
-        ttnn.deallocate(_m)
-        ttnn.deallocate(_mq)
+        if bank is None:
+            ttnn.deallocate(_m)
+            ttnn.deallocate(_mq)
 
     s0 = None
     if initial_state is not None:

@@ -5,6 +5,7 @@ import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.tt_transformers.tt.common import Mode
 
+from . import lean
 from .vision_attention import VisionAttention
 from .vision_distributed_layernorm import DistributedLayerNorm
 from .vision_mlp import MLP
@@ -86,6 +87,7 @@ class VisionBlock(LightweightModule):
         self,
         x: ttnn.Tensor,
         rot_mats,
+        pad_marks=None,
     ) -> ttnn.Tensor:
         """Run the vision block.
 
@@ -100,29 +102,50 @@ class VisionBlock(LightweightModule):
         ), f"VisionBlock input memcfg mismatch: {x.memory_config()} != {skip_mem_cfg}"
 
         # The norm gathers along dim=3 and outputs a replicated tensor.
-        attn_in = self.attention_norm(x)
+        attn_in = self._by_rows(self.attention_norm, x, keep_input=True)
         # Attention takes replicated input and produces a tensor fractured
         # along dim=3 (because tt_all_reduce reduce-scatters on T3K/QB2).
         attn_out = self.attention.forward(
             attn_in,
             rot_mats=rot_mats,
+            pad_marks=pad_marks,
         )
 
         # Residual + attn_out: both fractured along dim=3.
         h = ttnn.add(x, attn_out, memory_config=skip_mem_cfg, dtype=None)
         ttnn.deallocate(attn_out)
         ttnn.deallocate(x)
+        return self._by_rows(self._feed_forward, h)
 
+    def _feed_forward(self, h):
         ff_in = self.ff_norm(h)
         ff_out = self.feed_forward.forward(ff_in, mode=Mode.PREFILL)
         ttnn.deallocate(ff_in)
         out = ttnn.add(
             h,
             ff_out,
-            memory_config=skip_mem_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,
         )
         ttnn.deallocate(h)
         ttnn.deallocate(ff_out)
+        return out
 
+    @staticmethod
+    def _by_rows(fn, x, keep_input=False):
+        """fn(x) for a row-wise fn; frames longer than lean.CHUNK_ROWS run it per row chunk (bounded
+        device memory) and concatenate. fn may deallocate its input; x itself is deallocated unless
+        keep_input."""
+        seq_len = x.shape[-2]
+        if not lean.LEAN or seq_len <= lean.CHUNK_ROWS:
+            return fn(x)
+        outs = [
+            fn(ttnn.slice(x, [0, 0, a, 0], [1, 1, min(a + lean.CHUNK_ROWS, seq_len), x.shape[-1]]))
+            for a in range(0, seq_len, lean.CHUNK_ROWS)
+        ]
+        if not keep_input:
+            ttnn.deallocate(x)
+        out = ttnn.concat(outs, dim=2)
+        for t in outs:
+            ttnn.deallocate(t)
         return out

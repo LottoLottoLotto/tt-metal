@@ -31,6 +31,7 @@ from models.common.lightweightmodule import LightweightModule
 from models.tt_transformers.tt.ccl import tt_all_reduce
 
 from .vision_distributed_layernorm import DistributedLayerNorm
+from . import lean
 
 
 class PatchMerger(LightweightModule):
@@ -167,7 +168,7 @@ class PatchMerger(LightweightModule):
 
         # fc1 column-sharded: replicated in -> fractured-along-dim=3 out
         # (each device owns mlp_size/TP of the GELU activations).
-        w1_out = ttnn.linear(
+        w1_out = lean.mm(
             x_norm,
             self.w1,
             bias=self.b1,
@@ -179,7 +180,7 @@ class PatchMerger(LightweightModule):
 
         # fc2 row-sharded: each device produces partial sums for the full
         # out_hidden_size. Bias is folded in after the reduce_scatter.
-        w2_partial = ttnn.linear(
+        w2_partial = lean.mm(
             w1_out,
             self.w2,
             compute_kernel_config=self.args.compute_kernel_config_hifi2_fp16,

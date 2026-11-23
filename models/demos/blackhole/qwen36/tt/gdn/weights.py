@@ -1,32 +1,32 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Weight loading + precompute for the Qwen3.5-9B Gated DeltaNet layer.
+"""Load quantized GDN projections and precompute convolution/decay constants.
 
-Loads the projection / conv / norm weights for one `linear_attn` substate and
-precomputes the derived device tensors (conv taps, fused matmuls, prefill-kernel
-constants, cached chunk masks). Behavior-preserving extraction of the original
-`Qwen36GatedDeltaNet.__init__` weight code — every dtype / layout / memory_config
-and every env-var read is preserved verbatim.
+Optimized 27B keeps one canonical mega payload for prefill and T1/T2 decode;
+the original separately quantized projections are released after fusion.
 """
 from dataclasses import dataclass
+import os
 
 import torch
 
 import ttnn
 from models.demos.blackhole.qwen36.tt.gdn.config import GDNConfig
+from models.demos.blackhole.qwen36.tt import tp_common as tpc
+from models.demos.blackhole.qwen36.tt import weight_prefetch
 from models.experimental.gated_attention_gated_deltanet.tt.ttnn_delta_rule_seq import create_chunk_masks_seq
 
 
 @dataclass
 class GDNWeights:
     # Projection weights
-    qkv_proj_weight: ttnn.Tensor
+    qkv_proj_weight: ttnn.Tensor | None
     q_proj_weight: object  # None — dead split (op runs fused QKV); kept as kwarg
     k_proj_weight: object
     v_proj_weight: object
-    a_proj_weight: ttnn.Tensor
-    b_proj_weight: ttnn.Tensor
-    g_proj_weight: ttnn.Tensor
+    a_proj_weight: ttnn.Tensor | None
+    b_proj_weight: ttnn.Tensor | None
+    g_proj_weight: ttnn.Tensor | None
     o_proj_weight: ttnn.Tensor
     # Conv weights (stay on HOST, ROW_MAJOR) + biases
     q_conv_weight: ttnn.Tensor
@@ -49,9 +49,14 @@ class GDNWeights:
     v_bias_dev: object
     fused_conv_weight_taps: list
     fused_conv_bias_dev: object
+    native_frontend_weight_taps: object
+    native_frontend_bias: object
+    native_decay_bias: object
+    native_decay_scale: object
     # Fused projection weights
-    ab_proj_weight: ttnn.Tensor
+    ab_proj_weight: ttnn.Tensor | None
     mega_fused_weight: object
+    mega_fused_weight_decode: object
     mega_qkv_dim: object
     mega_a_dim: object
     mega_b_dim: object
@@ -75,18 +80,48 @@ def load_gdn_weights(mesh_device, config: GDNConfig, state_dict, tensor_cache_pa
     head_v_dim = config.head_v_dim
     conv_kernel_size = config.conv_kernel_size
     norm_eps = config.norm_eps
+    generic_baseline = os.environ.get("QWEN36_GENERIC_BASELINE") == "1"
 
+    linear_dtype = (
+        ttnn.bfloat4_b
+        if os.environ.get("QWEN36_BFP4_WEIGHTS") == "1"
+        else ttnn.bfloat8_b
+    )
+    from models.demos.blackhole.qwen36.tt.model_config import evaluation_weight_dtype
+
+    linear_dtype = evaluation_weight_dtype("gdn", tensor_cache_path, linear_dtype)
+    output_dtype = evaluation_weight_dtype("gdn_output", tensor_cache_path, linear_dtype)
     def load_weight_2d(name):
         """Load 2D weight, transpose to [in, out] for ttnn.linear."""
         t = state_dict[name].T.contiguous()
-        return ttnn.as_tensor(
+        dtype = output_dtype if name == "out_proj.weight" else linear_dtype
+        suffix = ""
+        logical = t
+        if name == "out_proj.weight" and not generic_baseline:
+            from models.demos.blackhole.qwen36.tt import tp_common as tpc
+
+            t, suffix = tpc.proj_o_rotating_pack(t, dtype)
+        weight = ttnn.as_tensor(
             t,
-            dtype=ttnn.bfloat8_b,
+            dtype=dtype,
             layout=ttnn.TILE_LAYOUT,
             device=mesh_device,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            cache_file_name=(tensor_cache_path / f"linear_attn.{name}") if tensor_cache_path else None,
+            cache_file_name=(tensor_cache_path / f"linear_attn.{name}{suffix}") if tensor_cache_path else None,
         )
+        if (
+            name == "out_proj.weight"
+            and not generic_baseline
+            and tuple(logical.shape) == (6144, 5120)
+            and dtype == ttnn.bfloat8_b
+            and weight_prefetch.enabled("proj_o")
+        ):
+            weight_prefetch.register(
+                "proj_o", weight, logical, mesh_device,
+                (tensor_cache_path / f"linear_attn.{name}.prefetch") if tensor_cache_path else None,
+                in0_block_w=8,  # GDN out_decode_program_config's K block (M=1 decode and verification)
+            )
+        return weight
 
     def load_conv_weight(name):
         """Load conv1d weight — stays on HOST (not device), ROW_MAJOR layout."""
@@ -112,18 +147,17 @@ def load_gdn_weights(mesh_device, config: GDNConfig, state_dict, tensor_cache_pa
             f"DeltaNet layer requires the combined qkv_proj weight "
             f"(key '{qkv_key}' missing; the split q/k/v_proj were removed in the weight refactor)."
         )
-    t = state_dict[qkv_key].T.contiguous()  # [4096, 8192]
+    t = state_dict[qkv_key].T.contiguous()  # [hidden, q_dim+k_dim+v_dim]
     qkv_proj_weight = ttnn.as_tensor(
         t,
-        dtype=ttnn.bfloat8_b,
+        dtype=linear_dtype,
         layout=ttnn.TILE_LAYOUT,
         device=mesh_device,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
         cache_file_name=(tensor_cache_path / "linear_attn.qkv_proj.weight") if tensor_cache_path else None,
     )
-    # The split q/k/v_proj are dead (the op runs the fused QKV from the combined weight; it
-    # reads the splits only in a fallback reached when qkv_proj_weight is None). Not created,
-    # saving ~33MB/layer of device memory. The op still receives them as kwargs (None).
+    # The operation receives these only for its split-projection fallback,
+    # which this loader never selects.
     q_proj_weight = None
     k_proj_weight = None
     v_proj_weight = None
@@ -205,27 +239,42 @@ def load_gdn_weights(mesh_device, config: GDNConfig, state_dict, tensor_cache_pa
         fused_reshaped = fused.reshape(1, 1, D_total).contiguous()
         return ttnn.from_torch(fused_reshaped, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh_device)
 
-    def _precompute_fused_ab_weight():
-        """Pre-concatenate a_proj + b_proj weights into [4096, 64] for fused matmul."""
-        a_w = ttnn.to_torch(a_proj_weight)  # [4096, 32]
-        b_w = ttnn.to_torch(b_proj_weight)  # [4096, 32]
-        fused = torch.cat([a_w, b_w], dim=1).contiguous()  # [4096, 64]
-        return ttnn.from_torch(fused, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=mesh_device)
+    def _precompute_native_frontend_weights():
+        # Source-head ownership consumes the same flat BF16 taps as generic FIR.
+        return fused_conv_weight_taps, fused_conv_bias_dev
+
+
 
     def _precompute_mega_fused_weight():
-        """Fuse QKV + a + b + g projections into one [4096, D_total] weight.
+        """Fuse QKV + padded a + padded b + g projections.
 
-        Saves 2 matmul kernel launches per decode step (QKV=1, ab=1, g=1 -> mega=1).
-        Output split: [qkv_dim | a_dim | b_dim | g_dim]
+        27B output split: [10240 QKV | 64 a | 64 b | 6144 gate].
+        Only the first 48 entries of either scalar segment are logical.
         """
         if qkv_proj_weight is None:
-            return None
-        qkv_w = ttnn.to_torch(qkv_proj_weight)  # [4096, 8192]
-        a_w = ttnn.to_torch(a_proj_weight)  # [4096, 32]
-        b_w = ttnn.to_torch(b_proj_weight)  # [4096, 32]
-        g_w = ttnn.to_torch(g_proj_weight)  # [4096, 4096]
+            return None, None
+        qkv_w = ttnn.to_torch(qkv_proj_weight)
+        a_w = ttnn.to_torch(a_proj_weight)
+        b_w = ttnn.to_torch(b_proj_weight)
+        g_w = ttnn.to_torch(g_proj_weight)
+        padded_heads = ((num_v_heads + 31) // 32) * 32
+        a_w = torch.nn.functional.pad(a_w, (0, padded_heads - num_v_heads))
+        b_w = torch.nn.functional.pad(b_w, (0, padded_heads - num_v_heads))
         fused = torch.cat([qkv_w, a_w, b_w, g_w], dim=1).contiguous()
-        return ttnn.from_torch(fused, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=mesh_device)
+        if os.environ.get("QWEN_GDN_MEGA_PACKED") == "1":
+            if linear_dtype not in (ttnn.bfloat4_b, ttnn.bfloat8_b):
+                raise ValueError("packed GDN mega requires block-floating projection weights")
+            packed_geometry = (86, 6) if tuple(fused.shape) == (5120, 16512) else (97, 4)
+            fused = tpc.repack_for_worker_banks(
+                fused, workers=packed_geometry[0], full_cols=packed_geometry[1]
+            )
+        # One canonical device payload for decode AND prefill. The packed-reader
+        # host dispatch must select the bank-page reader for every token count.
+        weight = ttnn.from_torch(
+            fused, dtype=linear_dtype, layout=ttnn.TILE_LAYOUT, device=mesh_device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        return weight, weight
 
     # Precompute conv weight taps and bias on device to avoid CPU round-trips during decode
     q_weight_taps = _precompute_weight_taps(q_conv_weight)
@@ -238,23 +287,44 @@ def load_gdn_weights(mesh_device, config: GDNConfig, state_dict, tensor_cache_pa
     # Precompute fused QKV conv weight taps [1, 1, D_total] for fused conv decode
     fused_conv_weight_taps = _precompute_fused_weight_taps()
     fused_conv_bias_dev = _precompute_fused_bias_dev()
+    native_frontend_weight_taps, native_frontend_bias = (
+        _precompute_native_frontend_weights()
+        if os.environ.get("QWEN_GDN_FRONTEND_FUSED") == "1" else (None, None)
+    )
+    native_decay_bias = native_decay_scale = None
+    if os.environ.get("QWEN_GDN_FRONTEND_FUSED") == "1":
+        def head_constants(value):
+            return ttnn.from_torch(
+                ttnn.to_torch(value).reshape(num_v_heads, 1, 1).contiguous(),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh_device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+        native_decay_bias = head_constants(dt_bias)
+        native_decay_scale = head_constants(A_neg)
 
-    # Fused a+b projection weight: [4096, 64] — saves 1 matmul per decode step
-    ab_proj_weight = _precompute_fused_ab_weight()
+    # Mega replaces every a/b consumer; generic baseline uses individual weights.
+    ab_proj_weight = None
 
-    # Mega-fused weight: QKV + a + b + g in one [4096, 12352] matmul
-    # Eliminates 2 separate matmuls (g_proj, ab_proj) per decode step
-    mega_fused_weight = _precompute_mega_fused_weight()
+    # One matmul supplies QKV, tile-aligned scalar segments, and the output gate.
+    mega_fused_weight, mega_fused_weight_decode = (
+        (None, None) if generic_baseline else _precompute_mega_fused_weight()
+    )
     if mega_fused_weight is not None:
         mega_qkv_dim = config.q_dim + config.k_dim + config.v_dim
-        mega_a_dim = num_v_heads
-        mega_b_dim = num_v_heads
+        mega_a_dim = ((num_v_heads + 31) // 32) * 32
+        mega_b_dim = mega_a_dim
         mega_g_dim = num_v_heads * head_v_dim
     else:
         mega_qkv_dim = None
         mega_a_dim = None
         mega_b_dim = None
         mega_g_dim = None
+    if mega_fused_weight is not None:
+        # Prefill and both decode token counts consume mega, so do not retain
+        # another full copy of QKV/a/b/g (~4.3 GB over the 27B GDN layers).
+        for projection in (qkv_proj_weight, a_proj_weight, b_proj_weight, g_proj_weight):
+            ttnn.deallocate(projection)
+        qkv_proj_weight = a_proj_weight = b_proj_weight = g_proj_weight = None
 
     # Chunk-parallel prefill via the C++ gated_delta_attn_seq kernel (float32) is
     # the default prefill path. The kernel hardcodes Ct=4 diagonal blocks, so it
@@ -290,8 +360,13 @@ def load_gdn_weights(mesh_device, config: GDNConfig, state_dict, tensor_cache_pa
         v_bias_dev=v_bias_dev,
         fused_conv_weight_taps=fused_conv_weight_taps,
         fused_conv_bias_dev=fused_conv_bias_dev,
+        native_frontend_weight_taps=native_frontend_weight_taps,
+        native_decay_bias=native_decay_bias,
+        native_decay_scale=native_decay_scale,
+        native_frontend_bias=native_frontend_bias,
         ab_proj_weight=ab_proj_weight,
         mega_fused_weight=mega_fused_weight,
+        mega_fused_weight_decode=mega_fused_weight_decode,
         mega_qkv_dim=mega_qkv_dim,
         mega_a_dim=mega_a_dim,
         mega_b_dim=mega_b_dim,

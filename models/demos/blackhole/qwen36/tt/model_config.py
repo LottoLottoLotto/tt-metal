@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3.5-9B config for Blackhole P150.
+"""Qwen hybrid text config for Blackhole P150.
 
 Subclasses tt_transformers.ModelArgs. HF_MODEL env var is canonical (hub id or local dir);
 hub ids are snapshot_download'd first (AutoConfig on bare hub id is unreliable here).
@@ -16,8 +16,36 @@ from models.tt_transformers.tt.model_config import ModelArgs
 GDN_CONV1D_L1_SMALL_SIZE = 24576
 
 
+def evaluation_weight_dtype(family, cache_path, default):
+    """Resolve an isolated evaluator's fully expanded target precision map.
+
+    The evaluator owns validation and a content-addressed cache root. Normal
+    serving has no QWEN36_EVAL_PRECISION and retains its original loading path.
+    """
+    import json
+    import ttnn
+
+    serialized = os.environ.get("QWEN36_EVAL_PRECISION")
+    if serialized is None:
+        return default
+    # Draft layers are stored losslessly and retain their own runtime dtype
+    # policy; the target's layers.N precision map does not describe them.
+    if cache_path is not None and Path(cache_path).name.startswith("mtp.layers."):
+        return default
+    plan = json.loads(serialized)
+    if family == "lm_head":
+        name = plan["lm_head"]
+    else:
+        if cache_path is None or not Path(cache_path).name.startswith("layers."):
+            raise ValueError("Evaluation layer precision requires a layers.N cache path")
+        index = Path(cache_path).name.split(".")[1]
+        values = plan["layers"][index]
+        name = values.get("gdn_output", values["gdn"]) if family == "gdn_output" else values[family]
+    return {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b, "bfp4": ttnn.bfloat4_b}[name]
+
+
 class Qwen36ModelArgs(ModelArgs):
-    """Qwen3.5-9B ModelArgs for Blackhole P150."""
+    """Configuration-derived Qwen hybrid ModelArgs for Blackhole P150."""
 
     # Opt into base ModelArgs TP > n_kv_heads path; attention/tp.py replicates via replicate_kv_weight.
     SUPPORTS_KV_REPLICATION = True
@@ -29,9 +57,8 @@ class Qwen36ModelArgs(ModelArgs):
         max_seq_len=2048,
         **kwargs,
     ):
-        # HF_MODEL is canonical (defaults to Qwen/Qwen3.6-27B). Snapshot hub ids unless
-        # config.json exists locally (avoids cache-dir false positives).
-        hf_model = os.environ.setdefault("HF_MODEL", "Qwen/Qwen3.6-27B")
+        # HF_MODEL is canonical. Snapshot hub ids unless config.json exists locally.
+        hf_model = os.environ.setdefault("HF_MODEL", "Qwen/Qwen3.8-27B")
         if not os.path.isfile(os.path.join(hf_model, "config.json")):
             from huggingface_hub import snapshot_download
 
@@ -74,11 +101,26 @@ class Qwen36ModelArgs(ModelArgs):
         self.linear_key_head_dim = getattr(text_config, "linear_key_head_dim", 128)
         self.linear_value_head_dim = getattr(text_config, "linear_value_head_dim", 128)
         self.linear_conv_kernel_dim = getattr(text_config, "linear_conv_kernel_dim", 4)
+        # output_gate_type belongs to GDN RMSNormGated, not full attention
+        # (which uses sigmoid in both Transformers and SGLang).
+        self.output_gate_type = getattr(text_config, "output_gate_type", None) or "swish"
+        if self.output_gate_type not in ("swish", "silu", "sigmoid"):
+            raise ValueError(f"Unsupported GDN output gate: {self.output_gate_type}")
+        self.mamba_ssm_dtype = getattr(text_config, "mamba_ssm_dtype", "float32")
+        if self.mamba_ssm_dtype not in ("float32", "bfloat16"):
+            raise ValueError(f"Unsupported GDN state dtype: {self.mamba_ssm_dtype}")
+        if self.linear_num_value_heads % self.linear_num_key_heads:
+            raise ValueError("GDN value heads must be a multiple of key heads")
+        if os.environ.get("QWEN36_GENERIC_BASELINE") == "1":
+            os.environ["QWEN_GDN_FP32_STATE"] = "1" if self.mamba_ssm_dtype == "float32" else "0"
 
         # Full layer_types list for DeltaNet vs full-attn dispatch.
-        self.attention_type_list = getattr(text_config, "layer_types", None) or (
-            ["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 8
-        )
+        self.attention_type_list = getattr(text_config, "layer_types", None) or [
+            "full_attention" if (i + 1) % getattr(text_config, "full_attention_interval", 4) == 0
+            else "linear_attention" for i in range(self.n_layers)
+        ]
+        if len(self.attention_type_list) != self.n_layers:
+            raise ValueError("layer_types length must match num_hidden_layers")
 
         # Derived
         self.linear_q_dim = self.linear_num_key_heads * self.linear_key_head_dim
@@ -89,7 +131,11 @@ class Qwen36ModelArgs(ModelArgs):
         if mesh_device is not None:
             import ttnn
 
-            self.weight_dtype = ttnn.bfloat8_b
+            self.weight_dtype = (
+                ttnn.bfloat4_b
+                if os.environ.get("QWEN36_BFP4_WEIGHTS") == "1"
+                else ttnn.bfloat8_b
+            )
             self.act_dtype = ttnn.bfloat16
         else:
             self.weight_dtype = None
@@ -275,6 +321,8 @@ class Qwen36ModelArgs(ModelArgs):
 
         if dtype == ttnn.bfloat8_b:
             suffix = "tensor_cache_bfp8"
+        elif dtype == ttnn.bfloat4_b:
+            suffix = "tensor_cache_bfp4_mixed"
         else:
             suffix = "tensor_cache_bf16"
         if self.num_devices > 1:
@@ -285,15 +333,36 @@ class Qwen36ModelArgs(ModelArgs):
     def load_state_dict(self):
         """Load + remap weights via the text-only HF Qwen3_5ForCausalLM.
         Overrides base meta-key loader."""
+        native_manifest = Path(self.CKPT_DIR) / "native_manifest.json"
+        if native_manifest.is_file():
+            import native_checkpoint as loader
+
+            loader.validate_runtime(self.CKPT_DIR, Path(__file__).resolve().parents[1], self.num_devices)
+            manifest = loader.read_manifest(self.CKPT_DIR)
+            serialized = os.environ.get("QWEN36_EVAL_PRECISION")
+            if serialized is not None:
+                import json
+
+                if json.loads(serialized) != manifest["precision"]:
+                    raise ValueError("Runtime precision must match the native checkpoint precision map")
+            else:
+                import json
+
+                os.environ["QWEN36_EVAL_PRECISION"] = json.dumps(manifest["precision"])
+            return loader.load_native_checkpoint(self.CKPT_DIR)
         from models.demos.blackhole.qwen36.tt.weight_mapping import (
             is_fp8_checkpoint,
+            load_qwen36_mtp_state_dict,
             load_qwen36_state_dict_fp8,
             remap_qwen36_state_dict,
         )
 
         # Block FP8 checkpoints: dequant + remap for TP loaders (skip the HF model).
         if is_fp8_checkpoint(self.CKPT_DIR):
-            return load_qwen36_state_dict_fp8(self.CKPT_DIR)
+            state_dict = load_qwen36_state_dict_fp8(self.CKPT_DIR)
+            if os.environ.get("QWEN36_MTP") == "1":
+                state_dict.update(load_qwen36_mtp_state_dict(self.CKPT_DIR))
+            return state_dict
 
         # Import the HF classes directly rather than going through AutoModelForCausalLM.
         # Serving out-of-tree, vllm.transformers_utils.config registers vLLM's OWN
@@ -319,4 +388,6 @@ class Qwen36ModelArgs(ModelArgs):
         model = Qwen3_5ForCausalLM.from_pretrained(self.CKPT_DIR, config=text_config, dtype="auto")
         state_dict = remap_qwen36_state_dict(model.state_dict())
         del model
+        if os.environ.get("QWEN36_MTP") == "1":
+            state_dict.update(load_qwen36_mtp_state_dict(self.CKPT_DIR))
         return state_dict

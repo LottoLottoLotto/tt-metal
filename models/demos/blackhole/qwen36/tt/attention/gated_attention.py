@@ -1,18 +1,19 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""The Qwen3.5-9B gated full-attention layer — composes config/weights/prefill/decode."""
+"""Qwen gated full attention — composes config/weights/prefill/decode."""
 
+import os
 import ttnn
-from models.demos.blackhole.qwen36.tt.attention.config import AttentionConfig
+from models.demos.blackhole.qwen36.tt.attention.config import AttentionConfig, optimized_27b_attention
 from models.demos.blackhole.qwen36.tt.attention.decode import decode_forward
 from models.demos.blackhole.qwen36.tt.attention.prefill import prefill_forward
 from models.demos.blackhole.qwen36.tt.attention.weights import load_attention_weights
 
 
 class Qwen36GatedAttention:
-    """Gated Full Attention layer for Qwen3.5-9B with KV cache.
+    """Gated Full Attention with KV cache.
 
-    Uses softmax SDPA with GQA (16 Q heads, 4 KV heads, head_dim=256)
+    Uses softmax SDPA with GQA (27B: 24 Q heads, 4 KV heads, head_dim=256)
     plus a sigmoid output gate derived from the 2x wide q_proj.
     Q and K are normalized with zero-centered RMSNorm before attention.
     """
@@ -20,8 +21,46 @@ class Qwen36GatedAttention:
     def __init__(self, mesh_device, config: AttentionConfig, state_dict, tensor_cache_path=None):
         self.device = mesh_device
         self.config = config
+        self.optimized_27b = optimized_27b_attention()
+        if self.optimized_27b and (config.num_heads, config.num_kv_heads, config.head_dim) != (24, 4, 256):
+            raise ValueError("Optimized 27B attention requires Q24/KV4/head256")
 
         self.weights = load_attention_weights(mesh_device, state_dict, tensor_cache_path)
+        self.decode_program_configs = {}
+        if self.optimized_27b or os.environ.get("QWEN36_SINGLE_1D_DECODE") == "1":
+            from models.demos.blackhole.qwen36.tt import tp_common as tpc
+
+            worker_grid = mesh_device.compute_with_storage_grid_size()
+            grid_w = min(int(os.environ.get("QWEN36_DECODE_GRID_W", "11")), worker_grid.x)
+            if self.optimized_27b:
+                if grid_w < 8 or worker_grid.y < 10:
+                    raise ValueError("Optimized 27B attention requires at least an 8x10 worker grid")
+                # QKV: 90 cores x 5 columns matches the packed worker-bank weight layout.
+                specs = {
+                    "q": (5120, 12288, 64), "k": (5120, 1024, 8),
+                    "v": (5120, 1024, 8), "o": (6144, 5120, tpc.proj_o_decode_cores(44)),
+                    "qkv": (5120, 14336, 90),
+                }
+            else:
+                specs = {
+                    name: (weight.shape[-2], weight.shape[-1], cores)
+                    for name, weight, cores in (
+                        ("q", self.weights.q_proj, 44), ("k", self.weights.k_proj, 8),
+                        ("v", self.weights.v_proj, 8), ("o", self.weights.o_proj, 33),
+                        ("qkv", self.weights.qkv_fused, 64),
+                    ) if weight is not None
+                }
+            self.decode_program_configs = {
+                name: tpc.create_matmul_1d_decode_progcfg(
+                    1, k, n, num_cores=num_cores, grid_w=grid_w,
+                )
+                for name, (k, n, num_cores) in specs.items()
+            }
+            if self.optimized_27b:
+                # Double-buffered BF16 in0/BF8 in1, BF16 output + FP32 partials:
+                # 2*4*2048 + 2*4*7*1088 + 7*(2048+4096) = 120320 B/core max (QKV uses 5 columns).
+                for pc in self.decode_program_configs.values():
+                    pc.in0_block_w = 4
 
         self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.LoFi,
@@ -54,7 +93,7 @@ class Qwen36GatedAttention:
         chunk_start_idx_tensor=None,
     ):
         T = x.shape[1]
-        mc = ttnn.L1_MEMORY_CONFIG if T == 1 else None
+        mc = ttnn.DRAM_MEMORY_CONFIG if self.optimized_27b else (ttnn.L1_MEMORY_CONFIG if T == 1 else None)
         ckc = self.compute_kernel_config_decode if T <= 1 else self.compute_kernel_config
 
         # Branches are mutually exclusive on T; decode (T==1) is checked first to keep the hot path short.
@@ -73,6 +112,8 @@ class Qwen36GatedAttention:
                 page_table=page_table,
                 paged_kv_cache_key=self.paged_kv_cache_key,
                 paged_kv_cache_value=self.paged_kv_cache_value,
+                program_configs=self.decode_program_configs,
+                qkv_fused_weight=self.weights.qkv_fused,
             )
         elif self.use_paged_attention and T > 1 and chunk_page_table is not None:
             # Branch A — paged prefill
@@ -112,6 +153,127 @@ class Qwen36GatedAttention:
             self.past_value = new_value
             return output
 
+    def verify_two(
+        self,
+        x,
+        cos,
+        sin,
+        position_tensor,
+        page_table,
+        shadow_fill_page_table,
+        shadow_source_page,
+        shadow_same_page,
+        verify_rows=None,
+    ):
+        """Run causal M=2 attention with the second KV position isolated in a shadow page."""
+        from models.experimental.gated_attention_gated_deltanet.tt.ttnn_gated_attention import (
+            gated_attention_forward_ttnn,
+        )
+
+        output, key1, value1 = gated_attention_forward_ttnn(
+            hidden_states=x,
+            q_proj_weight=self.weights.q_proj,
+            k_proj_weight=self.weights.k_proj,
+            v_proj_weight=self.weights.v_proj,
+            o_proj_weight=self.weights.o_proj,
+            q_norm_weight=self.weights.q_norm,
+            k_norm_weight=self.weights.k_norm,
+            cos=cos,
+            sin=sin,
+            num_attention_heads=self.config.num_heads,
+            num_key_value_heads=self.config.num_kv_heads,
+            head_dim=self.config.head_dim,
+            device=self.device,
+            norm_eps=self.config.norm_eps,
+            compute_kernel_config=self.compute_kernel_config_decode,
+            use_optimized_concat=True,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            norm_weights_pre_offset=True,
+            cur_pos_tensor=position_tensor,
+            page_table=page_table,
+            paged_kv_cache_key=self.paged_kv_cache_key,
+            paged_kv_cache_value=self.paged_kv_cache_value,
+            q_decode_program_config=self.decode_program_configs.get("q"),
+            k_decode_program_config=self.decode_program_configs.get("k"),
+            v_decode_program_config=self.decode_program_configs.get("v"),
+            o_decode_program_config=self.decode_program_configs.get("o"),
+            qkv_fused_weight=self.weights.qkv_fused,
+            qkv_fused_q_dim=2 * self.config.num_heads * self.config.head_dim,
+            qkv_fused_k_dim=self.config.num_kv_heads * self.config.head_dim,
+            qkv_fused_program_config=self.decode_program_configs.get("qkv"),
+            verify_two=True,
+            shadow_fill_page_table=shadow_fill_page_table,
+            shadow_source_page=shadow_source_page,
+            shadow_same_page=shadow_same_page,
+            verify_rows=verify_rows,
+        )
+        return output, (key1, value1)
+
+    def verify_many(self, x, cos, sin, position_tensor, page_table, fork_position=0,
+                    verify_rows=None, verify_groups=None):
+        """Verify 2..32 causal rows, leaving live KV unchanged until commit.
+
+        QKV and output projections run once with the decode accumulation config.
+        The returned single-use transaction owns candidate K/V and metadata.
+        With verify_groups (MTP chains only) KV rows are written directly into
+        the live cache and the returned transaction is None: rejected rows lie
+        beyond the committed context and are rewritten before any read.
+        """
+        from models.experimental.gated_attention_gated_deltanet.tt.ttnn_gated_attention import (
+            gated_attention_forward_ttnn,
+        )
+
+        if not self.use_paged_attention or len(x.shape) != 3 or x.shape[0] != 1:
+            raise ValueError("verify_many requires paged attention and [1,T,hidden] input")
+        if not 2 <= int(x.shape[1]) <= 32:
+            raise ValueError("verify_many supports 2..32 rows within one tile")
+        output, transaction, _ = gated_attention_forward_ttnn(
+            hidden_states=x,
+            q_proj_weight=self.weights.q_proj,
+            k_proj_weight=self.weights.k_proj,
+            v_proj_weight=self.weights.v_proj,
+            o_proj_weight=self.weights.o_proj,
+            q_norm_weight=self.weights.q_norm,
+            k_norm_weight=self.weights.k_norm,
+            cos=cos,
+            sin=sin,
+            num_attention_heads=self.config.num_heads,
+            num_key_value_heads=self.config.num_kv_heads,
+            head_dim=self.config.head_dim,
+            device=self.device,
+            norm_eps=self.config.norm_eps,
+            compute_kernel_config=self.compute_kernel_config_decode,
+            use_optimized_concat=True,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            norm_weights_pre_offset=True,
+            cur_pos_tensor=position_tensor,
+            page_table=page_table,
+            paged_kv_cache_key=self.paged_kv_cache_key,
+            paged_kv_cache_value=self.paged_kv_cache_value,
+            q_decode_program_config=self.decode_program_configs.get("q"),
+            k_decode_program_config=self.decode_program_configs.get("k"),
+            v_decode_program_config=self.decode_program_configs.get("v"),
+            o_decode_program_config=self.decode_program_configs.get("o"),
+            qkv_fused_weight=self.weights.qkv_fused,
+            qkv_fused_q_dim=2 * self.config.num_heads * self.config.head_dim,
+            qkv_fused_k_dim=self.config.num_kv_heads * self.config.head_dim,
+            qkv_fused_program_config=self.decode_program_configs.get("qkv"),
+            verify_many=True,
+            tree_fork_position=fork_position,
+            verify_rows=verify_rows,
+            verify_groups=verify_groups,
+        )
+        return output, transaction
+
+    def commit_verify_many(self, transaction, accepted_count, position_tensor, page_table):
+        """Commit only rows 0..accepted_count into the stable live KV buffers."""
+        from models.demos.blackhole.qwen36.tt.attention.verify import commit_verify_many
+
+        commit_verify_many(
+            transaction, accepted_count, position_tensor, page_table,
+            self.paged_kv_cache_key, self.paged_kv_cache_value,
+        )
+
     def reset_cache(self):
         """Clear the concat KV cache for a new sequence."""
         self.past_key = None
@@ -119,6 +281,15 @@ class Qwen36GatedAttention:
 
     def set_paged_kv_cache(self, k_cache, v_cache):
         """Attach externally-allocated paged KV cache (called once after allocate_kv_cache)."""
+        if self.optimized_27b:
+            for cache in (k_cache, v_cache):
+                if (
+                    cache.dtype not in (ttnn.bfloat16, ttnn.bfloat8_b) or cache.layout != ttnn.TILE_LAYOUT
+                    or len(cache.shape) != 4 or cache.shape[1] != 4 or cache.shape[-1] != 256
+                    or cache.shape[2] % 32 != 0
+                    or cache.memory_config() != ttnn.DRAM_MEMORY_CONFIG
+                ):
+                    raise ValueError("Optimized 27B KV cache must be tiled BF16/BFP8 DRAM [blocks,4,page,256]")
         self.paged_kv_cache_key = k_cache
         self.paged_kv_cache_value = v_cache
         self.use_paged_attention = True

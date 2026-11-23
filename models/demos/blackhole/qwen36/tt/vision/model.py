@@ -2,6 +2,8 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import math
+
 import torch
 from loguru import logger
 
@@ -17,6 +19,7 @@ from models.tt_transformers.tt.load_checkpoints import (
     standardize_hf_keys_multimodal,
 )
 
+from . import lean
 from .patch_merger import PatchMerger
 from .vision_block import VisionBlock
 from .vision_model_config import VisionModelArgs
@@ -121,9 +124,10 @@ class VisionTransformer(LightweightModule):
         x,
         unpadded_seq_len,
         rot_mats,
+        pad_marks=None,
     ):
         """
-        Forward pass through the Vision Transformer blocks.
+        Forward pass through the Vision Transformer blocks for ONE image or video frame.
 
         Args:
             x (ttnn.Tensor): Input tensor [batch_size, 1, seq_len, hidden_dim].
@@ -131,6 +135,8 @@ class VisionTransformer(LightweightModule):
                 `prepare_residual_tensor_prefill` shards at load time.
             unpadded_seq_len (int): Real sequence length before padding.
             rot_mats (list): Rotation matrices for positional embeddings.
+            pad_marks (tuple): (q_mark, k_mark) from vision_pad_marks, or None when the sequence
+                has no padding rows.
 
         Returns:
             ttnn.Tensor: Output tensor, fractured along dim=3 (each device owns
@@ -140,6 +146,7 @@ class VisionTransformer(LightweightModule):
             x = block(
                 x,
                 rot_mats=rot_mats,
+                pad_marks=pad_marks,
             )
 
         # The PatchMerger consumes the block output fractured along dim=3
@@ -149,6 +156,28 @@ class VisionTransformer(LightweightModule):
         x = x[:, :, :unpadded_seq_len, :]
         x = self.patch_merger(x)
         return x
+
+
+def vision_pad_marks(unpadded_seq_len, seq_len, head_dim, padded_head_dim, mesh_device):
+    """Padding mask for one segment, carried in a zero padded head-dim column (no S x S tensor).
+
+    Returns (q_mark, k_mark), each [1, 1, seq_len, padded_head_dim] BF16 and added to every head:
+    q_mark is 1 in the marker column; k_mark is -8192 there on padding rows and 0 on real rows.
+    The marker column starts a 16-wide block of padding columns, so BFP8 typecasts of q/k never
+    share an exponent between it and real values. None when there is no padding."""
+    if unpadded_seq_len == seq_len:
+        return None
+    col = math.ceil(head_dim / 16) * 16
+    assert col < padded_head_dim, f"no zero head-dim column for the padding mask ({head_dim} -> {padded_head_dim})"
+    q = torch.zeros(1, 1, seq_len, padded_head_dim, dtype=torch.bfloat16)
+    k = torch.zeros(1, 1, seq_len, padded_head_dim, dtype=torch.bfloat16)
+    q[..., col] = 1.0
+    k[..., unpadded_seq_len:, col] = -8192.0
+    upload = lambda t: ttnn.from_torch(  # noqa: E731
+        t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh_device,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+    )
+    return upload(q), upload(k)
 
 
 class DropInVisionTransformer(torch.nn.Module):
@@ -202,128 +231,69 @@ class DropInVisionTransformer(torch.nn.Module):
     def spatial_merge_size(self):
         return self.model_args.hf_config.vision_config.spatial_merge_size
 
-    def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass mimicking the Qwen3_5_VisionTransformerPretrainedModel interface.
+    def encode(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+        """Run the tower over every image / video frame; returns host BF16 ``[N, out_hidden_size]``.
 
         Args:
-            pixel_values (torch.Tensor): Input pixel values tensor (equivalent to hidden_states for the ref model start).
-                                         Shape typically [num_patches, hidden_size] or similar before patch_embed.
-            grid_thw (torch.Tensor): Tensor describing the grid dimensions (time, height, width) for each image/video.
-                                     Shape [num_images_or_videos, 3].
+            pixel_values (torch.Tensor): patchified pixels of all items, ``[num_patches, patch_dim]``.
+            grid_thw (torch.Tensor): per-item grid ``(t, h, w)``, ``[num_items, 3]``.
 
-        Returns:
-            torch.Tensor: Output tensor with shape [1, B, seq_len, out_hidden_size].
+        Patches attend only within their own image or video frame (the upstream ``cu_seqlens``
+        segments), and patch embedding, position embedding, rotary and the patch merger are
+        per-frame, so each frame runs as its own tower pass: exact, and no cross-frame mask.
         """
-        # process pixel_values for each image/video separately
-        all_pixel_values = pixel_values
-        all_grid_thw = grid_thw
-        final_outputs = []
-        # todo)) refactor this code to leverage tt-mesh's ttnn.ShardTensorToMesh(mesh_device, dim=batch_size_dim) for data parallelism
-        for grid_thw in all_grid_thw:
-            # --- pick out the pixel_values for this users' images (grid_thw.prod() pixels) ---
-            pixel_values = all_pixel_values[: grid_thw.prod(), :]
-            all_pixel_values = all_pixel_values[grid_thw.prod() :, :]
-            # --- Preprocessing ---
-            # 1. Calculate total unpadded sequence length
-            grid_thw = grid_thw.unsqueeze(0)
-            unpadded_seq_len = grid_thw.prod(dim=1).sum().item()
-            # Calculate padded sequence length (divisible by 2048) required by models/tt_transformers/tt/attention.py::forward_prefill
-            seq_len = ((unpadded_seq_len // 2048) + 1) * 2048
+        grids = [tuple(int(v) for v in g) for g in grid_thw.reshape(-1, 3).tolist()]
+        assert sum(t * h * w for t, h, w in grids) == pixel_values.shape[0], "pixel rows do not match grid_thw"
+        rows, offset = [], 0
+        for t, h, w in grids:
+            for _ in range(t):
+                rows.append(self._encode_frame(pixel_values[offset : offset + h * w], torch.tensor([[1, h, w]])))
+                offset += h * w
+        return torch.cat(rows, dim=0)
 
-            # 2. Use preprocessing function from reference/functional to get indices and embeddings
-            cu_seqlens, position_embeddings = qwen3_5_vision_transformer_preprocess(
-                seq_len=unpadded_seq_len,
-                grid_thw=grid_thw,
-                head_dim=self.model_args.head_dim,
-                spatial_merge_size=self.model_args.hf_config.vision_config.spatial_merge_size,
+    def _encode_frame(self, pixel_values, grid_thw):
+        """One image or video frame (grid ``[[1, h, w]]``) through the TT tower -> host ``[h*w/4, H]``."""
+        mesh = self.model_args.mesh_device
+        unpadded_seq_len = int(grid_thw.prod())
+        # Pad to a multiple of 2048 for the upstream attention configs; the lean path only needs 128.
+        seq_len = math.ceil(unpadded_seq_len / 128) * 128 if lean.LEAN else ((unpadded_seq_len // 2048) + 1) * 2048
+        _, position_embeddings = qwen3_5_vision_transformer_preprocess(
+            seq_len=unpadded_seq_len,
+            grid_thw=grid_thw,
+            head_dim=self.model_args.head_dim,
+            spatial_merge_size=self.model_args.hf_config.vision_config.spatial_merge_size,
+        )
+        patch_input = self.reference_model.patch_embed(pixel_values)
+        patch_input = patch_input + self.reference_model.fast_pos_embed_interpolate(grid_thw)
+
+        # Rotary tables padded with the identity rotation (cos = 1, sin = 0).
+        cos_orig, sin_orig = convert_rope_style_hf_to_meta(*position_embeddings)
+        pad = (0, 0, 0, seq_len - unpadded_seq_len)
+        rot_mats = [
+            ttnn.from_torch(
+                torch.nn.functional.pad(t, pad, value=v)[None, None], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
             )
-
-            # 3. Use reference model's patch embedding
-            patch_input = self.reference_model.patch_embed(pixel_values)
-            pos_embeds = self.reference_model.fast_pos_embed_interpolate(grid_thw)
-            patch_input = patch_input + pos_embeds
-
-            # 4. Prepare rotational embeddings (cos, sin) -> pad -> convert to TT tensors
-            cos_orig, sin_orig = position_embeddings
-            cos_orig, sin_orig = convert_rope_style_hf_to_meta(cos_orig, sin_orig)
-            # pad sequence length with cos = 1, sin = 0 (identity rotation)
-            cos_padded = (
-                torch.nn.functional.pad(cos_orig, (0, 0, 0, seq_len - unpadded_seq_len), value=1)
-                .unsqueeze(0)
-                .unsqueeze(0)
-            )
-            sin_padded = (
-                torch.nn.functional.pad(sin_orig, (0, 0, 0, seq_len - unpadded_seq_len), value=0)
-                .unsqueeze(0)
-                .unsqueeze(0)
-            )
-            # Convert to TT tensors on the mesh device
-            cos = ttnn.from_torch(
-                cos_padded,
-                dtype=ttnn.bfloat16,  # Use bfloat16 for RoPE
-                layout=ttnn.TILE_LAYOUT,
-                device=self.model_args.mesh_device,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(self.model_args.mesh_device),
-            )
-            sin = ttnn.from_torch(
-                sin_padded,
-                dtype=ttnn.bfloat16,  # Use bfloat16 for RoPE
-                layout=ttnn.TILE_LAYOUT,
-                device=self.model_args.mesh_device,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(self.model_args.mesh_device),
-            )
-            rot_mats = [cos, sin]
-
-            # 5. Prepare input tensor for the TT model using window_index
-            tt_input = self.tt_model.prepare_input(patch_input, seq_len)
-
-            # --- TT Model Execution ---
-            tt_out = self.tt_model(
-                tt_input,
-                unpadded_seq_len=unpadded_seq_len,
-                rot_mats=rot_mats,  # Use rot_mats generated in this forward pass
-            )
-
-            # deallocate device tensors that are not needed by decode
-            ttnn.deallocate(tt_input)
-            ttnn.deallocate(cos)
-            ttnn.deallocate(sin)
-            ttnn.deallocate(rot_mats[0])
-            ttnn.deallocate(rot_mats[1])
-
-            # --- Postprocessing ---
-            # 1. Extract the relevant output part and adjust shape (matching test logic).
-            # The merger output is fractured along dim=3, so each device owns
-            # out_hidden_size/TP channels.
-            out_hidden_size = (
-                self.model_args.hf_config.vision_config.out_hidden_size // self.model_args.cluster_shape[1]
-            )
-            # Output shape from TT is [1, B=1, S, H_out_padded], slice H and squeeze B, batch dims.
-            # The slice/reshape args are GLOBAL shapes; the tensor is already
-            # fractured along dim=3 and ttnn handles the per-device extents internally.
-            final_output = ttnn.reshape(tt_out[:, 0:1, :, :out_hidden_size], (-1, out_hidden_size))
-            # ttnn.deallocate(tt_out)
-
-            if self.debug:
-                logger.info(f"DropInVisionTransformer: Debug enabled, running reference model...")
-                reference_output = self.reference_model.forward(pixel_values, grid_thw)
-                _, pcc = comp_pcc(reference_output, final_output)
-                logger.info(f"DropInVisionTransformer: PCC to reference model: {pcc}")
-
-            # 2. The merger already produces a tensor fractured along the hidden
-            # dim (dim=3 in 4D / dim=1 in the 2D-reshaped view), which is the
-            # desired output sharding.
-            # final_output_sharded = final_output
-
-            # 3. Aggregate in batched users list
-            final_outputs.append(tt_out)
-
-        # concatenate all the outputs. With a single image, ttnn.concat aliases
-        # its lone input, so deallocating the sources would free the return.
-        if len(final_outputs) == 1:
-            return final_outputs[0]
-        tt_out = ttnn.concat(final_outputs, dim=1)
-        for t in final_outputs:
+            for t, v in ((cos_orig, 1.0), (sin_orig, 0.0))
+        ]
+        attention = self.tt_model.blocks[0].attention
+        pad_marks = vision_pad_marks(unpadded_seq_len, seq_len, attention.head_dim, attention.padded_head_dim, mesh)
+        tt_input = self.tt_model.prepare_input(patch_input, seq_len)
+        tt_out = self.tt_model(tt_input, unpadded_seq_len=unpadded_seq_len, rot_mats=rot_mats, pad_marks=pad_marks)
+        ttnn.deallocate(tt_input)
+        for t in rot_mats + list(pad_marks or ()):
             ttnn.deallocate(t)
-        return tt_out
+
+        # The merger output is fractured along dim=3 on a mesh (replicated across mesh rows).
+        out = ttnn.to_torch(
+            tt_out,
+            mesh_composer=ttnn.ConcatMesh2dToTensor(mesh, dims=(0, 3), mesh_shape=self.model_args.cluster_shape),
+        )
+        ttnn.deallocate(tt_out)
+        out_hidden_size = self.model_args.hf_config.vision_config.out_hidden_size
+        out = out[0, 0, : unpadded_seq_len // self.spatial_merge_size**2, :out_hidden_size].to(torch.bfloat16)
+        if self.debug:
+            reference_output = self.reference_model.forward(pixel_values, grid_thw)
+            _, pcc = comp_pcc(reference_output, out)
+            logger.info(f"DropInVisionTransformer: PCC to reference model: {pcc}")
+        return out

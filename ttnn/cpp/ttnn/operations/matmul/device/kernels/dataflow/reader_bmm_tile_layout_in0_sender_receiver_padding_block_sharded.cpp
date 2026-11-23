@@ -248,7 +248,7 @@ void kernel_main() {
                                          .noc_x_end = in0_mcast_dest_noc_end_x,
                                          .noc_y_end = in0_mcast_dest_noc_end_y,
                                          .addr = in0_tensor_local_l1_write_addr},
-                                        true);
+                                        noc_mode == DM_DEDICATED_NOC);
                                 }
                             }
                             // Mcast from different CB to another CB
@@ -278,8 +278,14 @@ void kernel_main() {
                                          .noc_x_end = in0_mcast_dest_noc_end_x,
                                          .noc_y_end = in0_mcast_dest_noc_end_y,
                                          .addr = in0_tensor_local_l1_write_addr},
-                                        true);
+                                        noc_mode == DM_DEDICATED_NOC);
                                 }
+                            }
+                            if constexpr (noc_mode == DM_DYNAMIC_NOC) {
+                                // A linked multicast forbids unicast on ANY command buffer
+                                // of this NoC, including the other RISC's packed DRAM reads.
+                                // Use unlinked data and complete it before publishing VALID.
+                                noc.async_write_barrier();
                             }
 
                             // We should also multicast the flag to destinations
@@ -308,7 +314,10 @@ void kernel_main() {
                                  .noc_x_end = in0_mcast_dest_noc_end_x,
                                  .noc_y_end = in0_mcast_dest_noc_end_y,
                                  .addr = in0_tensor_local_l1_write_addr},
-                                true);
+                                noc_mode == DM_DEDICATED_NOC);
+                            if constexpr (noc_mode == DM_DYNAMIC_NOC) {
+                                noc.async_write_barrier();
+                            }
 
                             // We should also multicast the flag to destinations
                             receiver_sem.set(VALID);
@@ -320,18 +329,22 @@ void kernel_main() {
                                 in0_mcast_dest_noc_end_y,
                                 in0_mcast_num_cores);
                         }
-                        // Note: no need for write barrier, since these two multicasts are done on the same noc id and
-                        // same vc even though cmd bufs are different Also, this only works because we are setting VCs
-                        // statically (using NOC_CMD_STATIC_VC).
+                        // Dedicated mode retains linked data/flag multicast on the same
+                        // static VC. Dynamic mode explicitly completed the unlinked data
+                        // before sending the flag, so concurrent unicast is safe.
 
-                        // Flush is required because the semaphore multicast reads receiver_sem's L1
-                        // address as the source value. Without a flush, the CPU can proceed to the next
-                        // iteration and overwrite receiver_sem to INVALID before the NoC has read the
-                        // VALID value from L1, causing receivers to see INVALID and hang.
-                        // In single-core receiver-grid configurations, semaphore multicast may be compiled out;
-                        // in that case, skip the flush to avoid an unnecessary stall.
+                        // The flag's L1 source must be consumed before it is reset to INVALID.
+                        // In dynamic mode also wait for delivery: our local set(VALID) can
+                        // satisfy receiver_sem.wait without observing the loopback flag.
+                        // A merely flushed flag could arrive after the next block sets INVALID
+                        // and falsely signal that next block. Complete it before semaphore reuse.
+                        // Skip when the single-core receiver grid emits no flag multicast.
                         if constexpr (!(core_in_in0_receiver_mcast_grid && (in0_mcast_num_cores == 1))) {
-                            noc.async_writes_flushed();
+                            if constexpr (noc_mode == DM_DYNAMIC_NOC) {
+                                noc.async_write_barrier();
+                            } else {
+                                noc.async_writes_flushed();
+                            }
                         }
                     } else if constexpr (core_in_in0_receiver_mcast_grid) {
                         // Increment remote sender's semaphore using pre-computed coordinates
@@ -358,4 +371,9 @@ void kernel_main() {
     }
 
     noc.async_write_barrier();
+    if constexpr (noc_mode == DM_DYNAMIC_NOC) {
+        // Receiver-role readiness atomics share this NCRISC's dynamic read/atomic
+        // command buffer. Drain their acknowledgements before firmware checks both NoCs.
+        noc.async_atomic_barrier();
+    }
 }

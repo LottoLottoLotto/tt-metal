@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdlib>
 #include <tt_stl/assert.hpp>
 #include <buffer.hpp>
 #include <buffer_types.hpp>
@@ -311,7 +312,19 @@ void GlobalCircularBuffer::setup_cb_buffers(BufferType buffer_type, uint32_t max
         .buffer_layout = TensorMemoryLayout::HEIGHT_SHARDED,
         .shard_parameters = shard_parameters,
     };
-    cb_buffer_ = distributed::AnyBuffer::create(cb_buffer_shard_config);
+    // Qwen decode weight prefetch: TT_GCB_UNTRACKED_DATA_ADDR places the FIFO at a caller-reserved L1 address
+    // as a non-owning view (the caller holds an allocator reservation there only while decode programs run,
+    // and releases it for prefill, whose circular buffers need that L1 while the FIFO is empty). The small
+    // config/counter block then lives in L1_SMALL, which circular buffers never overlap, so the GCB state
+    // survives prefill.
+    std::optional<uint64_t> untracked_data_address;
+    BufferType config_buffer_type = buffer_type;
+    if (const char* addr = std::getenv("TT_GCB_UNTRACKED_DATA_ADDR");
+        addr != nullptr && addr[0] != '\0' && buffer_type == BufferType::L1) {
+        untracked_data_address = std::strtoull(addr, nullptr, 10);
+        config_buffer_type = BufferType::L1_SMALL;
+    }
+    cb_buffer_ = distributed::AnyBuffer::create(cb_buffer_shard_config, untracked_data_address);
 
     auto l1_alignment = MetalContext::instance(extract_context_id(device_)).hal().get_alignment(HalMemType::L1);
     // [0] is_sender, [1] num_receivers, [2] fifo_start_addr, [3] fifo_size, [4] fifo_ptr,
@@ -327,7 +340,7 @@ void GlobalCircularBuffer::setup_cb_buffers(BufferType buffer_type, uint32_t max
         .device = device_,
         .size = cb_config_size,
         .page_size = cb_config_page_size,
-        .buffer_type = buffer_type,
+        .buffer_type = config_buffer_type,
         .buffer_layout = TensorMemoryLayout::HEIGHT_SHARDED,
         .shard_parameters = std::move(shard_parameters),
     };

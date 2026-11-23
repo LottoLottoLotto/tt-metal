@@ -16,12 +16,7 @@ def warmup_decode_buckets(generator, warmup, *args, **kwargs):
     if os.environ.get("TT_DECODE_BUCKETING", "1") != "1" or not isinstance(max_batch_size, int) or max_batch_size <= 1:
         return warmup(*args, **kwargs)
 
-    widths = []
-    width = 1
-    while width < max_batch_size:
-        widths.append(width)
-        width *= 2
-    widths.append(max_batch_size)
+    widths = generator.decode_bucket_widths(max_batch_size)
 
     result = None
     compile_key = (
@@ -125,7 +120,9 @@ def prime_decode_trace(generator, model, tokens, current_pos, page_table):
     ``tokens`` [B,1], ``current_pos`` a [B] tensor, ``page_table`` host tensor.
     """
     saved = model._save_deltanet_states()
-    generator.decode_forward(
-        tokens, current_pos, page_table=page_table, kv_cache=None, enable_trace=True, read_from_device=True
-    )
-    model._restore_deltanet_states(saved, model.mesh_device)
+    try:
+        generator.decode_forward(
+            tokens, current_pos, page_table=page_table, kv_cache=None, enable_trace=True, read_from_device=True
+        )
+    finally:
+        model._restore_deltanet_states(saved, model.mesh_device)
