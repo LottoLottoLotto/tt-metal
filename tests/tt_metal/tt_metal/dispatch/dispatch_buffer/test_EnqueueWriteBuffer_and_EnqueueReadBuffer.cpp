@@ -274,7 +274,8 @@ void test_EnqueueWriteBuffer_and_EnqueueReadBuffer(
     distributed::MeshCommandQueue& cq,
     const TestBufferConfig& config) {
     auto* device = mesh_device->impl().get_devices()[0];
-    // Clear out command queue
+    // Clear out command queue. Drain it first: commands the device has not fetched yet would be zeroed under it.
+    distributed::Finish(cq);
     uint16_t channel =
         tt::tt_metal::MetalContext::instance().get_cluster().get_assigned_channel_for_device(device->id());
     ChipId mmio_device_id =
