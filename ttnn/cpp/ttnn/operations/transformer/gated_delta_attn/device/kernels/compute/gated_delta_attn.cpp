@@ -30,12 +30,14 @@
 #include "api/dataflow/circular_buffer.h"
 
 // CB indices (must match program factory)
+// Reader-owned phase streams. Reusing the same id (not merely the same
+// address) makes the producer wait for each compute pop before overwriting.
 constexpr uint32_t cb_L_unit = tt::CBIndex::c_0;
+constexpr uint32_t cb_q_decay = cb_L_unit;
+constexpr uint32_t cb_intra_att = cb_L_unit;
+constexpr uint32_t cb_k_dt = cb_L_unit;
 constexpr uint32_t cb_v_beta_sc = tt::CBIndex::c_1;
-constexpr uint32_t cb_k_bd_sc = tt::CBIndex::c_2;
-constexpr uint32_t cb_intra_att = tt::CBIndex::c_3;
-constexpr uint32_t cb_q_decay = tt::CBIndex::c_4;
-constexpr uint32_t cb_k_dt = tt::CBIndex::c_5;
+constexpr uint32_t cb_k_bd_sc = cb_v_beta_sc;
 constexpr uint32_t cb_dl_exp = tt::CBIndex::c_6;
 // c_7: unused (was identity_32)
 constexpr uint32_t cb_S = tt::CBIndex::c_8;  // persistent state
@@ -51,17 +53,18 @@ constexpr uint32_t cb_L_inv_1 = tt::CBIndex::c_15;
 constexpr uint32_t cb_L_inv_2 = tt::CBIndex::c_16;
 constexpr uint32_t cb_L_inv_3 = tt::CBIndex::c_17;
 
+// Ct == Kt == Vt == 4, so every phase buffer below has 16 fp32 tiles.
+// Reuse each CB only after its prior value has been popped.
 constexpr uint32_t cb_v_cor = tt::CBIndex::c_18;
-constexpr uint32_t cb_k_cum = tt::CBIndex::c_19;
-
-constexpr uint32_t cb_v_prime = tt::CBIndex::c_20;
-constexpr uint32_t cb_v_new = tt::CBIndex::c_21;
-constexpr uint32_t cb_o_inter = tt::CBIndex::c_22;
-constexpr uint32_t cb_intra_v = tt::CBIndex::c_23;
-constexpr uint32_t cb_out = tt::CBIndex::c_24;
-constexpr uint32_t cb_s_upd = tt::CBIndex::c_25;
-constexpr uint32_t cb_S_tmp = tt::CBIndex::c_26;
+constexpr uint32_t cb_intra_v = cb_v_cor;
 constexpr uint32_t cb_final_state = tt::CBIndex::c_27;
+constexpr uint32_t cb_k_cum = tt::CBIndex::c_19;
+constexpr uint32_t cb_S_tmp = cb_k_cum;
+constexpr uint32_t cb_v_prime = tt::CBIndex::c_20;
+constexpr uint32_t cb_o_inter = cb_v_prime;
+constexpr uint32_t cb_s_upd = cb_v_prime;
+constexpr uint32_t cb_v_new = tt::CBIndex::c_21;
+constexpr uint32_t cb_out = tt::CBIndex::c_24;
 
 // Reconfigure sources + packer and re-init the matmul MOP for a new in0 @ in1 -> out matmul.
 // Matmul maps in0 -> SrcB and in1 -> SrcA, so the source reconfig uses SrcOrder::Reverse.
@@ -212,6 +215,7 @@ void kernel_main() {
     constexpr uint32_t Ct = get_compile_time_arg_val(0);
     constexpr uint32_t Kt = get_compile_time_arg_val(1);
     constexpr uint32_t Vt = get_compile_time_arg_val(2);
+    static_assert(Ct == 4 && Kt == 4 && Vt == 4);
 
     const uint32_t num_chunks = get_arg_val<uint32_t>(0);
 
@@ -231,15 +235,10 @@ void kernel_main() {
     CircularBuffer(cb_S).wait_front(state_tiles);
 
     for (uint32_t c = 0; c < num_chunks; c++) {
-        // Wait for all per-chunk inputs (loaded by reader).
+        // Reader supplies L_unit and the first RHS, then the four inverses,
+        // before waiting for the RHS stream to become free for k_bd_sc.
         CircularBuffer(cb_L_unit).wait_front(attn_tiles);
         CircularBuffer(cb_v_beta_sc).wait_front(out_tiles);
-        CircularBuffer(cb_k_bd_sc).wait_front(in_kv_tiles);
-        CircularBuffer(cb_intra_att).wait_front(attn_tiles);
-        CircularBuffer(cb_q_decay).wait_front(in_kv_tiles);
-        CircularBuffer(cb_k_dt).wait_front(kdt_tiles);
-        CircularBuffer(cb_dl_exp).wait_front(1);
-        // CB14-17 (L_inv0..3) loaded per chunk by reader.
 
         // ==================================================================
         // PA2. Forward substitution: v_cor = L_unit^{-1} @ v_beta_sc
@@ -255,11 +254,13 @@ void kernel_main() {
             cb_L_inv_2,
             cb_L_inv_3,
             /*pop_inv=*/false);
+        CircularBuffer(cb_v_beta_sc).pop_front(out_tiles);
 
         // ==================================================================
         // PA3. Forward substitution: k_cum = L_unit^{-1} @ k_bd_sc
         //      Pop L_inv tiles after this pass (pop_inv=true).
         // ==================================================================
+        CircularBuffer(cb_k_bd_sc).wait_front(in_kv_tiles);
         fwd_sub_4rows(
             Ct,
             Kt,
@@ -273,7 +274,6 @@ void kernel_main() {
 
         // Free per-chunk input CBs no longer needed after preprocessing.
         CircularBuffer(cb_L_unit).pop_front(attn_tiles);
-        CircularBuffer(cb_v_beta_sc).pop_front(out_tiles);
         CircularBuffer(cb_k_bd_sc).pop_front(in_kv_tiles);
 
         // ==================================================================
@@ -319,6 +319,7 @@ void kernel_main() {
         // ==================================================================
         // 3. o_inter = q_decay @ S
         // ==================================================================
+        CircularBuffer(cb_q_decay).wait_front(in_kv_tiles);
         CircularBuffer(cb_o_inter).reserve_back(out_tiles);
         matmul_reconfig_and_init(cb_q_decay, cb_S, cb_o_inter);
         for (uint32_t ct = 0; ct < Ct; ct++) {
@@ -339,6 +340,7 @@ void kernel_main() {
         // ==================================================================
         // 4. intra_v = intra_attn @ v_new
         // ==================================================================
+        CircularBuffer(cb_intra_att).wait_front(attn_tiles);
         CircularBuffer(cb_v_new).wait_front(out_tiles);
         CircularBuffer(cb_intra_v).reserve_back(out_tiles);
         matmul_reconfig_and_init(cb_intra_att, cb_v_new, cb_intra_v);
@@ -379,6 +381,7 @@ void kernel_main() {
         // ==================================================================
         // 6. s_upd = k_decay_t @ v_new
         // ==================================================================
+        CircularBuffer(cb_k_dt).wait_front(kdt_tiles);
         CircularBuffer(cb_s_upd).reserve_back(state_tiles);
         matmul_reconfig_and_init(cb_k_dt, cb_v_new, cb_s_upd);
         for (uint32_t kt = 0; kt < Kt; kt++) {
@@ -400,6 +403,7 @@ void kernel_main() {
         // ==================================================================
         // 7a. S_tmp = S * dl_exp
         // ==================================================================
+        CircularBuffer(cb_dl_exp).wait_front(1);
         CircularBuffer(cb_s_upd).wait_front(state_tiles);
         CircularBuffer(cb_S_tmp).reserve_back(state_tiles);
         mul_tiles_bcast_scalar_init_short(cb_S, cb_dl_exp);
@@ -416,7 +420,8 @@ void kernel_main() {
         CircularBuffer(cb_dl_exp).pop_front(1);
 
         // ==================================================================
-        // 7b. S = S_tmp + s_upd  (last chunk writes to cb_final_state)
+        // 7b. S = S_tmp + s_upd. On the last chunk CB27 aliases the now-popped
+        // CB8 storage; no reader/compute consumer can still access the old S.
         // ==================================================================
         CircularBuffer(cb_S_tmp).wait_front(state_tiles);
         const bool is_last_chunk = (c == num_chunks - 1);

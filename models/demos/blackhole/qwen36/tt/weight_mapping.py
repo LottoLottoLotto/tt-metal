@@ -11,6 +11,7 @@ Handles:
 - Renaming lm_head.weight → output.weight
 - Renaming embed_tokens → tok_embeddings
 """
+from collections.abc import Mapping
 import json
 from pathlib import Path
 from typing import Dict
@@ -106,6 +107,148 @@ def remap_qwen36_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, to
         remapped[new_key] = tensor
 
     return remapped
+
+class LazyQwen35MoeStateDict(Mapping):
+    """Read one remapped tensor at a time from the original sharded checkpoint."""
+
+    def __init__(self, checkpoint: str | Path):
+        from safetensors import safe_open
+
+        self.checkpoint = Path(checkpoint)
+        self._safe_open = safe_open
+        with (self.checkpoint / "model.safetensors.index.json").open() as stream:
+            index = json.load(stream)["weight_map"]
+        self._entries = {}
+        for source_name, shard_name in index.items():
+            if "visual" in source_name or source_name.startswith("mtp."):
+                continue
+            remapped = self._remapped_names(source_name)
+            for name, selector in remapped:
+                if name in self._entries:
+                    raise ValueError(f"Duplicate remapped checkpoint key: {name}")
+                self._entries[name] = (source_name, shard_name, selector)
+
+    @staticmethod
+    def _remapped_names(source_name):
+        name = source_name
+        for prefix in ("model.language_model.", "model."):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+        if name == "embed_tokens.weight":
+            return (("tok_embeddings.weight", None),)
+        if source_name == "lm_head.weight":
+            return (("output.weight", None),)
+        if name.endswith(".linear_attn.in_proj_qkv.weight"):
+            return ((name.replace(".linear_attn.in_proj_qkv.weight", ".linear_attn.qkv_proj.weight"), None),)
+        if name.endswith(".linear_attn.conv1d.weight"):
+            base = name.removesuffix("conv1d.weight")
+            return (
+                (base + "q_conv.weight", "q"),
+                (base + "k_conv.weight", "k"),
+                (base + "v_conv.weight", "v"),
+            )
+        return ((name, None),)
+
+    def __iter__(self):
+        return iter(self._entries)
+
+    def __len__(self):
+        return len(self._entries)
+
+    def __getitem__(self, name):
+        source_name, shard_name, selector = self._entries[name]
+        with self._safe_open(str(self.checkpoint / shard_name), framework="pt", device="cpu") as shard:
+            tensor = shard.get_tensor(source_name)
+        if selector is None:
+            return tensor
+        q_end = LINEAR_Q_DIM
+        k_end = q_end + LINEAR_K_DIM
+        if selector == "q":
+            return tensor[:q_end]
+        if selector == "k":
+            return tensor[q_end:k_end]
+        return tensor[k_end:]
+
+
+def prepare_qwen35_moe_layer(mlp_state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Convert one HF Qwen3.5 MoE MLP to the local TT canonical orientation.
+
+    HF stores linear weights as ``[out, in]`` and packs routed gate/up along the
+    output axis. The local runtime consumes ``[in, out]``:
+
+    * router: ``[hidden, experts]``
+    * routed gate/up: ``[experts, hidden, 2 * intermediate]``
+    * routed down: ``[experts, intermediate, hidden]``
+    * shared gate/up and down use the same trailing orientations
+    * shared-expert gate: ``[hidden, 1]``
+    """
+    required = {
+        "gate.weight",
+        "experts.gate_up_proj",
+        "experts.down_proj",
+        "shared_expert.gate_proj.weight",
+        "shared_expert.up_proj.weight",
+        "shared_expert.down_proj.weight",
+        "shared_expert_gate.weight",
+    }
+    missing = sorted(required.difference(mlp_state))
+    if missing:
+        raise KeyError(f"Missing Qwen MoE weights: {missing}")
+
+    router = mlp_state["gate.weight"].T
+    gate_up = mlp_state["experts.gate_up_proj"].transpose(-2, -1)
+    down = mlp_state["experts.down_proj"].transpose(-2, -1)
+    shared_gate = mlp_state["shared_expert.gate_proj.weight"].T
+    shared_up = mlp_state["shared_expert.up_proj.weight"].T
+    shared_gate_up = torch.cat((shared_gate, shared_up), dim=-1)
+    shared_down = mlp_state["shared_expert.down_proj.weight"].T
+    shared_expert_gate = mlp_state["shared_expert_gate.weight"].T
+
+    experts, hidden, packed_intermediate = gate_up.shape
+    intermediate = packed_intermediate // 2
+    expected = {
+        "router": (hidden, experts),
+        "down": (experts, intermediate, hidden),
+        "shared_gate_up": (hidden, packed_intermediate),
+        "shared_down": (intermediate, hidden),
+        "shared_expert_gate": (hidden, 1),
+    }
+    tensors = {
+        "router": router,
+        "gate_up": gate_up,
+        "down": down,
+        "shared_gate_up": shared_gate_up,
+        "shared_down": shared_down,
+        "shared_expert_gate": shared_expert_gate,
+    }
+    for name, shape in expected.items():
+        if tuple(tensors[name].shape) != shape:
+            raise ValueError(f"{name} shape {tuple(tensors[name].shape)} must be {shape}")
+    return tensors
+
+
+def load_qwen36_mtp_state_dict(model_path) -> Dict[str, torch.Tensor]:
+    """Load only the checkpoint's small MTP subtree from sharded safetensors."""
+    from safetensors import safe_open
+
+    model_path = Path(model_path)
+    with open(model_path / "model.safetensors.index.json") as f:
+        weight_map = json.load(f)["weight_map"]
+
+    file_to_keys: Dict[str, list[str]] = {}
+    for key, filename in weight_map.items():
+        if key.startswith("mtp."):
+            file_to_keys.setdefault(filename, []).append(key)
+
+    mtp: Dict[str, torch.Tensor] = {}
+    for filename, keys in file_to_keys.items():
+        with safe_open(str(model_path / filename), framework="pt") as sf:
+            for key in keys:
+                mtp[key] = sf.get_tensor(key)
+    if not mtp:
+        raise ValueError(f"Qwen3.5 checkpoint at {model_path} has no mtp.* weights")
+    return mtp
 
 
 def is_fp8_checkpoint(model_path) -> bool:

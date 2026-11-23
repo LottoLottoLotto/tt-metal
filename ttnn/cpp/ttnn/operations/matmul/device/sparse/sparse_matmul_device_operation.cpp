@@ -265,6 +265,15 @@ SparseMatmulDeviceOperation::tensor_return_value_t SparseMatmulDeviceOperation::
                 "If using optional output tensors, all output tensors must have a value");
             output_tensors.emplace_back(optional_output_tensor.value());
         }
+    } else {
+        const auto& device = input_tensors.at(0).device();
+        const auto& output_specs = compute_output_specs(operation_attributes, tensor_args);
+        output_tensors.reserve(output_specs.size());
+        for (const auto& output_spec : output_specs) {
+            output_tensors.emplace_back(create_device_tensor(output_spec, device));
+        }
+    }
+    if (operation_attributes.zero_output) {
         for (auto& output_tensor : output_tensors) {
             output_tensor = ttnn::zeros_like(
                 output_tensor,
@@ -274,22 +283,6 @@ SparseMatmulDeviceOperation::tensor_return_value_t SparseMatmulDeviceOperation::
                 std::nullopt,
                 std::optional<Tensor>(output_tensor));
         }
-        return output_tensors;
-    }
-    const auto& device = input_tensors.at(0).device();
-    const auto& output_specs = compute_output_specs(operation_attributes, tensor_args);
-    output_tensors.reserve(output_specs.size());
-    for (const auto& output_spec : output_specs) {
-        output_tensors.emplace_back(create_device_tensor(output_spec, device));
-    }
-    for (auto& output_tensor : output_tensors) {
-        output_tensor = ttnn::zeros_like(
-            output_tensor,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::optional<Tensor>(output_tensor));
     }
     return output_tensors;
 }
@@ -312,7 +305,8 @@ std::tuple<SparseMatmulParams, SparseMatmulInputs> sparse_matmul_build_operation
     const std::optional<const CoreCoord>& user_core_coord,
     const std::optional<const tt::tt_metal::Tile>& output_tile,
     const std::optional<const GlobalCircularBuffer>& global_cb,
-    const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id) {
+    const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id,
+    bool zero_output) {
     auto sparse_matmul_attributes = SparseMatmulParams{
         nnz,
         is_input_a_sparse,
@@ -324,7 +318,8 @@ std::tuple<SparseMatmulParams, SparseMatmulInputs> sparse_matmul_build_operation
         user_core_coord,
         output_tile,
         global_cb,
-        sub_device_id};
+        sub_device_id,
+        zero_output};
 
     auto parameters = create_sparse_matmul_attributes(
         input_tensor_a, input_tensor_b, sparsity, sparse_matmul_attributes, {optional_output_tensor});
@@ -347,7 +342,8 @@ SparseMatmulDeviceOperation::tensor_return_value_t sparse_matmul(
     const std::optional<const CoreCoord>& user_core_coord,
     const std::optional<const tt::tt_metal::Tile>& output_tile,
     const std::optional<const GlobalCircularBuffer>& global_cb,
-    const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id) {
+    const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id,
+    bool zero_output) {
     auto [params, inputs] = sparse_matmul_build_operation_args(
         input_tensor_a,
         input_tensor_b,
@@ -363,7 +359,8 @@ SparseMatmulDeviceOperation::tensor_return_value_t sparse_matmul(
         user_core_coord,
         output_tile,
         global_cb,
-        sub_device_id);
+        sub_device_id,
+        zero_output);
     return ttnn::device_operation::launch<SparseMatmulDeviceOperation>(params, inputs);
 }
 
@@ -406,6 +403,7 @@ SparseMatmulParams create_sparse_matmul_attributes(
         matmul_struct.user_core_coord,
         matmul_struct.output_tile,
         matmul_struct.global_cb,
-        matmul_struct.sub_device_id};
+        matmul_struct.sub_device_id,
+        parameters.zero_output};
 }
 }  // namespace ttnn::prim

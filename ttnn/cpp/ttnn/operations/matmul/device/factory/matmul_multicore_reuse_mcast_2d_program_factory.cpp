@@ -34,6 +34,12 @@ using tt::tt_metal::ProgramDescriptor;
 
 namespace ttnn::prim {
 
+namespace reuse_mcast_1d_optimized_helpers {
+// Defined in matmul_multicore_reuse_mcast_1d_program_factory.cpp: one canonical
+// bank-packed weight serves decode (1D packed readers) and 2D prefill (this file).
+bool qwen_packed_page_map(std::map<std::string, std::string>& defines, uint32_t K, uint32_t N, tt::DataFormat format);
+}  // namespace reuse_mcast_1d_optimized_helpers
+
 namespace reuse_mcast_optimized_helpers {
 
 static ProgramDescriptor create_program_mcast_in0_in1_descriptor(
@@ -629,6 +635,14 @@ static ProgramDescriptor create_program_mcast_in0_in1_descriptor(
 
     if (in1_receiver.num_cores() == 0) {
         mm_kernel_in1_sender_writer_defines["SKIP_MCAST"] = "1";
+    }
+    // 2D prefill over the canonical packed weight: each in1 sender reads its N slab once
+    // through the logical->physical tile map and multicasts it to every M row-block, so
+    // large-M prefill reuses weights exactly like the unpacked 2D matmul does.
+    if (reuse_mcast_1d_optimized_helpers::qwen_packed_page_map(mm_kernel_in1_sender_writer_defines, K, N, in1_data_format)) {
+        TT_FATAL(
+            !in1_is_sharded && !transpose_b,
+            "Canonical packed 2D prefill requires an unsharded, non-transposed interleaved weight");
     }
     if (in1_is_sharded) {
         if (in1_is_dram) {
@@ -2163,6 +2177,14 @@ create_program_mcast_in0_in1(
 
     if (in1_receiver.num_cores() == 0) {
         mm_kernel_in1_sender_writer_defines["SKIP_MCAST"] = "1";
+    }
+    // 2D prefill over the canonical packed weight: each in1 sender reads its N slab once
+    // through the logical->physical tile map and multicasts it to every M row-block, so
+    // large-M prefill reuses weights exactly like the unpacked 2D matmul does.
+    if (reuse_mcast_1d_optimized_helpers::qwen_packed_page_map(mm_kernel_in1_sender_writer_defines, K, N, in1_data_format)) {
+        TT_FATAL(
+            !in1_is_sharded && !transpose_b,
+            "Canonical packed 2D prefill requires an unsharded, non-transposed interleaved weight");
     }
     if (in1_is_sharded) {
         if (in1_is_dram) {

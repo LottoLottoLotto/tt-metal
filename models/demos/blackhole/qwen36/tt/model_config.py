@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3.5-9B config for Blackhole P150.
+"""Qwen hybrid text config for Blackhole P150.
 
 Subclasses tt_transformers.ModelArgs. HF_MODEL env var is canonical (hub id or local dir);
 hub ids are snapshot_download'd first (AutoConfig on bare hub id is unreliable here).
@@ -16,11 +16,60 @@ from models.tt_transformers.tt.model_config import ModelArgs
 GDN_CONV1D_L1_SMALL_SIZE = 24576
 
 
+def evaluation_weight_dtype(family, cache_path, default):
+    """Resolve an isolated evaluator's fully expanded target precision map.
+
+    The evaluator owns validation and a content-addressed cache root. Normal
+    serving has no QWEN36_EVAL_PRECISION and retains its original loading path.
+    """
+    import json
+    import ttnn
+
+    serialized = os.environ.get("QWEN36_EVAL_PRECISION")
+    if serialized is None:
+        return default
+    # Draft layers are stored losslessly and retain their own runtime dtype
+    # policy; the target's layers.N precision map does not describe them.
+    if cache_path is not None and Path(cache_path).name.startswith("mtp.layers."):
+        return default
+    plan = json.loads(serialized)
+    if family == "lm_head":
+        name = plan["lm_head"]
+    else:
+        if cache_path is None or not Path(cache_path).name.startswith("layers."):
+            raise ValueError("Evaluation layer precision requires a layers.N cache path")
+        index = Path(cache_path).name.split(".")[1]
+        values = plan["layers"][index]
+        name = values.get("gdn_output", values["gdn"]) if family == "gdn_output" else values[family]
+    return {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b, "bfp4": ttnn.bfloat4_b}[name]
+
+
 class Qwen36ModelArgs(ModelArgs):
-    """Qwen3.5-9B ModelArgs for Blackhole P150."""
+    """Configuration-derived Qwen hybrid ModelArgs for Blackhole P150."""
 
     # Opt into base ModelArgs TP > n_kv_heads path; attention/tp.py replicates via replicate_kv_weight.
     SUPPORTS_KV_REPLICATION = True
+
+    def _set_params_from_dict(self, config):
+        """Teach the dense base parser which MoE width represents its MLP width.
+
+        The base ``ModelArgs`` parser understands ``intermediate_size`` but Qwen3.5
+        MoE exposes only ``moe_intermediate_size``. Supplying that equivalent field
+        avoids the dense-only ``ffn_dim_multiplier`` fallback while retaining the
+        base handling for dimensions, heads, vocabulary padding, and layer types.
+        """
+        text_config = config.get("text_config", config)
+        model_type = text_config.get("model_type", config.get("model_type"))
+        if model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
+            config = dict(config)
+            if "text_config" in config:
+                nested = dict(text_config)
+                nested["intermediate_size"] = nested["moe_intermediate_size"]
+                config["text_config"] = nested
+            else:
+                config["intermediate_size"] = text_config["moe_intermediate_size"]
+        super()._set_params_from_dict(config)
+
 
     def __init__(
         self,
@@ -29,9 +78,8 @@ class Qwen36ModelArgs(ModelArgs):
         max_seq_len=2048,
         **kwargs,
     ):
-        # HF_MODEL is canonical (defaults to Qwen/Qwen3.6-27B). Snapshot hub ids unless
-        # config.json exists locally (avoids cache-dir false positives).
-        hf_model = os.environ.setdefault("HF_MODEL", "Qwen/Qwen3.6-27B")
+        # HF_MODEL is canonical. Snapshot hub ids unless config.json exists locally.
+        hf_model = os.environ.setdefault("HF_MODEL", "Qwen/Qwen3.8-27B")
         if not os.path.isfile(os.path.join(hf_model, "config.json")):
             from huggingface_hub import snapshot_download
 
@@ -46,6 +94,25 @@ class Qwen36ModelArgs(ModelArgs):
 
         # Qwen3.5-specific params from HF text config (base sets dim, heads, layers, etc.).
         text_config = self.hf_config.get_text_config()
+        text_model_type = getattr(text_config, "model_type", None)
+        self.is_moe = text_model_type in ("qwen3_5_moe", "qwen3_5_moe_text")
+        self.num_experts = getattr(text_config, "num_experts", 0)
+        self.num_local_experts = self.num_experts
+        self.moe_intermediate_size = getattr(text_config, "moe_intermediate_size", None)
+        self.shared_expert_intermediate_size = getattr(
+            text_config, "shared_expert_intermediate_size", None
+        )
+        if self.is_moe:
+            if self.num_experts <= 0 or self.num_experts_per_tok <= 0:
+                raise ValueError("Qwen MoE config requires positive expert and top-k counts")
+            if self.moe_intermediate_size != self.hidden_dim:
+                raise ValueError(
+                    "Base MLP width must resolve to moe_intermediate_size; "
+                    f"got {self.hidden_dim} and {self.moe_intermediate_size}"
+                )
+            if self.shared_expert_intermediate_size != self.moe_intermediate_size:
+                raise ValueError("Local MoE currently requires routed and shared experts to have equal width")
+
 
         # RoPE: read partial_rotary_factor from rope_parameters first (some configs nest only there).
         # Top-level-only read silently used 1.0 and broke long-context RoPE on 3.5-27B.
@@ -74,11 +141,26 @@ class Qwen36ModelArgs(ModelArgs):
         self.linear_key_head_dim = getattr(text_config, "linear_key_head_dim", 128)
         self.linear_value_head_dim = getattr(text_config, "linear_value_head_dim", 128)
         self.linear_conv_kernel_dim = getattr(text_config, "linear_conv_kernel_dim", 4)
+        # output_gate_type belongs to GDN RMSNormGated, not full attention
+        # (which uses sigmoid in both Transformers and SGLang).
+        self.output_gate_type = getattr(text_config, "output_gate_type", None) or "swish"
+        if self.output_gate_type not in ("swish", "silu", "sigmoid"):
+            raise ValueError(f"Unsupported GDN output gate: {self.output_gate_type}")
+        self.mamba_ssm_dtype = getattr(text_config, "mamba_ssm_dtype", "float32")
+        if self.mamba_ssm_dtype not in ("float32", "bfloat16"):
+            raise ValueError(f"Unsupported GDN state dtype: {self.mamba_ssm_dtype}")
+        if self.linear_num_value_heads % self.linear_num_key_heads:
+            raise ValueError("GDN value heads must be a multiple of key heads")
+        if os.environ.get("QWEN36_GENERIC_BASELINE") == "1":
+            os.environ["QWEN_GDN_FP32_STATE"] = "1" if self.mamba_ssm_dtype == "float32" else "0"
 
         # Full layer_types list for DeltaNet vs full-attn dispatch.
-        self.attention_type_list = getattr(text_config, "layer_types", None) or (
-            ["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 8
-        )
+        self.attention_type_list = getattr(text_config, "layer_types", None) or [
+            "full_attention" if (i + 1) % getattr(text_config, "full_attention_interval", 4) == 0
+            else "linear_attention" for i in range(self.n_layers)
+        ]
+        if len(self.attention_type_list) != self.n_layers:
+            raise ValueError("layer_types length must match num_hidden_layers")
 
         # Derived
         self.linear_q_dim = self.linear_num_key_heads * self.linear_key_head_dim
@@ -89,7 +171,11 @@ class Qwen36ModelArgs(ModelArgs):
         if mesh_device is not None:
             import ttnn
 
-            self.weight_dtype = ttnn.bfloat8_b
+            self.weight_dtype = (
+                ttnn.bfloat4_b
+                if os.environ.get("QWEN36_BFP4_WEIGHTS") == "1"
+                else ttnn.bfloat8_b
+            )
             self.act_dtype = ttnn.bfloat16
         else:
             self.weight_dtype = None
@@ -97,6 +183,8 @@ class Qwen36ModelArgs(ModelArgs):
 
         # TP config (num_devices>1 only). 27B (1,4) sharded dims + DRAM matmul cfgs; see tp_common.py.
         self.num_devices = mesh_device.get_num_devices() if mesh_device is not None else 1
+        if self.is_moe and self.num_devices != 1:
+            raise ValueError("Qwen3.5 MoE currently supports exactly one P150")
         if mesh_device is not None and self.num_devices > 1:
             self._init_tp_config(mesh_device)
 
@@ -275,6 +363,8 @@ class Qwen36ModelArgs(ModelArgs):
 
         if dtype == ttnn.bfloat8_b:
             suffix = "tensor_cache_bfp8"
+        elif dtype == ttnn.bfloat4_b:
+            suffix = "tensor_cache_bfp4_mixed"
         else:
             suffix = "tensor_cache_bf16"
         if self.num_devices > 1:
@@ -285,38 +375,69 @@ class Qwen36ModelArgs(ModelArgs):
     def load_state_dict(self):
         """Load + remap weights via the text-only HF Qwen3_5ForCausalLM.
         Overrides base meta-key loader."""
+        native_manifest = Path(self.CKPT_DIR) / "native_manifest.json"
+        if native_manifest.is_file():
+            import json
+
+            manifest = json.loads(native_manifest.read_text())
+            if manifest.get("format") == "qwen36-35b-a3b-ttnn-native-v1":
+                from models.demos.blackhole.qwen36.tt.native_moe_checkpoint import (
+                    LazyNativeQwen35StateDict,
+                    read_manifest,
+                )
+
+                read_manifest(self.CKPT_DIR)
+                # Dense-projection precision mix chosen by per-layer sensitivity (see the
+                # plan's "source"); an explicit QWEN36_EVAL_PRECISION still overrides it.
+                if os.environ.get("QWEN36_EVAL_PRECISION") is None:
+                    os.environ["QWEN36_EVAL_PRECISION"] = (
+                        Path(__file__).with_name("qwen36_35b_a3b_precision.json").read_text()
+                    )
+                return LazyNativeQwen35StateDict(self.CKPT_DIR)
+            import native_checkpoint as loader
+
+            loader.validate_runtime(self.CKPT_DIR, Path(__file__).resolve().parents[1], self.num_devices)
+            manifest = loader.read_manifest(self.CKPT_DIR)
+            serialized = os.environ.get("QWEN36_EVAL_PRECISION")
+            if serialized is not None:
+                if json.loads(serialized) != manifest["precision"]:
+                    raise ValueError("Runtime precision must match the native checkpoint precision map")
+            else:
+                os.environ["QWEN36_EVAL_PRECISION"] = json.dumps(manifest["precision"])
+            return loader.load_native_checkpoint(self.CKPT_DIR)
+        if self.is_moe:
+            from models.demos.blackhole.qwen36.tt.weight_mapping import LazyQwen35MoeStateDict
+
+            return LazyQwen35MoeStateDict(self.CKPT_DIR)
         from models.demos.blackhole.qwen36.tt.weight_mapping import (
             is_fp8_checkpoint,
+            load_qwen36_mtp_state_dict,
             load_qwen36_state_dict_fp8,
             remap_qwen36_state_dict,
         )
 
         # Block FP8 checkpoints: dequant + remap for TP loaders (skip the HF model).
         if is_fp8_checkpoint(self.CKPT_DIR):
-            return load_qwen36_state_dict_fp8(self.CKPT_DIR)
+            state_dict = load_qwen36_state_dict_fp8(self.CKPT_DIR)
+            if os.environ.get("QWEN36_MTP") == "1":
+                state_dict.update(load_qwen36_mtp_state_dict(self.CKPT_DIR))
+            return state_dict
 
-        # Import the HF classes directly rather than going through AutoModelForCausalLM.
-        # Serving out-of-tree, vllm.transformers_utils.config registers vLLM's OWN
-        # Qwen3_5Config for model_type "qwen3_5" into transformers' AutoConfig
-        # (AutoConfig.register(..., exist_ok=True)), so AutoConfig hands back vLLM's class.
-        # transformers only unwraps a composite config to its text sub-config when
-        # `model_class.config_class == config.sub_configs["text_config"]` — an identity
-        # check that cannot hold across libraries — so the composite config would reach
-        # Qwen3_5ForCausalLM and fail on `config.vocab_size` (which lives one level down,
-        # in text_config). Naming the classes here keeps config and model from the same
-        # library, matching vision/vision_model_config.py::reference_vision_model.
-        #
-        # Qwen3_5TextConfig.from_pretrained picks the `text_config` sub-dict on composite
-        # (3.6 VLM) checkpoints via base_config_key, and reads a text-only (3.5) config.json
-        # as-is, so both checkpoint layouts land on the config Qwen3_5ForCausalLM expects.
+        # Name the dense Transformers classes directly to avoid vLLM's out-of-tree
+        # AutoConfig registration returning a config class from another library.
         from transformers.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5TextConfig
 
-        text_config = Qwen3_5TextConfig.from_pretrained(self.CKPT_DIR)
+        model_class = Qwen3_5ForCausalLM
+        config_class = Qwen3_5TextConfig
+
+        text_config = config_class.from_pretrained(self.CKPT_DIR)
         assert text_config.vocab_size == self.vocab_size and text_config.hidden_size == self.dim, (
             f"HF text config disagrees with model args: vocab_size {text_config.vocab_size} vs "
             f"{self.vocab_size}, hidden_size {text_config.hidden_size} vs {self.dim}"
         )
-        model = Qwen3_5ForCausalLM.from_pretrained(self.CKPT_DIR, config=text_config, dtype="auto")
+        model = model_class.from_pretrained(self.CKPT_DIR, config=text_config, dtype="auto")
         state_dict = remap_qwen36_state_dict(model.state_dict())
         del model
+        if os.environ.get("QWEN36_MTP") == "1":
+            state_dict.update(load_qwen36_mtp_state_dict(self.CKPT_DIR))
         return state_dict

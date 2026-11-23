@@ -16,6 +16,8 @@ class GDNConfig:
     k_dim: int
     v_dim: int
     long_prefill_chunk_size: int = 128
+    output_gate_type: str = "swish"
+    state_dtype: str = "float32"
 
     @classmethod
     def from_args(cls, args) -> "GDNConfig":
@@ -29,4 +31,6 @@ class GDNConfig:
             q_dim=args.linear_q_dim,
             k_dim=args.linear_k_dim,
             v_dim=args.linear_v_dim,
+            output_gate_type=getattr(args, "output_gate_type", "swish"),
+            state_dtype=getattr(args, "mamba_ssm_dtype", "float32"),
         )

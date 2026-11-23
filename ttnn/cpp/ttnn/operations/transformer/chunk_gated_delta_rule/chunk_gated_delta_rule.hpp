@@ -52,6 +52,34 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_gated_delta_rule(
     const std::optional<ttnn::Tensor>& eye = std::nullopt,
     const std::optional<ttnn::Tensor>& tril = std::nullopt,
     const std::optional<ttnn::Tensor>& ones = std::nullopt,
-    const std::optional<ttnn::Tensor>& masks = std::nullopt);
+    const std::optional<ttnn::Tensor>& masks = std::nullopt,
+    bool fuse_decode_frontend = false,
+    const std::optional<ttnn::Tensor>& decay_bias = std::nullopt,
+    const std::optional<ttnn::Tensor>& decay_scale = std::nullopt);
+
+/**
+ * Verify a committed token and one validated MTP draft token in one recurrent
+ * Gated Delta Rule program without modifying the persistent input state.
+ *
+ * Inputs q/k/v are [2,1,48,128] with the head dimension padded to 64;
+ * a/b are [1,1,2,48] with two head tiles. The front end normalizes raw q/k,
+ * scales q by K**-0.5, applies sigmoid to b, and computes
+ * exp(softplus(a + decay_bias) * decay_scale), where decay_scale is the
+ * supplied precomputed -exp(A_log), exactly as the fused recurrent decode path.
+ *
+ * Returns output rows [2,1,48,128], state after t0 [1,48,128,128], and state
+ * after t1 [1,48,128,128]. Both candidates are newly allocated BF16 TILE
+ * tensors in interleaved DRAM; the compact input L1 state is never modified.
+ */
+std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor> verify_two_gated_delta_rule(
+    const ttnn::Tensor& q,
+    const ttnn::Tensor& k,
+    const ttnn::Tensor& v,
+    const ttnn::Tensor& a,
+    const ttnn::Tensor& b,
+    const ttnn::Tensor& decay_bias,
+    const ttnn::Tensor& decay_scale,
+    const ttnn::Tensor& norm_ones,
+    const ttnn::Tensor& state);
 
 }  // namespace ttnn::transformer

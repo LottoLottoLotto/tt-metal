@@ -5,11 +5,36 @@
 Wraps the experimental ``gated_deltanet_forward_ttnn()`` and the on-device GDN prefill
 kernel into a module that manages weight tensors, recurrent state, and conv state.
 """
+import os
+from loguru import logger
 import ttnn
 from models.demos.blackhole.qwen36.tt.gdn.config import GDNConfig
 from models.demos.blackhole.qwen36.tt.gdn.decode import recurrent_forward
 from models.demos.blackhole.qwen36.tt.gdn.state import init_recurrent_state, restore_split_conv_from_fused
 from models.demos.blackhole.qwen36.tt.gdn.weights import load_gdn_weights
+
+_LEGACY_NATIVE_FLAGS = (
+    "QWEN36_GDN_RECURRENT_FUSED",
+    "QWEN36_GDN_FRONTEND_FUSED",
+    "QWEN36_GDN_MEGA_CORES",
+)
+
+
+def _effective_native_gdn_config():
+    legacy = [name for name in _LEGACY_NATIVE_FLAGS if name in os.environ]
+    if legacy:
+        raise RuntimeError(
+            f"Obsolete native GDN environment variable(s): {', '.join(legacy)}; "
+            "use QWEN_GDN_RECURRENT_FUSED and QWEN_GDN_FRONTEND_FUSED"
+        )
+    recurrent = os.environ.get("QWEN_GDN_RECURRENT_FUSED", "0") == "1"
+    frontend = os.environ.get("QWEN_GDN_FRONTEND_FUSED", "0") == "1"
+    if frontend and not recurrent:
+        raise RuntimeError("QWEN_GDN_FRONTEND_FUSED=1 requires QWEN_GDN_RECURRENT_FUSED=1")
+    output = os.environ.get("QWEN_GDN_OUTPUT_FUSED", "0") == "1"
+    if output and not frontend:
+        raise RuntimeError("QWEN_GDN_OUTPUT_FUSED=1 requires QWEN_GDN_FRONTEND_FUSED=1")
+    return recurrent, frontend, output
 
 
 class Qwen36GatedDeltaNet:
@@ -21,8 +46,17 @@ class Qwen36GatedDeltaNet:
       - "recurrent": single-token decode (T=1), O(1) memory
       - "chunk": multi-token prefill (T>1), chunked parallel processing
     """
+    _logged_effective_config = False
+    _shared_native_output_value = None
+    _shared_native_output_value_m2 = None
+    _shared_native_frontend_many = {}
+    _shared_verify_many_inbox = {}
+    _shared_m1_inbox = {}
+    _shared_batched_workspace = {}
 
-    def __init__(self, mesh_device, config: GDNConfig, state_dict, tensor_cache_path=None):
+    def __init__(self, mesh_device, config: GDNConfig, state_dict, tensor_cache_path=None, pack_decode_mega=False):
+        """pack_decode_mega: single-request 35B decode stores the decode-only mega weight bank-packed and runs it
+        through PackedDecodeMatmul (bitwise the stock matmul; the batched path must not use it)."""
         self.device = mesh_device
         self.cfg = config
 
@@ -46,7 +80,121 @@ class Qwen36GatedDeltaNet:
             packer_l1_acc=True,
         )
 
-        self.weights = load_gdn_weights(mesh_device, config, state_dict, tensor_cache_path)
+        self.native_recurrent, self.native_frontend, self.native_output = _effective_native_gdn_config()
+        if self.native_output and config.output_gate_type not in ("swish", "silu"):
+            raise ValueError("Native GDN output supports only the Swish gate")
+        mega_cores = 88 if pack_decode_mega and os.environ.get("QWEN36_SINGLE_1D_DECODE") == "1" else None
+        self.weights = load_gdn_weights(mesh_device, config, state_dict, tensor_cache_path,
+                                        pack_decode_mega_cores=mega_cores)
+        self.mega_decode_runner = None
+        self.native_frontend_output = None
+        self.native_frontend_output_m2 = None
+        self.native_frontend_output_many = {}
+        self._fused_verify_output_many = {}
+        self._fused_m1_output = None
+        self.native_output_output = None
+        self.native_output_output_m2 = None
+        self.mega_decode_program_config = None
+        self.out_decode_program_config = None
+        self.out_verify_program_config = None
+        self.decode_program_configs = None
+        if os.environ.get("QWEN36_SINGLE_1D_DECODE") == "1":
+            from models.demos.blackhole.qwen36.tt import tp_common as tpc
+
+            grid_w = int(os.environ.get("QWEN36_DECODE_GRID_W", "11"))
+            if self.weights.mega_fused_weight_decode is not None:
+                if (
+                    os.environ.get("QWEN_GDN_MEGA_PACKED") == "1"
+                    and self.weights.mega_fused_weight_decode.dtype in (ttnn.bfloat4_b, ttnn.bfloat8_b)
+                ):
+                    self.mega_decode_program_config = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                        compute_with_storage_grid_size=(11, 10),
+                        in0_block_w=(
+                            2
+                            if tuple(self.weights.mega_fused_weight_decode.shape) == (5120, 16512)
+                            and self.weights.mega_fused_weight_decode.dtype == ttnn.bfloat8_b
+                            else 4
+                        ),
+                        out_subblock_h=1,
+                        out_subblock_w=2,
+                        per_core_M=1,
+                        per_core_N=6,
+                        fuse_batch=True,
+                        fused_activation=None,
+                        mcast_in0=True,
+                    )
+                elif self.weights.mega_fused_weight is None:
+                    # Decode-only mega (non-27B geometry): swept alongside the plain QKV.
+                    from models.common.modules.moe.tt_moe_local import decode_program_config
+
+                    mega = self.weights.mega_fused_weight_decode
+                    self.mega_decode_program_config = decode_program_config(
+                        int(mega.shape[-1]), int(mega.shape[-2]), (11, 8), 8
+                    )
+                    if mega_cores:
+                        from models.demos.blackhole.qwen36.tt.packed_matmul import PackedDecodeMatmul
+
+                        self.mega_decode_runner = PackedDecodeMatmul(
+                            mega, self.mega_decode_program_config, self.compute_kernel_config_decode,
+                            output_memory_config=ttnn.L1_MEMORY_CONFIG, dual_noc=True,
+                        )
+                else:
+                    self.mega_decode_program_config = tpc.create_matmul_1d_decode_progcfg(
+                        1,
+                        self.weights.mega_fused_weight.shape[-2],
+                        self.weights.mega_fused_weight.shape[-1],
+                        num_cores=int(os.environ.get("QWEN_GDN_MEGA_CORES", "44")),
+                        grid_w=grid_w,
+                    )
+            self.out_decode_program_config = tpc.create_matmul_1d_decode_progcfg(
+                1,
+                self.weights.o_proj_weight.shape[-2],
+                self.weights.o_proj_weight.shape[-1],
+                num_cores=33,
+                grid_w=grid_w,
+            )
+            if self.weights.mega_fused_weight_decode is None and self.weights.qkv_proj_weight is not None:
+                # Non-mega geometries (e.g. 35B-A3B, hidden 2048): swept traced M=1 configs.
+                # The tiny a/b projections run 7x faster on one core than on the default grid.
+                from models.common.modules.moe.tt_moe_local import decode_program_config
+
+                def cfg(weight, cores, k_block):
+                    return decode_program_config(int(weight.shape[-1]), int(weight.shape[-2]), cores, k_block)
+
+                w = self.weights
+                self.decode_program_configs = {
+                    "a": cfg(w.a_proj_weight, (1, 1), 64),
+                    "b": cfg(w.b_proj_weight, (1, 1), 64),
+                    "g": cfg(w.g_proj_weight, (8, 8), 8),
+                }
+                self.out_decode_program_config = cfg(w.o_proj_weight, (8, 4), 8)
+            if (
+                tuple(self.weights.o_proj_weight.shape) == (6144, 5120)
+                and self.weights.o_proj_weight.dtype == ttnn.bfloat8_b
+            ):
+                self.out_verify_program_config = tpc.create_matmul_1d_decode_progcfg(
+                    1, 6144, 5120, num_cores=33, grid_w=grid_w,
+                )
+                # Verification T<=32 fits one tile row. K-block 2 preserves the former automatic
+                # projection's accumulation boundaries; M1's K-block 8 drifts
+                # recurrent state over repeated verification cycles.
+                self.out_verify_program_config.in0_block_w = 2
+            if self.out_verify_program_config is None:
+                # Verification rows share one tile row: the decode config also serves M=2..32
+                # and keeps each row's accumulation order identical to a decode step.
+                self.out_verify_program_config = self.out_decode_program_config
+        if not Qwen36GatedDeltaNet._logged_effective_config:
+            logger.info(
+                "GDN effective config: implementation={} recurrent_fused={} frontend_fused={} output_fused={} "
+                "value_heads={} persistent_state_placement={}",
+                "native" if self.native_recurrent else "generic",
+                self.native_recurrent,
+                self.native_frontend,
+                self.native_output,
+                self.num_v_heads,
+                "L1" if self.native_recurrent else "DRAM",
+            )
+            Qwen36GatedDeltaNet._logged_effective_config = True
 
         # ---- Runtime state (plain instance attributes, exact same names as before;
         # poked directly by the trace machinery in model.py / qwen36_vllm.py) ----
@@ -70,20 +218,99 @@ class Qwen36GatedDeltaNet:
     def forward(self, x, mode="recurrent", chunk_size=None, valid_len=None):
         return recurrent_forward(self, x, mode=mode, chunk_size=chunk_size, valid_len=valid_len)
 
+    def forward_batched(self, x, position_tensor):
+        """Independent serving slots [1,1,B,2048], including B1 in concurrent mode."""
+        from models.demos.blackhole.qwen36.tt.gdn.batched_decode import forward_batched
+        return forward_batched(self, x, position_tensor)
+
+    def verify_two(self, x):
+        """Return M=2 output plus (S1,S2) recurrent and convolution candidates."""
+        return recurrent_forward(self, x, mode="verify_two")
+
+    def verify_many(self, x, fork_position=0):
+        """Return output and post-row candidate tuples, leaving live state unchanged.
+
+        Recurrent candidates are transient DRAM allocations consumed by commit.
+        Convolution candidates and frontend operands belong to the layer/runner;
+        callers must not deallocate them.
+        """
+        hidden = int(self.weights.o_proj_weight.shape[-1])
+        if len(x.shape) != 3 or x.shape[0] != 1 or x.shape[2] != hidden or not 2 <= int(x.shape[1]) <= 32:
+            raise ValueError(f"GDN verify_many requires [1,T,{hidden}], 2 <= T <= 32")
+        if x.dtype != ttnn.bfloat16 or x.layout != ttnn.TILE_LAYOUT:
+            raise ValueError("GDN verify_many requires BF16 TILE input")
+        if not (self.native_recurrent and self.native_frontend and self.native_output):
+            raise RuntimeError("GDN verify_many requires the exact native recurrent/frontend/output path")
+        if self.out_verify_program_config is None:
+            raise RuntimeError("GDN verify_many requires a decode-compatible output projection config")
+        if self.weights.mega_fused_weight_decode is not None and self.mega_decode_program_config is None:
+            raise RuntimeError("Packed GDN verification requires its mega projection config")
+        return recurrent_forward(self, x, mode="verify_many", fork_position=fork_position)
+
+    def commit_verify_many(self, accepted_count, recurrent_candidates, convolution_candidates):
+        """Copy candidate accepted_count into the stable live L1 state addresses."""
+        if not hasattr(self, "_fused_mtp_commit"):
+            from models.demos.blackhole.qwen36.tt.gdn.fused_commit import FusedCommit
+            self._fused_mtp_commit = FusedCommit()
+        self._fused_mtp_commit.commit_many(
+            accepted_count, recurrent_candidates, convolution_candidates,
+            self.recurrent_state, self.fused_conv_state,
+        )
+        for candidate in recurrent_candidates:
+            ttnn.deallocate(candidate)
+
+    def set_batched_external_state(self, recurrent_state, conv_state):
+        """Bind compact BF16 DRAM [capacity,32,128,128] and [capacity,3,8192].
+
+        A capacity-one pair also serves the concurrent model's prefill scratch.
+        B1/MTP serving continues to use set_external_state and its L1 contract.
+        """
+        from models.demos.blackhole.qwen36.tt.gdn.batched_decode import validate_batched_state
+        validate_batched_state(recurrent_state, conv_state)
+        self.recurrent_state = recurrent_state
+        self.fused_conv_state = conv_state
+        self._persistent_state_addresses = (
+            int(recurrent_state.buffer_address()), int(conv_state.buffer_address()),
+        )
+        self.use_inplace_state = True
+
     def set_external_state(self, recurrent_state, conv_state):
         """Point layer at externally-allocated state buffers.
         Sets use_inplace_state=True so all forward passes write state inplace (preserving buffer addresses).
         Does NOT create split_conv_state — that happens after prefill when there is real data to split.
         """
-        expected_rec = [1, self.num_v_heads, self.head_k_dim, self.head_v_dim]
-        assert (
-            list(recurrent_state.shape) == expected_rec
-        ), f"recurrent_state shape mismatch: {list(recurrent_state.shape)} != {expected_rec}"
-        assert (
-            conv_state.shape[1] == self.conv_kernel_size - 1
-        ), f"conv_state dim 1 mismatch: {conv_state.shape[1]} != {self.conv_kernel_size - 1}"
+        recurrent_shape = list(recurrent_state.shape)
+        conv_shape = list(conv_state.shape)
+        expected_tail = [self.num_v_heads, self.head_k_dim, self.head_v_dim]
+        assert recurrent_shape[1:] == expected_tail, (
+            f"recurrent_state shape mismatch: {recurrent_shape} "
+            f"does not end in {expected_tail}"
+        )
+        assert recurrent_shape[0] == conv_shape[0], (
+            f"state batch mismatch: recurrent={recurrent_shape[0]}, "
+            f"conv={conv_shape[0]}"
+        )
+        assert conv_state.shape[1] == self.conv_kernel_size - 1, (
+            f"conv_state dim 1 mismatch: {conv_state.shape[1]} != "
+            f"{self.conv_kernel_size - 1}"
+        )
+        assert conv_state.dtype == ttnn.bfloat16, "convolution state must use BF16"
+        if self.native_recurrent:
+            assert recurrent_state.dtype == ttnn.bfloat16, "native recurrence requires BF16"
+            assert recurrent_state.layout == ttnn.ROW_MAJOR_LAYOUT, "native recurrence requires row-major state"
+            assert recurrent_state.memory_config().buffer_type == ttnn.BufferType.L1
+            assert conv_state.memory_config().buffer_type == ttnn.BufferType.L1
+        else:
+            assert recurrent_state.dtype in (ttnn.float32, ttnn.bfloat16)
+            assert recurrent_state.layout == ttnn.TILE_LAYOUT, "generic recurrence requires tiled state"
+            assert recurrent_state.memory_config() == ttnn.DRAM_MEMORY_CONFIG
+            assert conv_state.memory_config() == ttnn.DRAM_MEMORY_CONFIG
         self.recurrent_state = recurrent_state
         self.fused_conv_state = conv_state
+        self._persistent_state_addresses = (
+            int(recurrent_state.buffer_address()),
+            int(conv_state.buffer_address()),
+        )
         self.use_inplace_state = True
 
     def _restore_split_conv_from_fused(self):
