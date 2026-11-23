@@ -10,7 +10,6 @@
 #include <type_traits>
 
 #include "ckernel.h"
-#include "lltt.h"
 
 // Code sequences: driving an execution unit from a table instead of from branches.
 //
@@ -80,7 +79,7 @@ public:
             }
             if (k == needle_len)
             {
-                return lltt::replay_insn(m_replay_base + i, needle_len);
+                return TT_OP_REPLAY(m_replay_base + i, needle_len, 0, 0);
             }
         }
         return 0; // not a substring of this sequence

@@ -12,7 +12,6 @@
 #include "cmath_common.h"
 #include "llk_assert.h"
 #include "llk_math_common.h"
-#include "lltt.h"
 
 #ifndef HF
 #define HF 0
@@ -467,7 +466,7 @@ inline void matmul_configure_mop(
 
     // TODO: can we commonize this?
     constexpr std::uint32_t inner_loops = high_fidelity ? to_underlying(math_fidelity) : 1;
-    ckernel_template tmp(1 /* outer loop */, inner_loops, lltt::replay_insn(ckernel::math::replay_buf_offset, replay_buf_len));
+    ckernel_template tmp(1 /* outer loop */, inner_loops, TT_OP_REPLAY(ckernel::math::replay_buf_offset, replay_buf_len), 0, 0);
 
     if constexpr (high_fidelity)
     {
@@ -744,7 +743,7 @@ inline void matmul_configure_mop_throttled(
     const std::uint32_t inner_loops            = (!is_in1_16x32) ? 2 : 1;
     constexpr std::uint32_t loop_instruction_0 = (THROTTLE_LEVEL == 5)   ? lltt::replay_insn(ckernel::math::replay_buf_offset + 1, 8)
                                                  : (THROTTLE_LEVEL == 4) ? lltt::replay_insn(ckernel::math::replay_buf_offset + 2, 6)
-                                                                         : lltt::replay_insn(ckernel::math::replay_buf_offset, replay_buff_len_throttle);
+                                                                         : TT_OP_REPLAY(ckernel::math::replay_buf_offset, replay_buff_len_throttle, 0, 0);
     constexpr std::uint32_t loop_instruction_1 = (THROTTLE_LEVEL == 5)   ? lltt::replay_insn(ckernel::math::replay_buf_offset + 9, 4)
                                                  : (THROTTLE_LEVEL == 4) ? lltt::replay_insn(ckernel::math::replay_buf_offset + 8, 4)
                                                                          : TT_OP_MVMUL(p_setrwc::CLR_NONE, 0, ADDR_MOD_0, 0);
@@ -752,13 +751,13 @@ inline void matmul_configure_mop_throttled(
 
     if constexpr (THROTTLE_LEVEL == 5)
     {
-        tmp.set_last_inner_loop_instr(lltt::replay_insn(ckernel::math::replay_buf_offset, 4));
-        tmp.set_last_outer_loop_instr(lltt::replay_insn(ckernel::math::replay_buf_offset + 13, 3));
+        tmp.set_last_inner_loop_instr(TT_OP_REPLAY(ckernel::math::replay_buf_offset, 4), 0, 0);
+        tmp.set_last_outer_loop_instr(TT_OP_REPLAY(ckernel::math::replay_buf_offset + 13, 3), 0, 0);
     }
     else if constexpr (THROTTLE_LEVEL == 4)
     {
-        tmp.set_last_inner_loop_instr(lltt::replay_insn(ckernel::math::replay_buf_offset, 4));
-        tmp.set_last_outer_loop_instr(lltt::replay_insn(ckernel::math::replay_buf_offset + 12, 4));
+        tmp.set_last_inner_loop_instr(TT_OP_REPLAY(ckernel::math::replay_buf_offset, 4), 0, 0);
+        tmp.set_last_outer_loop_instr(TT_OP_REPLAY(ckernel::math::replay_buf_offset + 12, 4), 0, 0);
     }
     else
     {

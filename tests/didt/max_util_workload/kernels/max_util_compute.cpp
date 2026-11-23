@@ -290,7 +290,7 @@ ALWI void max_util_math(uint32_t num_loops, uint32_t num_tiles) {
             // (addr_mod_5), clear src A
         });
     ckernel_template tmp(
-        8, 1, lltt::replay_insn(ckernel::math::replay_buf_offset, 15), TT_OP_MVMUL(p_setrwc::CLR_A, 0, ADDR_MOD_5, 0));
+        8, 1, TT_OP_REPLAY(ckernel::math::replay_buf_offset, 15), TT_OP_MVMUL(p_setrwc::CLR_A, 0, ADDR_MOD_5, 0), 0, 0);
     tmp.set_last_outer_loop_instr(TT_OP_MVMUL(p_setrwc::CLR_AB, 0, ADDR_MOD_6, 0));
     tmp.program();
 

@@ -514,7 +514,7 @@ inline void matmul_configure_mop(
         return;
     }
 
-    ckernel_template tmp(1 /* outer loop */, inner_loops, lltt::replay_insn(ckernel::math::replay_buf_offset, replay_buf_len));
+    ckernel_template tmp(1 /* outer loop */, inner_loops, TT_OP_REPLAY(ckernel::math::replay_buf_offset, replay_buf_len), 0, 0);
 
     if constexpr (high_fidelity)
     {

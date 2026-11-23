@@ -309,7 +309,7 @@ def test_wait_recorded_with_the_moves_is_checked(tmp_path, wait, warns):
             lltt::record<lltt::NoExec>(0, 2);
             {wait}
             TTI_MOVD2A(0, 0, ADDR_MOD_1, p_movd2a::MOV_4_ROWS, 0);
-            std::uint32_t replay_instr = lltt::replay_insn(0, 2);
+            std::uint32_t replay_instr = TT_OP_REPLAY(0, 2, 0, 0);
         }}
         """,
     )

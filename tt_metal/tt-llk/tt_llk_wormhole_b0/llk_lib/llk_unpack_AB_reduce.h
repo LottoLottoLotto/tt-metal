@@ -23,7 +23,6 @@
 #include "cunpack_common.h"
 #include "llk_assert.h"
 #include "llk_unpack_common.h"
-#include "lltt.h"
 #include "tensor_shape.h"
 #include "tensor_shape_coverage_unpack.h"
 
@@ -113,7 +112,7 @@ inline void _llk_unpack_AB_reduce_mop_config_(const ckernel::TensorShape tensor_
             lltt::record<lltt::NoExec>(0, whole_tile_replay_len);
             TTI_UNPACR(SrcA, 0b0, 0, 0, 0, 1, 1 /*SetDatValid*/, p_unpacr::RAREFYB_DISABLE, 0, 0, 0, 0, 1);
             TTI_UNPACR(SrcB, 0b0, 0, 0, 0, 1, 1 /*SetDatValid*/, p_unpacr::RAREFYB_DISABLE, 0, 0, 0, 0, 1);
-            ckernel_template tmp(1, 1, lltt::replay_insn(0, whole_tile_replay_len));
+            ckernel_template tmp(1, 1, TT_OP_REPLAY(0, whole_tile_replay_len), 0, 0);
             tmp.program();
             return;
         }
@@ -127,7 +126,7 @@ inline void _llk_unpack_AB_reduce_mop_config_(const ckernel::TensorShape tensor_
         TTI_UNPACR(SrcA, 0b0, 0, 0, 0, 1, 1 /*SetDatValid*/, p_unpacr::RAREFYB_DISABLE, 0, 0, 0, 0, 1);
         TTI_UNPACR(SrcB, 0b0, 0, 0, 0, 1, 1 /*SetDatValid*/, p_unpacr::RAREFYB_DISABLE, 0, 0, 0, 0, 1);
 
-        ckernel_template tmp(1, 1, lltt::replay_insn(0, replay_len));
+        ckernel_template tmp(1, 1, TT_OP_REPLAY(0, replay_len), 0, 0);
         tmp.program();
         return;
     }
@@ -155,7 +154,7 @@ inline void _llk_unpack_AB_reduce_mop_config_(const ckernel::TensorShape tensor_
     TTI_UNPACR(SrcA, 0b01 /*ch0_z+=1*/, 0, 0, 0, 1, 1 /*SetDatValid*/, p_unpacr::RAREFYB_DISABLE, 0, 0, 0, 0, 1);
     TTI_UNPACR(SrcB, 0b01 /*ch0_z+=1*/, 0, 0, 0, 1, 1 /*SetDatValid*/, p_unpacr::RAREFYB_DISABLE, 0, 0, 0, 0, 1);
 
-    ckernel_template tmp(outerloop, innerloop, lltt::replay_insn(0, replay_len));
+    ckernel_template tmp(outerloop, innerloop, TT_OP_REPLAY(0, replay_len), 0, 0);
     if (wrap_scaler)
     {
         tmp.set_end_op(TT_OP_SETADCZW(scaler_adc, 0, 0, 0, 0, 0b0001));

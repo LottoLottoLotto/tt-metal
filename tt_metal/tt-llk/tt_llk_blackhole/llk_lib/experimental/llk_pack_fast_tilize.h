@@ -136,7 +136,7 @@ inline void _llk_pack_fast_tilize_mop_config_(const std::uint32_t unit_dim)
     tmp.set_last_outer_loop_instr(TT_OP_ADDRCRZW(p_setadc::PAC, 0, 0, 1, 0, 0b0010));
 
     // end_ops: L1 address advance via replay (runs per outer iteration = per tile).
-    tmp.set_end_ops(lltt::replay_insn(REPLAY_ADDR_UPDATE_OFFSET, REPLAY_ADDR_UPDATE_LEN), TT_OP_NOP);
+    tmp.set_end_ops(TT_OP_REPLAY(REPLAY_ADDR_UPDATE_OFFSET, REPLAY_ADDR_UPDATE_LEN), TT_OP_NOP, 0, 0);
 
     tmp.program();
 }
