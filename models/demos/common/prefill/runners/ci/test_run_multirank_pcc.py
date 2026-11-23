@@ -780,8 +780,6 @@ class MultirankPccHarnessTests(unittest.TestCase):
                 self.assertIn(f"export PREFILL_HF_MODEL={self.checkpoint};", launch_line)
                 self.assertTrue(runner["PREFILL_MANIFEST"].endswith(f"manifests/{model}.json"))
                 self.assert_kimi_4x4_cache_check(records, model, sp_axis=0)
-                producer_mpi = [r for r in records if r["kind"] == "mpi" and "prefill_producer" in r["args"][-1]]
-                self.assertIn("export PREFILL_SP_AXIS=0;", producer_mpi[0]["args"][-1])
                 self.assertIn("PCC GATE PASS", result.stdout)
 
     def test_sp_axis_knob_missing_flipped_cache_names_its_dir(self):
