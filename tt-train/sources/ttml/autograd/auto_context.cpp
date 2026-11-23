@@ -177,7 +177,10 @@ void AutoContext::initialize_socket_manager(ttnn::distributed::SocketType socket
 }
 
 ParallelismContext::ParallelismContext(
-    const ttnn::distributed::MeshDevice& mesh_device, const DistributedConfig& config) {
+    const ttnn::distributed::MeshDevice& mesh_device,
+    const DistributedConfig& config,
+    core::distributed::CpSharding cp_sharding) :
+    m_cp_sharding(cp_sharding) {
     const uint32_t num_enabled_parallelisms =
         (uint32_t)config.enable_ddp + (uint32_t)config.enable_cp + (uint32_t)config.enable_tp;
     const auto& mesh_shape = mesh_device.shape();
@@ -251,7 +254,6 @@ ParallelismContext::ParallelismContext(
         m_cp_axis.value_or(0U),
         m_num_cp_devices);
 
-    m_cp_sharding = config.cp_sharding;
     TT_FATAL(
         m_cp_sharding == core::distributed::CpSharding::Contiguous || (m_cp_axis.has_value() && m_num_cp_devices > 1U),
         "Zig-zag CP sharding needs context parallelism over more than one device (mesh shape {})",
@@ -269,11 +271,12 @@ bool AutoContext::is_parallelism_context_initialized() const {
     return m_parallelism_context != nullptr;
 }
 
-void AutoContext::initialize_parallelism_context(const DistributedConfig& config) {
+void AutoContext::initialize_parallelism_context(
+    const DistributedConfig& config, core::distributed::CpSharding cp_sharding) {
     if (m_parallelism_context) {
         throw std::runtime_error("ParallelismContext is already initialized.");
     }
-    m_parallelism_context = std::make_unique<ParallelismContext>(get_device(), config);
+    m_parallelism_context = std::make_unique<ParallelismContext>(get_device(), config, cp_sharding);
 }
 
 const uint32_t ParallelismContext::get_ddp_size() const {

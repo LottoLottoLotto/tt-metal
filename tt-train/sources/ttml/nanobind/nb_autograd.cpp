@@ -328,7 +328,7 @@ void py_module(nb::module_& m) {
         // Parallelism context controls
         py_auto_context.def(
             "initialize_parallelism_context",
-            &AutoContext::initialize_parallelism_context,
+            [](AutoContext& self, const DistributedConfig& config) { self.initialize_parallelism_context(config); },
             nb::arg("config"),
             "Initialize parallelism context with DistributedConfig");
         py_auto_context.def(

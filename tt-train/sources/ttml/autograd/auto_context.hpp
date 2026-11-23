@@ -26,7 +26,6 @@ struct DistributedConfig {
     bool enable_ddp = false;
     bool enable_tp = false;
     bool enable_cp = false;
-    core::distributed::CpSharding cp_sharding = core::distributed::CpSharding::Contiguous;
 };
 
 class ParallelismContext {
@@ -35,7 +34,10 @@ public:
     // For TP+DP: dp_axis=0, tp_axis=1
     // For TP only: tp_axis=0
     // For DP only: dp_axis=0
-    ParallelismContext(const ttnn::distributed::MeshDevice& mesh_device, const DistributedConfig& config);
+    ParallelismContext(
+        const ttnn::distributed::MeshDevice& mesh_device,
+        const DistributedConfig& config,
+        core::distributed::CpSharding cp_sharding = core::distributed::CpSharding::Contiguous);
 
     // Axis queries
     [[nodiscard]] std::optional<uint32_t> get_ddp_axis() const {
@@ -73,7 +75,7 @@ private:
     uint32_t m_num_cp_devices = 1U;
     uint32_t m_num_ddp_devices = 1U;
     uint32_t m_num_tp_devices = 1U;
-    core::distributed::CpSharding m_cp_sharding = core::distributed::CpSharding::Contiguous;
+    const core::distributed::CpSharding m_cp_sharding;
 };
 
 class AutoContext {
@@ -141,7 +143,9 @@ public:
 
     [[nodiscard]] bool is_parallelism_context_initialized() const;
 
-    void initialize_parallelism_context(const DistributedConfig& config);
+    void initialize_parallelism_context(
+        const DistributedConfig& config,
+        core::distributed::CpSharding cp_sharding = core::distributed::CpSharding::Contiguous);
 
 private:
     AutoContext();

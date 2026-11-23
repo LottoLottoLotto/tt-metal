@@ -49,8 +49,7 @@ protected:
     static void SetUpTestSuite() {
         Mesh1x2SuiteFixture::SetUpTestSuite();
         if (ttml::test_utils::system_supports_mesh(mesh_shape())) {
-            ttml::autograd::ctx().initialize_parallelism_context(
-                {.enable_cp = true, .cp_sharding = CpSharding::ZigZag});
+            ttml::autograd::ctx().initialize_parallelism_context({.enable_cp = true}, CpSharding::ZigZag);
         }
     }
 };

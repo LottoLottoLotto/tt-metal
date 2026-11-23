@@ -454,8 +454,8 @@ int main(int argc, char **argv) {
         ttml::autograd::ctx().initialize_parallelism_context(
             {.enable_ddp = device_config.enable_ddp,
              .enable_tp = device_config.enable_tp,
-             .enable_cp = device_config.enable_cp,
-             .cp_sharding = device_config.cp_sharding});
+             .enable_cp = device_config.enable_cp},
+            device_config.cp_sharding);
     }
 
     if (multihost_config.enable_mpi) {
