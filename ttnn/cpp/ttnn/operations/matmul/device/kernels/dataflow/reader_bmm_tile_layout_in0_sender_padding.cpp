@@ -366,16 +366,29 @@ void kernel_main() {
                              .noc_x_end = in0_mcast_dest_noc_end_x,
                              .noc_y_end = in0_mcast_dest_noc_end_y,
                              .addr = in0_start_address},
-                            true);
+                            noc_mode == DM_DEDICATED_NOC);
 
-                        // Note: no need for write barrier, since these two multicasts are done on the same noc id, same
-                        // vc, same cmd_buf Also, this only works because we are setting VCs statically (using
-                        // NOC_CMD_STATIC_VC).
+                        if constexpr (noc_mode == DM_DYNAMIC_NOC) {
+                            // Dynamic NoC mode (TT_MM1D_IN1_DUAL_NOC: the in1 reader also issues unicast reads on
+                            // this NoC): a linked multicast forbids unicasts on any command buffer of the NoC, so
+                            // the data multicast is unlinked and completes before its VALID flag is published.
+                            // G4_IN0_MCAST_FLUSH (TT_MM1D_IN0_MCAST_FLUSH=1, experimental) only waits until the data
+                            // has left L1 and relies on same-NoC/VC/command-buffer ordering of the two multicasts.
+#ifdef G4_IN0_MCAST_FLUSH
+                            noc.async_writes_flushed();
+#else
+                            noc.async_write_barrier();
+#endif
+                        } else {
+                            // Note: no need for write barrier, since these two multicasts are done on the same noc
+                            // id, same vc, same cmd_buf Also, this only works because we are setting VCs statically
+                            // (using NOC_CMD_STATIC_VC).
 #ifdef ARCH_BLACKHOLE
-                        // On Blackhole the flush is needed because NoC latency is higher than L1 <-> RISCV
-                        // latency which means data could be changed before write is issued.
-                        noc.async_writes_flushed();
+                            // On Blackhole the flush is needed because NoC latency is higher than L1 <-> RISCV
+                            // latency which means data could be changed before write is issued.
+                            noc.async_writes_flushed();
 #endif  // ARCH_BLACKHOLE
+                        }
 
                         // We should also multicast the flag to destinations
                         // num_dests must not include source, since we are NOT really doing a local copy!

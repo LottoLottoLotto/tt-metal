@@ -5,6 +5,7 @@
 #include "ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.hpp"
 #include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <utility>
 
 #include "hostdevcommon/common_values.hpp"
@@ -38,6 +39,203 @@ using tt::tt_metal::ProgramDescriptor;
 namespace ttnn::prim {
 
 namespace reuse_mcast_1d_optimized_helpers {
+
+// TT_MM1D_IN0_CHUNK_TILES=T (in0-multicast 1D matmul, read when a program is created, so set it before
+// the first matmul of a process): the activation sender reads and multicasts C consecutive K blocks per
+// semaphore handshake, C being the largest divisor of the K block count with C*in0_block_w <= T. Data
+// movement only: compute still consumes in0_block_w tiles per K block in the same order, so outputs
+// are bit-identical to the default program. Unset or 0 disables it.
+static uint32_t env_u32(const char* name, uint32_t fallback) {
+    const char* value = std::getenv(name);
+    return value == nullptr || value[0] == '\0' ? fallback : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+}
+
+// Weight (in1) reader of the in0-multicast 1D matmul for an interleaved DRAM weight and one output block per
+// core (decode). Read when a program is created, so set before the first matmul of a process or clear the
+// program cache. Data movement only: the K blocking and accumulation order are unchanged. Unset = default.
+//   TT_MM1D_IN1_DUAL_NOC=1..4  (Blackhole) read the weight over both NoCs; all data-movement kernels of the program
+//                              run in dynamic NoC mode (the activation multicast becomes unlinked). 1: interleaved
+//                              weight alternates tiles, packed weight splits every contiguous read into two
+//                              DRAM-aligned halves; 2: interleaved weight gives each NoC half of a block's tiles
+//                              (packed: as 1); 3: odd workers read on the second NoC; 4: odd K blocks do;
+//                              5: per DRAM bank by direction: a worker reads a bank on the NoC whose x route from
+//                              the bank's DRAM column to the worker is short (banks in the leftmost DRAM column on
+//                              the in1 NoC for workers west of the middle DRAM column, on the other NoC east of it;
+//                              the reverse for middle-column banks); 6: the opposite choice (control).
+//   TT_MM1D_IN1_NOC_COLS=GXxGY:c0c1...[,...]  (with DUAL_NOC=3) per program grid: the worker in logical column x
+//                              reads on the second NoC iff c_x is 1. When set, programs on grids not listed keep one
+//                              NoC (dedicated mode); unset, every eligible program splits odd/even workers.
+//   TT_MM1D_IN0_MCAST_FLUSH=1  (with DUAL_NOC, experimental) the unlinked activation multicast only flushes its data
+//                              before the VALID flag instead of waiting for acknowledgements.
+//   TT_MM1D_IN1_CB_SLOTS=S     the in1 CB holds S K blocks (default 2) } only in programs that use the dual-NoC
+//   TT_MM1D_IN1_OUTSTANDING=D  keep up to D K-block reads in flight     } or packed reader; D uses NoC transaction
+//                              ids and needs S > D.
+//   TT_MM1D_PACKED_IN1=Kt:Nt:pn:G[:b0.b1...][,...]  every [Kt, Nt]-tile weight is stored in the worker-bank
+//                              packed layout for per_core_N = pn (G = 0: worker w's columns live in bank b_w, by
+//                              default w % 8, each bank holding Nt / pn / 8 workers; G > 0: groups of G K rows
+//                              rotate over the banks; layout in the in1 reader kernel). Only programs with
+//                              per_core_N == pn can read such a weight; any other program on it is rejected.
+struct PackedIn1 {
+    uint32_t pn = 0;  // 0: not packed
+    uint32_t group = 0;
+    std::vector<uint32_t> bank_map;  // G == 0 only; empty: w % banks
+};
+
+struct In1ReaderOpts {
+    uint32_t dual_noc = 0;     // 0..6 (G4_IN1_SPLIT)
+    uint32_t cb_slots = 0;     // 0: default depth
+    uint32_t outstanding = 1;  // K blocks in flight
+    std::string noc_cols;      // DUAL_NOC=3: per logical column '0'/'1' (TT_MM1D_IN1_NOC_COLS), empty: odd workers
+    PackedIn1 packed;
+    bool active() const { return dual_noc != 0 || cb_slots != 0 || outstanding > 1 || packed.pn != 0; }
+};
+
+// TT_MM1D_IN1_NOC_COLS entry for a gx x gy program grid ("" when not listed).
+static std::string noc_cols_entry(const char* value, uint32_t gx, uint32_t gy) {
+    const std::string key = std::to_string(gx) + "x" + std::to_string(gy) + ":";
+    const std::string all(value);
+    for (size_t pos = 0; pos < all.size();) {
+        const size_t end = std::min(all.find(',', pos), all.size());
+        const std::string entry = all.substr(pos, end - pos);
+        TT_FATAL(
+            entry.find(':') != std::string::npos &&
+                entry.find_first_not_of("01", entry.find(':') + 1) == std::string::npos,
+            "TT_MM1D_IN1_NOC_COLS='{}': expected GXxGY:bits[,...]",
+            value);
+        if (entry.compare(0, key.size(), key) == 0) {
+            TT_FATAL(entry.size() - key.size() == gx, "TT_MM1D_IN1_NOC_COLS entry '{}' needs {} columns", entry, gx);
+            return entry.substr(key.size());
+        }
+        pos = end + 1;
+    }
+    return "";
+}
+
+// TT_MM1D_PACKED_IN1 entry for a [Kt, Nt]-tile weight (pn == 0 when the weight is not packed).
+static PackedIn1 packed_in1_entry(uint32_t Kt, uint32_t Nt) {
+    const char* value = std::getenv("TT_MM1D_PACKED_IN1");
+    for (const char* p = value; p != nullptr && *p != '\0';) {
+        uint32_t f[4] = {0, 0, 0, 0};
+        uint32_t n = 0;
+        while (n < 4) {
+            char* end = nullptr;
+            f[n++] = static_cast<uint32_t>(std::strtoul(p, &end, 10));
+            TT_FATAL(end != p, "TT_MM1D_PACKED_IN1='{}': expected Kt:Nt:pn:G[:b0.b1...],...", value);
+            p = end;
+            if (*p != ':' || n == 4) {
+                break;
+            }
+            ++p;
+        }
+        TT_FATAL(n == 4 && f[2] > 0, "TT_MM1D_PACKED_IN1='{}': expected Kt:Nt:pn:G[:b0.b1...],...", value);
+        std::vector<uint32_t> bank_map;
+        if (*p == ':') {
+            do {
+                ++p;
+                char* end = nullptr;
+                bank_map.push_back(static_cast<uint32_t>(std::strtoul(p, &end, 10)));
+                TT_FATAL(end != p, "TT_MM1D_PACKED_IN1='{}': bad bank map", value);
+                p = end;
+            } while (*p == '.');
+        }
+        if (f[0] == Kt && f[1] == Nt) {
+            return {f[2], f[3], std::move(bank_map)};
+        }
+        if (*p == ',') {
+            ++p;
+        }
+    }
+    return {};
+}
+
+static In1ReaderOpts in1_reader_opts(
+    const tt_metal::IDevice* device,
+    CoreCoord grid,
+    const MeshTensor& in1_tensor,
+    uint32_t Kt,
+    uint32_t Nt,
+    uint32_t per_core_N,
+    uint32_t out_block_w,
+    uint32_t per_core_M,
+    uint32_t out_block_h,
+    uint32_t B,
+    bool in0_is_sharded,
+    bool in1_is_sharded,
+    bool transpose_b,
+    bool fuse_op) {
+    In1ReaderOpts o;
+    const PackedIn1 packed = packed_in1_entry(Kt, Nt);
+    const bool eligible = !in1_is_sharded && in1_tensor.memory_config().is_dram() && !fuse_op;
+    if (packed.pn != 0) {
+        const uint32_t banks = device->num_dram_channels();
+        const uint32_t pn = packed.pn;
+        const uint32_t group = packed.group;
+        TT_FATAL(
+            eligible && !transpose_b && B == 1 && per_core_N == pn && out_block_w == pn && per_core_M == out_block_h &&
+                Nt % pn == 0 &&
+                (group == 0 ? (Nt / pn) % banks == 0 : Kt % (group * banks) == 0 && packed.bank_map.empty()),
+            "TT_MM1D_PACKED_IN1 weight [{}, {}] tiles (pn {}, G {}): needs an unsharded DRAM weight read by a "
+            "non-transposed, unfused B=1 program with per_core_N == out_block_w == pn and one output block per core "
+            "(got per_core_N {}, out_block_w {}), Nt % pn == 0, and (G == 0) {} workers a multiple of {} banks or "
+            "(G > 0, no bank map) Kt a multiple of G * banks",
+            Kt,
+            Nt,
+            pn,
+            group,
+            per_core_N,
+            out_block_w,
+            Nt / pn,
+            banks);
+        if (!packed.bank_map.empty()) {
+            std::vector<uint32_t> count(banks, 0);
+            for (const uint32_t b : packed.bank_map) {
+                TT_FATAL(b < banks, "TT_MM1D_PACKED_IN1 bank map: bank {} out of range", b);
+                ++count[b];
+            }
+            TT_FATAL(
+                packed.bank_map.size() == Nt / pn &&
+                    std::all_of(count.begin(), count.end(), [&](uint32_t c) { return c == Nt / pn / banks; }),
+                "TT_MM1D_PACKED_IN1 bank map for [{}, {}] must list {} workers, {} per bank",
+                Kt,
+                Nt,
+                Nt / pn,
+                Nt / pn / banks);
+        }
+        o.packed = packed;
+    }
+    if (!eligible) {
+        return o;
+    }
+    // The block-sharded activation sender is not adapted to dynamic NoC mode.
+    o.dual_noc = device->arch() == tt::ARCH::BLACKHOLE && !in0_is_sharded ? env_u32("TT_MM1D_IN1_DUAL_NOC", 0) : 0;
+    TT_FATAL(o.dual_noc <= 6, "TT_MM1D_IN1_DUAL_NOC must be 0..6");
+    if (const char* cols = std::getenv("TT_MM1D_IN1_NOC_COLS"); o.dual_noc == 3 && cols != nullptr && *cols != '\0') {
+        o.noc_cols = noc_cols_entry(cols, grid.x, grid.y);
+        if (o.noc_cols.empty() || transpose_b || per_core_N != out_block_w) {
+            o.dual_noc = 0;  // unlisted grid (or no per-worker column mapping): one NoC
+            o.noc_cols.clear();
+        }
+    }
+    // Deeper in1 buffering only for the programs using the dual-NoC or packed reader (keeps e.g. an unlisted LM
+    // head program's L1 footprint unchanged).
+    if (o.dual_noc == 0 && o.packed.pn == 0) {
+        return o;
+    }
+    o.cb_slots = env_u32("TT_MM1D_IN1_CB_SLOTS", 0);
+    o.outstanding = std::max<uint32_t>(env_u32("TT_MM1D_IN1_OUTSTANDING", 1), 1);
+    const uint32_t slots = o.cb_slots != 0 ? o.cb_slots : operations::matmul::utilities::MCAST_INPUT_BUFFERING_DEPTH;
+    TT_FATAL(
+        o.cb_slots == 0 || (o.cb_slots >= 2 && o.cb_slots <= 16), "TT_MM1D_IN1_CB_SLOTS must be in [2, 16]");
+    TT_FATAL(
+        o.outstanding == 1 || (o.outstanding < slots && o.outstanding < 15),
+        "TT_MM1D_IN1_OUTSTANDING={} needs more CB slots ({})",
+        o.outstanding,
+        slots);
+    if (o.outstanding > 1 && B != 1) {
+        o.outstanding = 1;
+    }
+    return o;
+}
 
 uint32_t get_preferred_noc(
     const ttnn::CoreCoord src,
@@ -3197,6 +3395,25 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
         uint32_t in1_shard_height_in_tiles = in1_tensor.shard_spec()->shape[0] / in1_tile.get_height();
         in1_CB_tiles = per_core_N * in1_shard_height_in_tiles;
     }
+    // Gemma decode weight reader (TT_MM1D_IN1_*, TT_MM1D_PACKED_IN1; see In1ReaderOpts).
+    const In1ReaderOpts in1_opts = in1_reader_opts(
+        device,
+        compute_with_storage_grid_size,
+        in1_tensor,
+        K,
+        N,
+        per_core_N,
+        out_block_w,
+        per_core_M,
+        out_block_h,
+        std::max(in0_B, in1_B),
+        in0_is_sharded,
+        in1_is_sharded,
+        transpose_b,
+        fuse_op);
+    if (in1_opts.cb_slots != 0) {
+        in1_CB_tiles = in1_block_tiles * in1_opts.cb_slots;
+    }
 
     uint32_t in1_CB_size = in1_CB_tiles * in1_aligned_tile_size;
 
@@ -3339,11 +3556,33 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
         in0_last_ktile_w,
         in0_last_ktile_h);
 
+    // Activation multicast chunking (TT_MM1D_IN0_CHUNK_TILES): for one interleaved M tile row the in0
+    // sender reads and multicasts C consecutive K blocks per semaphore handshake into a CB sized for two
+    // chunks. Compute still consumes in0_block_w tiles per K block, so the K blocking and accumulation
+    // order are unchanged; only the per-block read + handshake + multicast round trip is amortized.
+    uint32_t in0_chunk = 1;
+    if (const uint32_t chunk_tiles = env_u32("TT_MM1D_IN0_CHUNK_TILES", 0);
+        chunk_tiles != 0 && !in0_is_sharded && !fuse_op && !transpose_a && in0_B == 1 && per_core_M == 1 &&
+        out_block_h == 1 && in0_block_h == 1 && in0_last_ktile_w == 0 && in0_last_ktile_h == 0 && num_blocks > 1) {
+        for (uint32_t c = 2; c <= num_blocks && c * in0_block_w <= chunk_tiles; ++c) {
+            if (num_blocks % c == 0) {
+                in0_chunk = c;
+            }
+        }
+    }
+    if (in0_chunk > 1) {
+        in0_CB_tiles = in0_block_tiles * in0_chunk * operations::matmul::utilities::MCAST_INPUT_BUFFERING_DEPTH;
+        in0_CB_size = in0_CB_tiles * in0_aligned_tile_size;
+    }
+    const uint32_t in0_dm_block_w = in0_block_w * in0_chunk;
+    const uint32_t in0_dm_block_num_tiles = in0_block_num_tiles * in0_chunk;
+    const uint32_t in0_dm_num_blocks = num_blocks / in0_chunk;
+
     const auto& a_padded_shape = operations::matmul::utilities::get_matmul_tensor_padded_shape(a, transpose_a);
     const uint32_t M_per_batch = a_padded_shape[-2] / in0_tile.get_height();
     const auto [in0_tensor_stride_w, in0_tensor_stride_h] =
         operations::matmul::utilities::get_in0_transpose_strides(M, M_per_batch, transpose_a, K);
-    const auto in0_tensor_next_block_stride = in0_block_w * in0_tensor_stride_w;
+    const auto in0_tensor_next_block_stride = in0_dm_block_w * in0_tensor_stride_w;
     const auto in0_tensor_next_h_dim_block_stride = in0_block_h * in0_tensor_stride_h;
     const auto in0_tensor_start_tile_id_stride = per_core_M * in0_tensor_stride_h;
 
@@ -3392,16 +3631,16 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
             (std::uint32_t)in0_tensor_next_block_stride,
             (std::uint32_t)in0_tensor_next_h_dim_block_stride,
             // in0 block args
-            (std::uint32_t)in0_block_w,          // in0_block_w
-            (std::uint32_t)in0_block_h,          // in0_block_h
-            (std::uint32_t)in0_block_num_tiles,  // in0_block_num_tiles
+            (std::uint32_t)in0_dm_block_w,          // in0_block_w (per multicast chunk)
+            (std::uint32_t)in0_block_h,             // in0_block_h
+            (std::uint32_t)in0_dm_block_num_tiles,  // in0_block_num_tiles (per multicast chunk)
             (std::uint32_t)in0_last_ktile_w,
             (std::uint32_t)in0_last_ktile_h,
             (std::uint32_t)false,  // extract_shard_sub_blocks (not used for interleaved)
             (std::uint32_t)0,      // shard_width_in_tiles (not used for interleaved)
             (std::uint32_t)0,      // shard_height_in_tiles (not used for interleaved)
             // in0/in1 common args
-            (std::uint32_t)num_blocks,        // num_blocks
+            (std::uint32_t)in0_dm_num_blocks,  // num_blocks (multicast chunks)
             (std::uint32_t)out_num_blocks_x,  // num_blocks_x
             (std::uint32_t)out_num_blocks_y,  // num_blocks_y
             // in0 mcast args
@@ -3488,9 +3727,9 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
 
     std::vector<uint32_t> in0_receiver_compile_time_args = {
         // in0 block args
-        (std::uint32_t)in0_block_num_tiles,  // in0_block_num_tiles
+        (std::uint32_t)in0_dm_block_num_tiles,  // in0_block_num_tiles (per multicast chunk)
         // in0/in1 common args
-        (std::uint32_t)num_blocks,        // num_blocks
+        (std::uint32_t)in0_dm_num_blocks,  // num_blocks (multicast chunks)
         (std::uint32_t)out_num_blocks_x,  // out_num_blocks_x
         (std::uint32_t)out_num_blocks_y,  // out_num_blocks_y
         // in0 mcast args
@@ -3549,6 +3788,67 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
     }
 
     mm_kernel_in1_sender_writer_defines["SKIP_MCAST"] = "1";
+    if (in1_opts.active()) {
+        auto& defines = mm_kernel_in1_sender_writer_defines;
+        defines["G4_IN1"] = "1";
+        defines["G4_IN1_NOCS"] = in1_opts.dual_noc != 0 ? "2" : "1";
+        defines["G4_IN1_SPLIT"] = std::to_string(in1_opts.dual_noc);
+        defines["G4_IN1_D"] = std::to_string(in1_opts.outstanding);
+        defines["G4_IN1_BANKS"] = std::to_string(device->num_dram_channels());
+        if (!in1_opts.noc_cols.empty()) {
+            // Worker w (w-th core with work, row-major on the program grid) sits in logical column w % gx.
+            std::string map;
+            for (uint32_t w = 0; w < num_cores_with_work; ++w) {
+                map += (w == 0 ? "" : ",") + std::string(1, in1_opts.noc_cols[w % compute_with_storage_grid_size.x]);
+            }
+            defines["G4_NOC_MAP"] = map;
+        }
+        if (in1_opts.dual_noc >= 5) {
+            // DRAM-adjacent logical worker per bank (Blackhole: right of the bank's endpoint on the in1 NoC); banks
+            // whose worker sits in the leftmost column are "left", the others "middle". Workers at logical x >=
+            // G4_EAST_X (the middle column's adjacent worker) are east of the middle DRAM column.
+            const auto anchors = device->get_optimal_dram_bank_to_logical_worker_assignment(
+                tt::tt_metal::detail::preferred_noc_for_dram_read(device->arch()));
+            uint32_t left_x = UINT32_MAX;
+            uint32_t mid_x = 0;
+            for (const auto& a : anchors) {
+                left_x = std::min<uint32_t>(left_x, a.x);
+                mid_x = std::max<uint32_t>(mid_x, a.x);
+            }
+            uint32_t mid_banks = 0;
+            for (uint32_t b = 0; b < anchors.size(); ++b) {
+                mid_banks |= (anchors[b].x != left_x ? 1u : 0u) << b;
+            }
+            const uint32_t left_banks = ((1u << anchors.size()) - 1) & ~mid_banks;
+            // in1 NoC (NOC_0 on Blackhole) flows +x: west workers get left banks on it, middle banks on the other NoC.
+            const bool direct = in1_opts.dual_noc == 5;
+            defines["G4_EAST_X"] = std::to_string(mid_x);
+            defines["G4_NOC1_BANKS_WEST"] = std::to_string(direct ? mid_banks : left_banks);
+            defines["G4_NOC1_BANKS_EAST"] = std::to_string(direct ? left_banks : mid_banks);
+        }
+        if (in1_opts.packed.pn != 0) {
+            defines["G4_PACKED_IN1"] = "1";
+            defines["G4_PACKED_KT"] = std::to_string(K);
+            defines["G4_PACKED_PN"] = std::to_string(in1_opts.packed.pn);
+            defines["G4_PACKED_G"] = std::to_string(in1_opts.packed.group);
+            defines["G4_PACKED_BANKS"] = std::to_string(device->num_dram_channels());
+            if (!in1_opts.packed.bank_map.empty()) {
+                std::string map;
+                for (const uint32_t b : in1_opts.packed.bank_map) {
+                    map += (map.empty() ? "" : ",") + std::to_string(b);
+                }
+                defines["G4_PACKED_BANK_MAP"] = map;
+            }
+        }
+    }
+    // Both data-movement processors must use dynamic NoC mode when the in1 reader uses both NoCs.
+    const auto dm_noc_mode =
+        in1_opts.dual_noc != 0 ? tt_metal::NOC_MODE::DM_DYNAMIC_NOC : tt_metal::NOC_MODE::DM_DEDICATED_NOC;
+    // TT_MM1D_IN0_MCAST_FLUSH=1 (experimental, dual NoC only): the unlinked activation multicast waits until its data
+    // has left L1 instead of for its acknowledgements before the VALID flag multicast (same NoC, VC and command buffer).
+    if (in1_opts.dual_noc != 0 && env_u32("TT_MM1D_IN0_MCAST_FLUSH", 0) != 0) {
+        mm_kernel_in0_sender_writer_defines["G4_IN0_MCAST_FLUSH"] = "1";
+    }
 
     // Intermediate CB read
 
@@ -3603,7 +3903,8 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
         };
     }
     in0_sender_kernel_desc.config =
-        DataMovementConfigDescriptor{.processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = in0_noc};
+        DataMovementConfigDescriptor{
+            .processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = in0_noc, .noc_mode = dm_noc_mode};
 
     if (in0_is_sharded) {
         if (in0_mcast_cores_without_work_and_in_receiver_grid.num_cores() > 0) {
@@ -3624,7 +3925,8 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
                 {"cb_l1_array", tt::CBIndex::c_6},
             };
             in0_no_work_in_receiver_kernel_desc.config =
-                DataMovementConfigDescriptor{.processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = in0_noc};
+                DataMovementConfigDescriptor{
+                    .processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = in0_noc, .noc_mode = dm_noc_mode};
         }
         if (in0_mcast_cores_without_work_and_not_in_receiver_grid.num_cores() > 0) {
             has_in0_no_work_not_in_receiver_kernel = true;
@@ -3644,7 +3946,8 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
                 {"cb_l1_array", tt::CBIndex::c_6},
             };
             in0_no_work_not_in_receiver_kernel_desc.config =
-                DataMovementConfigDescriptor{.processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = in0_noc};
+                DataMovementConfigDescriptor{
+                    .processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = in0_noc, .noc_mode = dm_noc_mode};
         }
     }
 
@@ -3659,7 +3962,8 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
             {"cb_in0", tt::CBIndex::c_0},
         };
         in0_receiver_kernel_desc.config =
-            DataMovementConfigDescriptor{.processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = in0_noc};
+            DataMovementConfigDescriptor{
+                .processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = in0_noc, .noc_mode = dm_noc_mode};
     }
 
     in1_sender_writer_kernel_desc.kernel_source =
@@ -3675,7 +3979,8 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
         {"cb_sparsity", tt::CBIndex::c_7},
     };
     in1_sender_writer_kernel_desc.config =
-        DataMovementConfigDescriptor{.processor = tt_metal::DataMovementProcessor::RISCV_0, .noc = in1_noc};
+        DataMovementConfigDescriptor{
+            .processor = tt_metal::DataMovementProcessor::RISCV_0, .noc = in1_noc, .noc_mode = dm_noc_mode};
 
     // Compute kernel compile time args
     uint32_t in0_subblock_num_tiles = out_subblock_h * in0_block_w;
@@ -4192,6 +4497,11 @@ static ProgramDescriptor create_program_mcast_in1_descriptor(
 
     bool fuse_op = false;
 
+    TT_FATAL(
+        packed_in1_entry(K, N).pn == 0,
+        "TT_MM1D_PACKED_IN1 lists this [{}, {}]-tile weight as packed; the in1-multicast program cannot read it",
+        K,
+        N);
     uint32_t num_blocks = K / in0_block_w;
     // Only enable packer l1 accumulation when there are num_blocks > 2, otherwise
     // unnecessary overhead for reconfigs are added. Last iteration of l1 accumulation

@@ -14,6 +14,29 @@
 #include "api/tensor/noc_traits.h"
 #include "api/dataflow/endpoints.h"
 #include "api/core_local_mem.h"
+
+// Gemma decode weight reader (G4_IN1, set by the 1D in0-multicast factory from TT_MM1D_IN1_* and
+// TT_MM1D_PACKED_IN1). Interleaved DRAM weight, no in1 multicast. Per K block:
+//  - G4_IN1_NOCS == 2: the in1 reads use both NoCs (dynamic NoC mode). G4_IN1_SPLIT 1: interleaved weight
+//    alternates tiles, packed weight splits every contiguous read into two DRAM-aligned byte halves; 2: like 1,
+//    but the interleaved weight gives the first half of each block's tiles to one NoC and the rest to the other;
+//    3: odd workers read everything on the second NoC; 4: odd K blocks are read on the second NoC.
+//  - G4_IN1_D > 1: up to G4_IN1_D blocks in flight, one NoC transaction id per block; blocks are published
+//    to compute in K order as their reads complete (the CB holds more than G4_IN1_D blocks).
+//  - G4_PACKED_IN1: the weight is stored in a worker-bank packed layout for per_core_N = G4_PACKED_PN
+//    (W = Nt / pn workers, worker w owns logical columns [w*pn, (w+1)*pn), B = G4_PACKED_BANKS). Logical
+//    tile (k, n), w = n / pn, c = n % pn, lives in interleaved page  bank + B * slot  with
+//      G4_PACKED_G == 0:  bank = map[w],               slot = rank(w) * Kt * pn + k * pn + c
+//      G4_PACKED_G == G:  bank = (w + k / G) % B,      slot = w * (Kt / B) * pn + (k / G / B) * G * pn
+//                                                             + (k % G) * pn + c
+//    map = G4_PACKED_BANK_MAP (one bank per worker, W / B workers per bank) or w % B by default, and rank(w)
+//    = #{w' < w : map[w'] == map[w]}. A worker's rows of one bank are contiguous and each K block is read with
+//    one read per bank run.
+// Tiles land in the CB in the same order as on the default path, so compute is unchanged.
+#if defined(G4_IN1) && (!defined(SKIP_MCAST) || defined(IN1_SHARDED) || defined(ENABLE_GLOBAL_CB) || \
+                        defined(IN1_DRAM_WIDTH_SHARDED) || defined(IN1_DRAM_HEIGHT_SHARDED))
+#error "G4_IN1 requires the interleaved, non-multicast in1 reader"
+#endif
 void kernel_main() {
     // READER
     uint32_t rt_args_idx = 0;
@@ -217,6 +240,88 @@ void kernel_main() {
     const uint32_t in1_fifo_tiles = get_local_cb_interface(dfb_id_in1).fifo_num_pages;
 #endif
 
+#ifdef G4_IN1
+    constexpr uint32_t g4_d = G4_IN1_D;
+    constexpr uint32_t g4_nocs = G4_IN1_NOCS;
+    static_assert(g4_d >= 1 && g4_d < NOC_MAX_TRANSACTION_ID && (g4_nocs == 1 || g4_nocs == 2));
+    const Noc g4_noc0(noc.get_noc_id());
+    const Noc g4_noc1(noc.get_noc_id() ^ 1);
+    // Whole-read NoC choice for G4_IN1_SPLIT 3 (per worker: odd workers, or G4_NOC_MAP[worker] when given; K block
+    // parity for 4 is applied per block).
+#ifdef G4_NOC_MAP
+    constexpr uint8_t g4_noc_map[] = {G4_NOC_MAP};
+    const bool g4_odd_worker = g4_noc_map[in1_tensor_start_tile_id / in1_block_w] != 0;
+#else
+    const bool g4_odd_worker = ((in1_tensor_start_tile_id / in1_block_w) & 1) != 0;
+#endif
+#if G4_IN1_SPLIT >= 5
+    // G4_IN1_SPLIT 5/6: per DRAM bank, bit b of the mask selects the second NoC for reads from bank b. The factory
+    // gives workers west / east of logical column G4_EAST_X the masks that keep each bank's data on the NoC whose
+    // route from the bank's column to the worker is short.
+    const uint32_t g4_noc1_banks =
+        get_absolute_logical_x() < G4_EAST_X ? G4_NOC1_BANKS_WEST : G4_NOC1_BANKS_EAST;
+#else
+    constexpr uint32_t g4_noc1_banks = 0;
+#endif
+    const uint32_t g4_fifo_limit = get_local_cb_interface(dfb_id_in1).fifo_limit;
+    const uint32_t g4_fifo_size = get_local_cb_interface(dfb_id_in1).fifo_size;
+    uint32_t g4_pending = 0;  // blocks issued but not yet pushed
+    uint32_t g4_issue_trid = 1;
+    uint32_t g4_wait_trid = 1;
+#ifdef G4_PACKED_IN1
+    static_assert(in1_block_w == G4_PACKED_PN);
+    // This core's worker index follows from its first output column (non-transposed weight).
+    const uint32_t g4_worker = in1_tensor_start_tile_id / G4_PACKED_PN;
+#if G4_PACKED_G == 0
+#ifdef G4_PACKED_BANK_MAP
+    constexpr uint8_t g4_bank_map[] = {G4_PACKED_BANK_MAP};
+    const uint32_t g4_fixed_bank = g4_bank_map[g4_worker];
+    uint32_t g4_rank = 0;
+    for (uint32_t i = 0; i < g4_worker; ++i) {
+        g4_rank += g4_bank_map[i] == g4_fixed_bank ? 1 : 0;
+    }
+#else
+    const uint32_t g4_fixed_bank = g4_worker % G4_PACKED_BANKS;
+    const uint32_t g4_rank = g4_worker / G4_PACKED_BANKS;
+#endif
+#endif
+    AllocatorBank<AllocatorBankType::DRAM> g4_dram;
+    auto g4_read_run = [&](const Noc& n, uint32_t bank, uint32_t src, uint32_t dst, uint32_t bytes) {
+        if constexpr (g4_d > 1) {
+            n.async_read<NocOptions::TXN_ID>(
+                g4_dram, CoreLocalMem<uint32_t>(dst), bytes, {.bank_id = bank, .addr = src}, {},
+                NocOptVals{.trid = g4_issue_trid});
+        } else {
+            n.async_read(g4_dram, CoreLocalMem<uint32_t>(dst), bytes, {.bank_id = bank, .addr = src}, {});
+        }
+    };
+#else
+    auto g4_read_page = [&](const Noc& n, uint32_t page, uint32_t dst) {
+        if constexpr (g4_d > 1) {
+            n.async_read<NocOptions::TXN_ID, NOC_MAX_BURST_SIZE>(
+                s1, CoreLocalMem<uint32_t>(dst), in1_single_tile_size_bytes, {.page_id = page}, {},
+                NocOptVals{.trid = g4_issue_trid});
+        } else {
+            n.async_read<NocOptions::DEFAULT, NOC_MAX_BURST_SIZE>(
+                s1, CoreLocalMem<uint32_t>(dst), in1_single_tile_size_bytes, {.page_id = page}, {});
+        }
+    };
+#endif
+    auto g4_wait = [&]() {
+        if constexpr (g4_d > 1) {
+            g4_noc0.async_read_barrier<NocOptions::TXN_ID>({.trid = g4_wait_trid});
+            if constexpr (g4_nocs == 2) {
+                g4_noc1.async_read_barrier<NocOptions::TXN_ID>({.trid = g4_wait_trid});
+            }
+        } else {
+            g4_noc0.async_read_barrier();
+            if constexpr (g4_nocs == 2) {
+                g4_noc1.async_read_barrier();
+            }
+        }
+    };
+#endif  // G4_IN1
+
     //  WRITER
     const auto s = TensorAccessor(out_args, out_tensor_addr);
     // `s` is only consumed inside the `#ifndef OUT_SHARDED` write path below; mark it used so
@@ -395,6 +500,84 @@ void kernel_main() {
 
                         // Barrier! make sure the reads are done
                         noc.async_read_barrier();
+#elif defined(G4_IN1)
+                        // Operand 1 - Gemma decode reader (see G4_IN1 above): reserve room for every unpublished
+                        // block plus this one, issue this block's reads and publish the oldest block once g4_d
+                        // blocks are in flight.
+                        dfb_in1.reserve_back(in1_block_num_tiles * (g4_pending + 1));
+                        {
+                            uint32_t g4_dst = dfb_in1.get_write_ptr() + g4_pending * in1_block_size_bytes;
+                            if (g4_dst >= g4_fifo_limit) {
+                                g4_dst -= g4_fifo_size;
+                            }
+                            const bool g4_block_other = g4_nocs == 2 && (G4_IN1_SPLIT == 3   ? g4_odd_worker
+                                                                         : G4_IN1_SPLIT == 4 ? (block & 1) != 0
+                                                                                             : false);
+#ifdef G4_PACKED_IN1
+                            constexpr uint32_t pn = G4_PACKED_PN;
+                            constexpr uint32_t banks = G4_PACKED_BANKS;
+                            uint32_t g4_k = block * in1_block_h;
+                            for (uint32_t h = 0; h < in1_block_h;) {
+#if G4_PACKED_G == 0
+                                const uint32_t g4_bank = g4_fixed_bank;
+                                const uint32_t g4_slot = g4_rank * G4_PACKED_KT * pn + g4_k * pn;
+                                const uint32_t g4_rows = in1_block_h - h;
+#else
+                                constexpr uint32_t group = G4_PACKED_G;
+                                const uint32_t g4_group = g4_k / group;
+                                const uint32_t g4_row = g4_k - g4_group * group;
+                                const uint32_t g4_bank = (g4_worker + g4_group) % banks;
+                                const uint32_t g4_slot = g4_worker * (G4_PACKED_KT / banks) * pn +
+                                                         (g4_group / banks) * group * pn + g4_row * pn;
+                                const uint32_t g4_rows =
+                                    in1_block_h - h < group - g4_row ? in1_block_h - h : group - g4_row;
+#endif
+                                const uint32_t g4_bytes = g4_rows * pn * in1_aligned_tile_size_bytes;
+                                const uint32_t g4_src = in1_tensor_addr + g4_slot * in1_aligned_tile_size_bytes;
+                                if constexpr (g4_nocs == 2 && G4_IN1_SPLIT <= 2) {
+                                    const uint32_t first = (g4_bytes / 2) & ~(DRAM_ALIGNMENT - 1);
+                                    g4_read_run(g4_noc0, g4_bank, g4_src, g4_dst, first);
+                                    g4_read_run(g4_noc1, g4_bank, g4_src + first, g4_dst + first, g4_bytes - first);
+                                } else {
+                                    const bool g4_other = G4_IN1_SPLIT >= 5 ? ((g4_noc1_banks >> g4_bank) & 1) != 0
+                                                                            : g4_block_other;
+                                    g4_read_run(g4_other ? g4_noc1 : g4_noc0, g4_bank, g4_src, g4_dst, g4_bytes);
+                                }
+                                g4_dst += g4_bytes;
+                                h += g4_rows;
+                                g4_k += g4_rows;
+                            }
+#else
+                            uint32_t in1_tensor_row_start_tile_id = in1_tensor_current_inner_dim_block_start_tile_id;
+                            uint32_t g4_t = 0;
+                            for (uint32_t h = 0; h < in1_block_h; ++h) {
+                                uint32_t in1_tensor_tile_id = in1_tensor_row_start_tile_id;
+                                for (uint32_t w = 0; w < in1_block_w; ++w, ++g4_t) {
+                                    if (bw < num_blocks_w_dim - 1 || w < last_block_w) {
+                                        const bool other =
+                                            g4_nocs == 2 &&
+                                            (G4_IN1_SPLIT == 1   ? (g4_t & 1) != 0
+                                             : G4_IN1_SPLIT == 2 ? g4_t >= in1_block_num_tiles / 2
+                                             : G4_IN1_SPLIT >= 5
+                                                 ? ((g4_noc1_banks >> (in1_tensor_tile_id % G4_IN1_BANKS)) & 1) != 0
+                                                 : g4_block_other);
+                                        g4_read_page(other ? g4_noc1 : g4_noc0, in1_tensor_tile_id, g4_dst);
+                                    }
+                                    g4_dst += in1_aligned_tile_size_bytes;
+                                    in1_tensor_tile_id += in1_tensor_stride_w;
+                                }
+                                in1_tensor_row_start_tile_id += in1_tensor_stride_h;
+                            }
+#endif
+                        }
+                        in1_tensor_current_inner_dim_block_start_tile_id += in1_tensor_next_block_stride;
+                        g4_issue_trid = g4_issue_trid == g4_d ? 1 : g4_issue_trid + 1;
+                        if (++g4_pending == g4_d) {
+                            g4_wait();
+                            dfb_in1.push_back(in1_block_num_tiles);
+                            g4_wait_trid = g4_wait_trid == g4_d ? 1 : g4_wait_trid + 1;
+                            --g4_pending;
+                        }
 #elif !defined(IN1_SHARDED)
                         // Operand 1 - interleaved
                         dfb_in1.reserve_back(in1_block_num_tiles);
@@ -470,7 +653,7 @@ void kernel_main() {
                             in1_mcast_num_cores);
 #endif  // SKIP_MCAST
 
-#ifndef IN1_SHARDED
+#if !defined(IN1_SHARDED) && !defined(G4_IN1)
                         dfb_in1.push_back(in1_block_num_tiles);
 #endif  // IN1_SHARDED
 #ifdef ENABLE_GLOBAL_CB
@@ -482,6 +665,21 @@ void kernel_main() {
                         }
 #endif
                     }
+#ifdef G4_IN1
+                    // Publish the blocks still in flight, oldest first.
+                    for (; g4_pending > 0; --g4_pending) {
+                        g4_wait();
+                        dfb_in1.push_back(in1_block_num_tiles);
+                        g4_wait_trid = g4_wait_trid == g4_d ? 1 : g4_wait_trid + 1;
+                    }
+                    if constexpr (g4_d > 1) {
+                        // The packet tag register is sticky: leave later plain reads untagged.
+                        noc_async_read_set_trid(0, g4_noc0.get_noc_id());
+                        if constexpr (g4_nocs == 2) {
+                            noc_async_read_set_trid(0, g4_noc1.get_noc_id());
+                        }
+                    }
+#endif
 #ifdef ENABLE_GLOBAL_CB
                     if (num_blocks_inner_dim > 0) {
                         while (!dfb_in1.pages_reservable_at_back(in1_fifo_tiles)) {
