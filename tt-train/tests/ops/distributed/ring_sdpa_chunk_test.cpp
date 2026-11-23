@@ -494,6 +494,7 @@ auto launch_bw_kv(
 
 }  // namespace
 
+// ZigZag forward: each device writes only its assigned chunk, correct on cache miss and hit.
 TEST_F(RingSDPAChunkTest, ZigZagForwardBindsAssignedChunkPerDevice) {
     const auto ring = ring_setup();
     for_each_direction_step_and_pass(
@@ -502,6 +503,7 @@ TEST_F(RingSDPAChunkTest, ZigZagForwardBindsAssignedChunkPerDevice) {
         });
 }
 
+// A ZigZag call does not reuse the programs of a contiguous call.
 TEST_F(RingSDPAChunkTest, ContiguousAndZigZagCallsGetSeparateProgramCacheEntries) {
     const auto ring = ring_setup();
     auto& device = ttml::autograd::ctx().get_device();
@@ -515,6 +517,7 @@ TEST_F(RingSDPAChunkTest, ContiguousAndZigZagCallsGetSeparateProgramCacheEntries
         << "a zig-zag call must not reuse the programs built for a contiguous call";
 }
 
+// ZigZag backward: each device writes only its assigned chunk's grads, correct on cache miss and hit.
 TEST_F(RingSDPAChunkTest, ZigZagBackwardBindsAssignedChunkPerDevice) {
     const auto ring = ring_setup();
 
@@ -548,6 +551,7 @@ TEST_F(RingSDPAChunkTest, ZigZagBackwardBindsAssignedChunkPerDevice) {
         });
 }
 
+// Swapping the chunk list hits the cache and still binds each device to its list position.
 TEST_F(RingSDPAChunkTest, ZigZagCacheHitBindsChunksByListPositionNotByCachedAddress) {
     const auto ring = ring_setup();
     auto& device = ttml::autograd::ctx().get_device();
@@ -610,6 +614,7 @@ TEST_F(RingSDPAChunkTest, ZigZagCacheHitBindsChunksByListPositionNotByCachedAddr
     expect_zigzag_backward_wrote_assigned_chunks(ring, direction, step, swapped_data, bw_chunks);
 }
 
+// Contiguous causal: executing devices are correct, skipped devices leave caller outputs and grads untouched.
 TEST_F(RingSDPAChunkTest, ContiguousCausalSkippedDevicesKeepCallerOutputsAndGrads) {
     const auto ring = ring_setup();
     for (auto direction : {RingShiftDirection::Backward, RingShiftDirection::Forward}) {
@@ -656,6 +661,7 @@ TEST_F(RingSDPAChunkTest, ContiguousCausalSkippedDevicesKeepCallerOutputsAndGrad
     }
 }
 
+// A chunk list whose size does not match the mode is rejected.
 TEST_F(RingSDPAChunkTest, ValidationRejectsChunkCountThatDoesNotMatchLoadBalancing) {
     const auto ring = ring_setup();
     const auto data = make_chunks(4242U);
@@ -676,6 +682,7 @@ TEST_F(RingSDPAChunkTest, ValidationRejectsChunkCountThatDoesNotMatchLoadBalanci
         ThrowsMessage<std::runtime_error>(HasSubstr("expects 2 chunks, got 1")));
 }
 
+// ZigZag at step 0 or without a causal mask is rejected.
 TEST_F(RingSDPAChunkTest, ValidationRejectsZigZagAtStepZeroAndWithoutCausalMask) {
     const auto ring = ring_setup();
     const auto data = make_chunks(4243U);
@@ -696,6 +703,7 @@ TEST_F(RingSDPAChunkTest, ValidationRejectsZigZagAtStepZeroAndWithoutCausalMask)
         ThrowsMessage<std::runtime_error>(HasSubstr("requires a causal mask")));
 }
 
+// A chunk whose shape or memory config differs from chunk 0 is rejected.
 TEST_F(RingSDPAChunkTest, ValidationRejectsChunksWhoseSpecsDifferFromChunkZero) {
     const auto ring = ring_setup();
     const auto data = make_chunks(4244U);
@@ -736,6 +744,7 @@ TEST_F(RingSDPAChunkTest, ValidationRejectsChunksWhoseSpecsDifferFromChunkZero) 
         ThrowsMessage<std::runtime_error>(HasSubstr("Chunk 1 'grad_key'")));
 }
 
+// An empty chunk list is rejected before launch.
 TEST_F(RingSDPAChunkTest, ValidationRejectsEmptyChunkListBeforeLaunch) {
     const auto ring = ring_setup();
 

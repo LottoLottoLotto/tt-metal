@@ -134,6 +134,7 @@ TEST(RingSDPAScheduleTest, CausalScheduleInvariants) {
     }
 }
 
+// None mode gives the same work as the contiguous causal schedule, always on chunk 0.
 TEST(RingSDPAScheduleTest, LoadBalancingNoneMatchesExecutionInfo) {
     for (auto direction : {RingShiftDirection::Forward, RingShiftDirection::Backward}) {
         for (auto mask_type : {AttentionMaskType::None, AttentionMaskType::Causal}) {
@@ -154,6 +155,7 @@ TEST(RingSDPAScheduleTest, LoadBalancingNoneMatchesExecutionInfo) {
     }
 }
 
+// ZigZag on a ring of 4, Backward: skip at step 0, then the expected chunk per device and step.
 TEST(RingSDPAScheduleTest, ZigZagRing4BackwardTable) {
     struct Row {
         uint32_t device;
@@ -195,6 +197,7 @@ TEST(RingSDPAScheduleTest, ZigZagRing4BackwardTable) {
     }
 }
 
+// Step 0 + cross block + ZigZag chunk cover every causal block once, with equal work per device and step.
 TEST(RingSDPAScheduleTest, ZigZagCoversCausalTriangleExactlyOnceAndBalances) {
     for (auto direction : {RingShiftDirection::Forward, RingShiftDirection::Backward}) {
         for (uint32_t ring_size : {1U, 2U, 3U, 4U, 5U, 8U}) {
@@ -251,11 +254,13 @@ TEST(RingSDPAScheduleTest, ZigZagCoversCausalTriangleExactlyOnceAndBalances) {
     }
 }
 
+// ZigZag with a non-causal mask throws.
 TEST(RingSDPAScheduleTest, ZigZagRequiresCausalMask) {
     EXPECT_ANY_THROW(get_ring_step_work(
         1U, 1U, 4U, AttentionMaskType::None, RingShiftDirection::Backward, RingLoadBalancing::ZigZag));
 }
 
+// Every mode only assigns chunk indices inside its chunk list.
 TEST(RingSDPAScheduleTest, AssignedChunkIndexIsBelowChunkCountOfLoadBalancing) {
     struct Mode {
         RingLoadBalancing load_balancing;
