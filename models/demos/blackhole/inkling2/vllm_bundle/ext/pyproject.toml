@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: © 2026 Lottolabs
+# SPDX-License-Identifier: Apache-2.0
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inkling2-vllm-config"
+version = "1.0"
+description = "Inkling-2-Mini config, tokenizer mode and chat renderer for vLLM (vLLM general plugin)"
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+inkling2_config = "inkling2_vllm_config:register"
+
+[tool.setuptools]
+py-modules = ["inkling2_vllm_config", "inkling2_encoding"]

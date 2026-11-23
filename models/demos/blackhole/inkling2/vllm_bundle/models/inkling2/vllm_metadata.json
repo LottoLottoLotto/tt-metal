@@ -1,0 +1,1 @@
+{"arch": "Inkling2LoopForConditionalGeneration", "main_class": "models.demos.blackhole.inkling2.tt.inkling2_vllm:Inkling2ForCausalLM"}
