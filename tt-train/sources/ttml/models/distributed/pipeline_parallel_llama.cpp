@@ -82,6 +82,9 @@ PipelineParallelLlama::PipelineParallelLlama(
     fmt::print("    Positional embedding type: RoPE\n");
     fmt::print("    Runner type: {}\n", runner_type == RunnerType::Default ? "Default" : "Memory efficient");
     fmt::print("    Theta: {}\n", theta);
+    if (config.cp_layout != ops::distributed::RingAttentionLayout::Contiguous) {
+        throw std::logic_error("cp_layout: zigzag is not supported with pipeline parallelism");
+    }
 
     fmt::println("  Pipeline parallel configuration:");
     fmt::println("    Num blocks: {}", pipeline_parallel_config.num_blocks);
