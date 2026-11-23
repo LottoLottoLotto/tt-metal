@@ -289,6 +289,20 @@ static xt::xarray<float> create_causal_mask(size_t seq_len) {
     return mask;
 }
 
+static xt::xarray<float> zigzag_permute(const xt::xarray<float>& x, uint32_t cp_size, bool to_device) {
+    const size_t B = x.shape()[0], H = x.shape()[1], S = x.shape()[2], D = x.shape()[3];
+    xt::xarray<float> out = xt::empty<float>(x.shape());
+    for (size_t bh = 0; bh < B * H; ++bh) {
+        for (size_t pos = 0; pos < S; ++pos) {
+            const size_t global = ttml::ops::distributed::zigzag_global_position(pos, S, cp_size);
+            const size_t from = to_device ? global : pos;
+            const size_t to = to_device ? pos : global;
+            std::copy_n(x.data() + (bh * S + from) * D, D, out.data() + (bh * S + to) * D);
+        }
+    }
+    return out;
+}
+
 static void TestRingAttention(
     const size_t batch,
     const size_t num_heads,
@@ -296,8 +310,11 @@ static void TestRingAttention(
     const size_t head_dim,
     const bool test_backward = false,
     const float rtol = 1e-2F,
-    const float atol = 5e-1F) {
+    const float atol = 5e-1F,
+    const ttml::ops::distributed::RingAttentionLayout layout =
+        ttml::ops::distributed::RingAttentionLayout::Contiguous) {
     using namespace ttml;
+    const bool zigzag = layout == ops::distributed::RingAttentionLayout::ZigZag;
 
     auto* device = &autograd::ctx().get_device();
     auto mesh_shape = device->shape();
@@ -330,12 +347,18 @@ static void TestRingAttention(
     const auto key_mapper = ttnn::distributed::shard_tensor_to_mesh_mapper(*device, /*dim=*/2, cp_axis);
     const auto value_mapper = ttnn::distributed::shard_tensor_to_mesh_mapper(*device, /*dim=*/2, cp_axis);
 
-    auto query_tt =
-        core::from_xtensor<float, ttnn::DataType::BFLOAT16>(query_xt, device, ttnn::Layout::TILE, query_mapper.get());
-    auto key_tt =
-        core::from_xtensor<float, ttnn::DataType::BFLOAT16>(key_xt, device, ttnn::Layout::TILE, key_mapper.get());
-    auto value_tt =
-        core::from_xtensor<float, ttnn::DataType::BFLOAT16>(value_xt, device, ttnn::Layout::TILE, value_mapper.get());
+    const auto to_device_order = [&](const xt::xarray<float>& x) {
+        return zigzag ? zigzag_permute(x, cp_size, /*to_device=*/true) : x;
+    };
+    const auto to_natural_order = [&](const xt::xarray<float>& x) {
+        return zigzag ? zigzag_permute(x, cp_size, /*to_device=*/false) : x;
+    };
+    auto query_tt = core::from_xtensor<float, ttnn::DataType::BFLOAT16>(
+        to_device_order(query_xt), device, ttnn::Layout::TILE, query_mapper.get());
+    auto key_tt = core::from_xtensor<float, ttnn::DataType::BFLOAT16>(
+        to_device_order(key_xt), device, ttnn::Layout::TILE, key_mapper.get());
+    auto value_tt = core::from_xtensor<float, ttnn::DataType::BFLOAT16>(
+        to_device_order(value_xt), device, ttnn::Layout::TILE, value_mapper.get());
 
     auto query_tensor = autograd::create_tensor(query_tt, /* requires_grad */ true);
     auto key_tensor = autograd::create_tensor(key_tt, /* requires_grad */ true);
@@ -344,7 +367,13 @@ static void TestRingAttention(
     // No explicit mask tensor: the op rejects one in CP mode; causal masking comes from
     // mask_type and is generated on device.
     auto output_tensor = ops::distributed::ring_attention_sdpa(
-        query_tensor, key_tensor, value_tensor, /*mask=*/std::nullopt, ttml::metal::AttentionMaskType::Causal);
+        query_tensor,
+        key_tensor,
+        value_tensor,
+        /*mask=*/std::nullopt,
+        ttml::metal::AttentionMaskType::Causal,
+        /*reuse_forward_kv=*/true,
+        layout);
 
     // Gather output from all devices
     auto output_xtensors = core::to_xtensor<float>(output_tensor->get_value(), core::IdentityComposer{});
@@ -366,6 +395,7 @@ static void TestRingAttention(
         }
     }
 
+    gathered_output = to_natural_order(gathered_output);
     EXPECT_TRUE(xt::allclose(ref_result.output, gathered_output, rtol, atol))
         << "Ring attention output does not match reference SDPA output";
 
@@ -379,7 +409,7 @@ static void TestRingAttention(
 
         const auto grad_mapper = ttnn::distributed::shard_tensor_to_mesh_mapper(*device, /*dim=*/2, cp_axis);
         auto grad_tt = core::from_xtensor<float, ttnn::DataType::BFLOAT16>(
-            grad_output_xt, device, ttnn::Layout::TILE, grad_mapper.get());
+            to_device_order(grad_output_xt), device, ttnn::Layout::TILE, grad_mapper.get());
 
         output_tensor->set_grad(grad_tt);
         output_tensor->backward();
@@ -409,6 +439,10 @@ static void TestRingAttention(
                 }
             }
         }
+
+        gathered_dQ = to_natural_order(gathered_dQ);
+        gathered_dK = to_natural_order(gathered_dK);
+        gathered_dV = to_natural_order(gathered_dV);
 
         // One grade for all three gradients: rtol matches the single-device sdpa_bw
         // suite; atol has headroom for what that suite does not exercise — uniform(0,2)
@@ -514,7 +548,8 @@ TEST_F(GalaxyRingSDPATest, LargerSequenceCausalMaskBackward) {
 
 // Backward with the forward's K/V handles must give the very same bits as re-shifting K/V:
 // a ring shift only moves data, so both paths feed identical tensors to the kernels.
-TEST_F(GalaxyRingSDPATest, ReuseMatchesReshiftBitExact) {
+static void ExpectReuseMatchesReshiftBitExact(
+    const size_t seq_len, const ttml::ops::distributed::RingAttentionLayout layout) {
     using namespace ttml;
 
     auto* device = &autograd::ctx().get_device();
@@ -522,7 +557,7 @@ TEST_F(GalaxyRingSDPATest, ReuseMatchesReshiftBitExact) {
     const auto mapper = ttnn::distributed::shard_tensor_to_mesh_mapper(*device, /*dim=*/2, cp_axis);
 
     auto& rng = autograd::ctx().get_generator();
-    const std::array<std::size_t, 4> shape{2, 4, 256, 64};
+    const std::array<std::size_t, 4> shape{2, 4, seq_len, 64};
     std::array<xt::xarray<float>, 4> inputs;  // Q, K, V, dO
     for (auto& input : inputs) {
         input = ttml::test_utils::make_uniform_xarray<float>(shape, 0.0F, 2.0F, rng());
@@ -537,7 +572,13 @@ TEST_F(GalaxyRingSDPATest, ReuseMatchesReshiftBitExact) {
         auto key = autograd::create_tensor(to_device(inputs[1]), /* requires_grad */ true);
         auto value = autograd::create_tensor(to_device(inputs[2]), /* requires_grad */ true);
         auto output = ops::distributed::ring_attention_sdpa(
-            query, key, value, /*mask=*/std::nullopt, ttml::metal::AttentionMaskType::Causal, reuse_forward_kv);
+            query,
+            key,
+            value,
+            /*mask=*/std::nullopt,
+            ttml::metal::AttentionMaskType::Causal,
+            reuse_forward_kv,
+            layout);
         output->set_grad(to_device(inputs[3]));
         output->backward();
         return std::array{
@@ -551,6 +592,38 @@ TEST_F(GalaxyRingSDPATest, ReuseMatchesReshiftBitExact) {
     EXPECT_TRUE(reused[0] == reshifted[0]) << "dQ differs";
     EXPECT_TRUE(reused[1] == reshifted[1]) << "dK differs";
     EXPECT_TRUE(reused[2] == reshifted[2]) << "dV differs";
+}
+
+TEST_F(GalaxyRingSDPATest, ReuseMatchesReshiftBitExact) {
+    ExpectReuseMatchesReshiftBitExact(/*seq_len=*/256, ttml::ops::distributed::RingAttentionLayout::Contiguous);
+}
+
+TEST_F(GalaxyRingSDPATest, ZigZagCausalMaskBackward) {
+    TestRingAttention(
+        /*batch=*/1,
+        /*num_heads=*/4,
+        /*seq_len=*/1024,
+        /*head_dim=*/64,
+        /*test_backward=*/true,
+        /*rtol=*/1e-2F,
+        /*atol=*/5e-1F,
+        ttml::ops::distributed::RingAttentionLayout::ZigZag);
+}
+
+TEST_F(GalaxyRingSDPATest, ZigZagLargerBatchSequenceBackward) {
+    TestRingAttention(
+        /*batch=*/2,
+        /*num_heads=*/8,
+        /*seq_len=*/4096,
+        /*head_dim=*/64,
+        /*test_backward=*/true,
+        /*rtol=*/1e-2F,
+        /*atol=*/5e-1F,
+        ttml::ops::distributed::RingAttentionLayout::ZigZag);
+}
+
+TEST_F(GalaxyRingSDPATest, ZigZagReuseMatchesReshiftBitExact) {
+    ExpectReuseMatchesReshiftBitExact(/*seq_len=*/1024, ttml::ops::distributed::RingAttentionLayout::ZigZag);
 }
 
 // CP2: step 0 is the diagonal block on both devices; at step 1 device 0 skips (its K/V come from later in the
@@ -581,4 +654,16 @@ TEST_F(Mesh1x2RingSDPATest, LargerBatchSequenceBackward) {
         /*seq_len=*/512,
         /*head_dim=*/64,
         /*test_backward=*/true);
+}
+
+TEST_F(Mesh1x2RingSDPATest, ZigZagBackward) {
+    TestRingAttention(
+        /*batch=*/2,
+        /*num_heads=*/4,
+        /*seq_len=*/512,
+        /*head_dim=*/64,
+        /*test_backward=*/true,
+        /*rtol=*/1e-2F,
+        /*atol=*/5e-1F,
+        ttml::ops::distributed::RingAttentionLayout::ZigZag);
 }
