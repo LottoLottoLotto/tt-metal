@@ -20,7 +20,13 @@ def init_recurrent_state(gdn, batch_size):
         gdn.head_v_dim,
         dtype=torch.bfloat16,
     )
-    gdn.recurrent_state = ttnn.from_torch(state, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=gdn.device)
+    gdn.recurrent_state = ttnn.from_torch(
+        state,
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=gdn.device,
+        memory_config=ttnn.L1_MEMORY_CONFIG,
+    )
 
 
 def split_fused_conv_state(gdn):
@@ -31,7 +37,7 @@ def split_fused_conv_state(gdn):
     for k in range(gdn.conv_kernel_size - 1):
         s_k = gdn.fused_conv_state[:, k : k + 1, :]
         s_k = ttnn.to_layout(s_k, ttnn.TILE_LAYOUT)
-        buf = ttnn.clone(s_k, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        buf = ttnn.clone(s_k, memory_config=ttnn.L1_MEMORY_CONFIG)
         ttnn.deallocate(s_k)
         gdn.split_conv_state.append(buf)
 

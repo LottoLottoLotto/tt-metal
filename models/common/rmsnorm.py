@@ -143,7 +143,7 @@ class RMSNorm(LightweightModule):
 
         # If input is sharded do sharded RMSNorm and optionally return sharded output
         program_config = sharded_program_config if in_sharded else None
-        memory_config = sharded_output_config if out_sharded else None
+        memory_config = sharded_output_config if out_sharded else output_mem_config
         distributed = self.is_distributed and self.is_distributed(mode)
         weight = self.weight_distributed if distributed else self.weight
 
@@ -173,7 +173,7 @@ class RMSNorm(LightweightModule):
         if in_sharded and not out_sharded:
             return ttnn.sharded_to_interleaved(x)
         else:
-            if output_mem_config is not None:
+            if output_mem_config is not None and x.memory_config() != output_mem_config:
                 x = ttnn.to_memory_config(x, output_mem_config)
             return x
 

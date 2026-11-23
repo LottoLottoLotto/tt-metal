@@ -216,10 +216,10 @@ def create_chunk_masks_seq(chunk_size, device):
     # Replicate on TP mesh; single device leaves mapper unset (matches kernel fallback).
     _mesh_mapper = ttnn.ReplicateTensorToMesh(device) if device.get_num_devices() > 1 else None
 
-    def _from(m):
+    def _from(m, dtype=ttnn.float32):
         return ttnn.from_torch(
             m.to(torch.float32).reshape(1, m.shape[-2], m.shape[-1]),
-            dtype=ttnn.float32,
+            dtype=dtype,
             layout=ttnn.TILE_LAYOUT,
             device=device,
             mesh_mapper=_mesh_mapper,
@@ -233,6 +233,7 @@ def create_chunk_masks_seq(chunk_size, device):
         "lower_causal": _from(torch.tril(ones, diagonal=0)),
         "eye": _from(torch.eye(chunk_size)),
         "eye_32": _from(torch.eye(32)),
+        "ones_32": _from(torch.ones(32, 32), dtype=ttnn.bfloat16),
     }
 
 

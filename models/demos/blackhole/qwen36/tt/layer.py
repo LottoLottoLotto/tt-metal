@@ -22,15 +22,25 @@ class Qwen36DecoderLayer:
     Attention is either GatedAttention (full, with RoPE) or GatedDeltaNet (linear).
     """
 
-    def __init__(self, mesh_device, args, state_dict, layer_num, tensor_cache_path=None, tt_ccl=None):
+    def __init__(
+        self,
+        mesh_device,
+        args,
+        state_dict,
+        layer_num,
+        tensor_cache_path=None,
+        tt_ccl=None,
+        state_prefix=None,
+        force_full_attention=False,
+    ):
         self.layer_num = layer_num
         self.device = mesh_device
         self.args = args
         self.tt_ccl = tt_ccl
         self.num_devices = getattr(args, "num_devices", 1)
-        self.is_full_attention = args.is_full_attention_layer(layer_num)
+        self.is_full_attention = force_full_attention or args.is_full_attention_layer(layer_num)
 
-        prefix = f"layers.{layer_num}"
+        prefix = state_prefix or f"layers.{layer_num}"
 
         # Zero-centered RMSNorm (Qwen3.5): output = x_normed * (1 + weight). The
         # framework RMSNorm applies the +1 internally via add_unit_offset=True and
@@ -53,7 +63,7 @@ class Qwen36DecoderLayer:
             mesh_device,
             args,
             state_dict,
-            layer_num,
+            prefix,
             "input_layernorm",
             tensor_cache_path,
             tt_ccl,
@@ -68,7 +78,7 @@ class Qwen36DecoderLayer:
             mesh_device,
             args,
             state_dict,
-            layer_num,
+            prefix,
             "post_attention_layernorm",
             tensor_cache_path,
             tt_ccl,
@@ -80,32 +90,32 @@ class Qwen36DecoderLayer:
             # Tensor-parallel modules (sharded weights from the raw substate).
             # Cache the sharded mesh weights to disk so re-runs skip the (slow,
             # single-threaded) reorder+shard of the full 27B.
-            tp_cache = (tensor_cache_path / f"layers.{layer_num}" / "tp") if tensor_cache_path else None
+            tp_cache = (tensor_cache_path / prefix / "tp") if tensor_cache_path else None
             if self.is_full_attention:
                 from models.demos.blackhole.qwen36.tt.attention.tp import TPAttention, load_attention_weights_tp
 
                 tw = load_attention_weights_tp(
-                    mesh_device, substate(state_dict, f"layers.{layer_num}.self_attn"), args, cache_dir=tp_cache
+                    mesh_device, substate(state_dict, f"{prefix}.self_attn"), args, cache_dir=tp_cache
                 )
                 self.attention = TPAttention(mesh_device, args, tw, tt_ccl)
             else:
                 from models.demos.blackhole.qwen36.tt.gdn.tp import TPGatedDeltaNet, load_gdn_weights_tp
 
                 tw = load_gdn_weights_tp(
-                    mesh_device, substate(state_dict, f"layers.{layer_num}.linear_attn"), args, cache_dir=tp_cache
+                    mesh_device, substate(state_dict, f"{prefix}.linear_attn"), args, cache_dir=tp_cache
                 )
                 self.attention = TPGatedDeltaNet(mesh_device, args, tw, tt_ccl)
         elif self.is_full_attention:
-            attn_state = substate(state_dict, f"layers.{layer_num}.self_attn")
-            attn_cache = (tensor_cache_path / f"layers.{layer_num}") if tensor_cache_path else None
+            attn_state = substate(state_dict, f"{prefix}.self_attn")
+            attn_cache = (tensor_cache_path / prefix) if tensor_cache_path else None
             self.attention = Qwen36GatedAttention(mesh_device, AttentionConfig.from_args(args), attn_state, attn_cache)
         else:
-            gdn_state = substate(state_dict, f"layers.{layer_num}.linear_attn")
-            gdn_cache = (tensor_cache_path / f"layers.{layer_num}") if tensor_cache_path else None
+            gdn_state = substate(state_dict, f"{prefix}.linear_attn")
+            gdn_cache = (tensor_cache_path / prefix) if tensor_cache_path else None
             self.attention = Qwen36GatedDeltaNet(mesh_device, GDNConfig.from_args(args), gdn_state, gdn_cache)
 
-        mlp_state = substate(state_dict, f"layers.{layer_num}.mlp")
-        mlp_cache = (tensor_cache_path / f"layers.{layer_num}") if tensor_cache_path else None
+        mlp_state = substate(state_dict, f"{prefix}.mlp")
+        mlp_cache = (tensor_cache_path / prefix) if tensor_cache_path else None
         self.feed_forward = Qwen36MLP(mesh_device, mlp_state, mlp_cache, args=args, tt_ccl=tt_ccl)
 
     def _make_norm(
@@ -113,7 +123,7 @@ class Qwen36DecoderLayer:
         mesh_device,
         args,
         state_dict,
-        layer_num,
+        state_prefix,
         weight_key,
         tensor_cache_path,
         tt_ccl,
@@ -131,7 +141,7 @@ class Qwen36DecoderLayer:
             dim=args.dim,
             state_dict=state_dict,
             weight_key=weight_key,
-            state_dict_prefix=f"layers.{layer_num}.",
+            state_dict_prefix=f"{state_prefix}.",
             weight_cache_path=tensor_cache_path,
             weight_dtype=ttnn.bfloat16,
             add_unit_offset=True,
@@ -150,6 +160,71 @@ class Qwen36DecoderLayer:
             )
         return norm
 
+    def verify_two(
+        self,
+        x,
+        cos,
+        sin,
+        position_tensor,
+        page_table,
+        shadow_fill_page_table=None,
+        shadow_source_page=0,
+        shadow_same_page=True,
+    ):
+        """Execute this layer at M=2 without committing speculative state."""
+        attn_input = self._decode_norm(self.attention_norm, x)
+        if self.is_full_attention:
+            attn_output, candidates = self.attention.verify_two(
+                attn_input,
+                cos,
+                sin,
+                position_tensor,
+                page_table,
+                shadow_fill_page_table,
+                shadow_source_page,
+                shadow_same_page,
+            )
+        else:
+            attn_output, recurrent_candidates, conv_candidates = self.attention.verify_two(attn_input)
+            candidates = (recurrent_candidates, conv_candidates)
+        ttnn.deallocate(attn_input)
+        h = ttnn.add(x, attn_output)
+        ttnn.deallocate(attn_output)
+        ff_input = self._decode_norm(self.ffn_norm, h)
+        # Keep both verification tokens in one tile row throughout the MLP.
+        # Moving them to [2, 1, D] would materialize two separately padded rows.
+        ff_output = self.feed_forward.forward(ttnn.reshape(ff_input, [1, 1, 2, ff_input.shape[-1]]))
+        ttnn.deallocate(ff_input)
+        output = ttnn.add(h, ttnn.reshape(ff_output, [1, 2, ff_output.shape[-1]]))
+        ttnn.deallocate(h)
+        ttnn.deallocate(ff_output)
+        return output, candidates
+
+    def _decode_norm(self, norm, x):
+        """Width-sharded RMSNorm for single-request decode and verification.
+
+        Interleaved ttnn.rms_norm on a [1, M, dim] tensor runs a single tile row
+        on one core (~65us). The lm_head decode norm config shards the width over
+        the 8x8 grid (~6us) and the unshard lands the rows back in DRAM.
+        """
+        nc = self.args.get_norm_config("lm_head", Mode.DECODE)
+        shard_mc = nc["sharded_output_config"]
+        rows = x.shape[-2]
+        dim = x.shape[-1]
+        sharded = ttnn.to_memory_config(ttnn.reshape(x, [1, 1, rows, dim]), shard_mc)
+        normed = ttnn.rms_norm(
+            sharded,
+            epsilon=norm.eps,
+            weight=norm.weight,
+            program_config=nc["sharded_program_config"],
+            memory_config=shard_mc,
+            compute_kernel_config=norm.compute_kernel_config_hifi2,
+        )
+        ttnn.deallocate(sharded)
+        output = ttnn.reshape(ttnn.sharded_to_interleaved(normed, ttnn.DRAM_MEMORY_CONFIG), [1, rows, dim])
+        ttnn.deallocate(normed)
+        return output
+
     def forward(
         self,
         x,
@@ -164,6 +239,7 @@ class Qwen36DecoderLayer:
         chunk_start_idx_tensor=None,
         valid_len=None,
         gdn_collect=False,
+        final_norm=None,
     ):
         _norm_mode = Mode.PREFILL if mode == "prefill" else Mode.DECODE
         if self.num_devices > 1:
@@ -180,12 +256,19 @@ class Qwen36DecoderLayer:
                 # clashing with each matmul's CBs (w1/w3/w2) for no gain. Verified dead end; keep DRAM.
                 _ff_norm_config = self.args.get_norm_config("ff", _norm_mode)
         else:
-            # In decode the norm output stays in L1 (as the old rms_norm_ttnn(memory_config=L1) did);
-            # in prefill the framework RMSNorm returns interleaved DRAM (matches the old None default).
+            # Persistent GDN state occupies the top of every worker's L1.
+            # LayerNorm's interleaved-L1 output allocation overlaps its own
+            # 1,258,368-byte static CB high-water mark; emit to DRAM so the
+            # allocator never aliases live recurrent state.
             _attn_norm_config = _ff_norm_config = (
-                {"output_mem_config": ttnn.L1_MEMORY_CONFIG} if mode == "decode" else None
+                {"output_mem_config": ttnn.DRAM_MEMORY_CONFIG} if mode == "decode" else None
             )
-        attn_input = self.attention_norm(x, mode=_norm_mode, norm_config=_attn_norm_config)
+        single_request_decode = mode == "decode" and self.num_devices == 1 and x.shape[0] == 1
+        attn_input = (
+            self._decode_norm(self.attention_norm, x)
+            if single_request_decode
+            else self.attention_norm(x, mode=_norm_mode, norm_config=_attn_norm_config)
+        )
 
         if self.num_devices > 1:
             # TP modules: input is the gathered (full-dim) norm output [1,1,B/S,dim];
@@ -247,12 +330,19 @@ class Qwen36DecoderLayer:
         h = ttnn.add(x, attn_output)
         ttnn.deallocate(attn_output)
 
-        ff_input = self.ffn_norm(h, mode=_norm_mode, norm_config=_ff_norm_config)
+        ff_input = (
+            self._decode_norm(self.ffn_norm, h)
+            if single_request_decode
+            else self.ffn_norm(h, mode=_norm_mode, norm_config=_ff_norm_config)
+        )
 
         ff_output = self.feed_forward.forward(ff_input)
         ttnn.deallocate(ff_input)
 
-        output = ttnn.add(h, ff_output)
+        if final_norm is None:
+            output = ttnn.add(h, ff_output)
+        else:
+            output = final_norm(h, ff_output)
         ttnn.deallocate(h)
         ttnn.deallocate(ff_output)
 

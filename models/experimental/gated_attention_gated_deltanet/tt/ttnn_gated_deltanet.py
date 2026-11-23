@@ -6,11 +6,14 @@
 TTNN implementation of the Gated DeltaNet layer.
 """
 
+import os
+
 import torch
 
 import ttnn
 
 from .ttnn_delta_rule_ops import (
+    l2_norm_ttnn,
     recurrent_gated_delta_rule_ttnn,
     recurrent_gated_delta_rule_decode_ttnn,
     recurrent_gated_delta_rule_decode_inplace_ttnn,
@@ -112,11 +115,12 @@ def _causal_conv1d_decode_t1_inplace(
 ):
     """T=1 conv; copy-back to pre-allocated conv_buffer for trace capture."""
     mc = memory_config
+    conv_interleaved = ttnn.to_memory_config(conv_buffer, ttnn.L1_MEMORY_CONFIG)
 
     # out = sum(weight_taps[k] * state[k]) + weight_taps[K-1] * x
     out = ttnn.multiply(x, weight_taps[kernel_size - 1], memory_config=mc)
     for k in range(kernel_size - 1):
-        s_k = conv_buffer[:, k : k + 1, :]
+        s_k = conv_interleaved[:, k : k + 1, :]
         s_k = ttnn.to_layout(s_k, ttnn.TILE_LAYOUT)
         term = ttnn.multiply(s_k, weight_taps[k], memory_config=mc)
         out = ttnn.add(out, term, memory_config=mc)
@@ -124,13 +128,57 @@ def _causal_conv1d_decode_t1_inplace(
     if bias_dev is not None:
         out = ttnn.add(out, bias_dev, memory_config=mc)
 
-    # Update conv_buffer in-place
-    new_state = ttnn.concat([conv_buffer[:, 1:, :], x], dim=1, memory_config=mc)
-    new_state = ttnn.to_layout(new_state, ttnn.TILE_LAYOUT)
-    ttnn.copy(new_state, conv_buffer)
+    # Keep the compact persistent history row-major: TILE layout pads three
+    # history rows to 32 and costs 512 KiB/layer instead of 48 KiB/layer.
+    x_row = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.L1_MEMORY_CONFIG)
+    new_state = ttnn.concat([conv_interleaved[:, 1:, :], x_row], dim=1, memory_config=ttnn.L1_MEMORY_CONFIG)
+    new_state_sharded = ttnn.to_memory_config(new_state, conv_buffer.memory_config())
+    ttnn.copy(new_state_sharded, conv_buffer)
+    ttnn.deallocate(new_state_sharded)
     ttnn.deallocate(new_state)
+    ttnn.deallocate(x_row)
+    ttnn.deallocate(conv_interleaved)
 
     return ttnn.silu(out, memory_config=mc), conv_buffer
+
+
+def _causal_conv1d_verify_two(
+    x, conv_state, kernel_size, device, memory_config=None, weight_taps=None, bias_dev=None
+):
+    """Two exact T=1 convolution transitions without mutating the live state."""
+    outputs = []
+    candidates = []
+    state = conv_state
+    for step in range(2):
+        token = x[:, step : step + 1, :]
+        state_interleaved = ttnn.to_memory_config(state, ttnn.L1_MEMORY_CONFIG)
+        out = ttnn.multiply(token, weight_taps[kernel_size - 1], memory_config=memory_config)
+        for tap in range(kernel_size - 1):
+            state_tap = state_interleaved[:, tap : tap + 1, :]
+            state_tap = ttnn.to_layout(state_tap, ttnn.TILE_LAYOUT)
+            term = ttnn.multiply(state_tap, weight_taps[tap], memory_config=memory_config)
+            next_out = ttnn.add(out, term, memory_config=memory_config)
+            ttnn.deallocate(out)
+            ttnn.deallocate(term)
+            ttnn.deallocate(state_tap)
+            out = next_out
+        if bias_dev is not None:
+            next_out = ttnn.add(out, bias_dev, memory_config=memory_config)
+            ttnn.deallocate(out)
+            out = next_out
+        token_row = ttnn.to_layout(token, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.L1_MEMORY_CONFIG)
+        next_interleaved = ttnn.concat(
+            [state_interleaved[:, 1:, :], token_row], dim=1, memory_config=ttnn.L1_MEMORY_CONFIG
+        )
+        next_state = ttnn.to_memory_config(next_interleaved, ttnn.DRAM_MEMORY_CONFIG)
+        outputs.append(ttnn.silu(out, memory_config=memory_config))
+        candidates.append(next_state)
+        ttnn.deallocate(out)
+        ttnn.deallocate(next_interleaved)
+        ttnn.deallocate(token_row)
+        ttnn.deallocate(state_interleaved)
+        state = next_state
+    return ttnn.concat(outputs, dim=1, memory_config=memory_config), candidates
 
 
 def _causal_conv1d_fir(
@@ -394,9 +442,14 @@ def gated_deltanet_forward_ttnn(
     mega_a_dim=None,
     mega_b_dim=None,
     mega_g_dim=None,
+    mega_decode_program_config=None,
+    out_decode_program_config=None,
     use_inplace_state=False,  # ttnn.copy for trace-stable state
     chunk_seq_masks=None,  # cached masks for gated_delta_attn_seq prefill
     valid_len=None,  # fixed-bucket padding; zeros padded positions in scan
+    native_frontend_runner=None,
+    native_output_runner=None,
+    native_verify_output_runner=None,
 ):
     """Gated DeltaNet forward. mode: recurrent (decode T=1) or chunk (prefill T>1).
 
@@ -405,12 +458,39 @@ def gated_deltanet_forward_ttnn(
     if num_v_heads is None:
         num_v_heads = num_heads
 
-    B = hidden_states.shape[0]
-    T = hidden_states.shape[1]
+    verify_two = mode == "verify_two"
+    flat_decode = (
+        not verify_two
+        and len(hidden_states.shape) == 4
+        and int(hidden_states.shape[0]) == 1
+        and int(hidden_states.shape[1]) == 1
+    )
+    B = 1 if verify_two else (int(hidden_states.shape[-2]) if flat_decode else int(hidden_states.shape[0]))
+    T = 2 if verify_two else (1 if flat_decode else int(hidden_states.shape[1]))
     # valid_len path forces DRAM (bucket 512 hits L1 CB clash on _seq_memory_config threshold)
-    mc = None if valid_len is not None else _seq_memory_config(T)
+    mc = ttnn.DRAM_MEMORY_CONFIG if verify_two else (None if valid_len is not None else _seq_memory_config(T))
 
     ckc = compute_kernel_config
+
+    def decode_linear(x, weight, program_config=None):
+        """Treat serving slots as M rows, not independent matmul batches."""
+        if T == 1 and B > 1:
+            x = ttnn.reshape(x, [1, 1, B, x.shape[-1]])
+            out = ttnn.linear(
+                x,
+                weight,
+                memory_config=mc,
+                compute_kernel_config=ckc,
+                program_config=program_config,
+            )
+            return ttnn.reshape(out, [B, 1, out.shape[-1]])
+        return ttnn.linear(
+            x,
+            weight,
+            memory_config=mc,
+            compute_kernel_config=ckc,
+            program_config=program_config,
+        )
 
     # Mega-fused: one matmul for QKV+a+b+g (decode needs conv state; prefill needs fused taps)
     use_mega_fused = (
@@ -430,21 +510,67 @@ def gated_deltanet_forward_ttnn(
         and q_dim is not None
     )
 
-    if use_mega_fused:
-        mega_out = ttnn.linear(hidden_states, mega_fused_weight, memory_config=mc, compute_kernel_config=ckc)
+    native_frontend_preexpanded = False
+    if use_mega_fused and (T == 1 or verify_two) and native_frontend_runner is not None:
+        # Keep the packed M=2 projection in L1. The native frontend reads tile
+        # rows directly; the DRAM-interleaved form does not preserve the same
+        # token-row addressing for its two-row logical shape.
+        mega_out = ttnn.linear(
+            hidden_states,
+            mega_fused_weight,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            compute_kernel_config=ckc,
+            program_config=mega_decode_program_config,
+        )
+        q, k, v, a_raw, b_raw = native_frontend_runner(
+            mega_out, fused_conv_weight_taps, fused_conv_bias_dev, fused_conv_state
+        )
+        gate_raw = mega_out[..., mega_qkv_dim + mega_a_dim + mega_b_dim :]
+        gate_raw = ttnn.to_layout(gate_raw, ttnn.TILE_LAYOUT)
+        ttnn.deallocate(mega_out)
+        new_fused_conv_state = (
+            (native_frontend_runner.conv_s1, native_frontend_runner.conv_s2)
+            if verify_two
+            else fused_conv_state
+        )
+        new_conv_q = None
+        new_conv_k = None
+        new_conv_v = None
+        _mega_extracted = True
+        native_frontend_preexpanded = True
+    elif use_mega_fused:
+        mega_out = decode_linear(
+            hidden_states,
+            mega_fused_weight,
+            program_config=mega_decode_program_config if (T == 1 or verify_two) else None,
+        )
         # Split QKV | a | b | g
-        qkv = mega_out[:, :, :mega_qkv_dim]
+        qkv = mega_out[..., :mega_qkv_dim]
         qkv = ttnn.to_layout(qkv, ttnn.TILE_LAYOUT)
-        a_raw = mega_out[:, :, mega_qkv_dim : mega_qkv_dim + mega_a_dim]
+        a_raw = mega_out[..., mega_qkv_dim : mega_qkv_dim + mega_a_dim]
         a_raw = ttnn.to_layout(a_raw, ttnn.TILE_LAYOUT)
-        b_raw = mega_out[:, :, mega_qkv_dim + mega_a_dim : mega_qkv_dim + mega_a_dim + mega_b_dim]
+        b_raw = mega_out[..., mega_qkv_dim + mega_a_dim : mega_qkv_dim + mega_a_dim + mega_b_dim]
         b_raw = ttnn.to_layout(b_raw, ttnn.TILE_LAYOUT)
-        gate_raw = mega_out[:, :, mega_qkv_dim + mega_a_dim + mega_b_dim :]
+        gate_raw = mega_out[..., mega_qkv_dim + mega_a_dim + mega_b_dim :]
         gate_raw = ttnn.to_layout(gate_raw, ttnn.TILE_LAYOUT)
         ttnn.deallocate(mega_out)
 
-        # Fused conv on QKV
-        if T > 1:
+        # Fused conv on QKV. Verification deliberately composes two exact
+        # single-token transitions while retaining both candidate states.
+        if verify_two:
+            qkv, new_fused_conv_state = _causal_conv1d_verify_two(
+                qkv,
+                fused_conv_state,
+                conv_kernel_size,
+                device,
+                memory_config=mc,
+                weight_taps=fused_conv_weight_taps,
+                bias_dev=fused_conv_bias_dev,
+            )
+            new_conv_q = None
+            new_conv_k = None
+            new_conv_v = None
+        elif T > 1:
             # Prefill FIR conv
             qkv, new_fused_conv_state_raw = _causal_conv1d_fir(
                 qkv,
@@ -537,7 +663,30 @@ def gated_deltanet_forward_ttnn(
     elif qkv_proj_weight is not None and q_dim is not None:
         qkv = ttnn.linear(hidden_states, qkv_proj_weight, memory_config=mc, compute_kernel_config=ckc)
         # Fused conv prefill on concatenated QKV
-        if T > 1 and fused_conv_weight_taps is not None:
+        if verify_two:
+            qkv = ttnn.to_layout(qkv, ttnn.TILE_LAYOUT)
+            qkv, new_fused_conv_state = _causal_conv1d_verify_two(
+                qkv,
+                fused_conv_state,
+                conv_kernel_size,
+                device,
+                memory_config=mc,
+                weight_taps=fused_conv_weight_taps,
+                bias_dev=fused_conv_bias_dev,
+            )
+            q = qkv[:, :, :q_dim]
+            k = qkv[:, :, q_dim : q_dim + k_dim]
+            v = qkv[:, :, q_dim + k_dim :]
+            q = ttnn.to_layout(q, ttnn.TILE_LAYOUT)
+            k = ttnn.to_layout(k, ttnn.TILE_LAYOUT)
+            v = ttnn.to_layout(v, ttnn.TILE_LAYOUT)
+            ttnn.deallocate(qkv)
+            new_conv_q = None
+            new_conv_k = None
+            new_conv_v = None
+            _mega_extracted = False
+        # Fused conv prefill on concatenated QKV
+        elif T > 1 and fused_conv_weight_taps is not None:
             qkv = ttnn.to_layout(qkv, ttnn.TILE_LAYOUT)
             qkv, new_fused_conv_state_raw = _causal_conv1d_fir(
                 qkv,
@@ -656,21 +805,32 @@ def gated_deltanet_forward_ttnn(
             bias_dev=v_bias_dev,
         )
 
-    # Reshape to heads (explicit mc keeps decode in L1)
-    q = ttnn.reshape(q, [B, T, num_heads, head_k_dim], memory_config=mc)
-    k = ttnn.reshape(k, [B, T, num_heads, head_k_dim], memory_config=mc)
-    v = ttnn.reshape(v, [B, T, num_v_heads, head_v_dim], memory_config=mc)
+    if not native_frontend_preexpanded:
+        # Reshape to heads (explicit mc keeps decode in L1)
+        q = ttnn.reshape(q, [B, T, num_heads, head_k_dim], memory_config=mc)
+        k = ttnn.reshape(k, [B, T, num_heads, head_k_dim], memory_config=mc)
+        v = ttnn.reshape(v, [B, T, num_v_heads, head_v_dim], memory_config=mc)
 
-    # GVA: repeat q,k
-    if num_v_heads > num_heads:
-        repeats = num_v_heads // num_heads
-        q = ttnn.repeat_interleave(q, repeats, dim=2)
-        k = ttnn.repeat_interleave(k, repeats, dim=2)
+        # GVA: repeat q,k
+        if num_v_heads > num_heads:
+            repeats = num_v_heads // num_heads
+            q = ttnn.repeat_interleave(q, repeats, dim=2)
+            k = ttnn.repeat_interleave(k, repeats, dim=2)
 
-    # Beta and g
+    native_decode_frontend = (
+        (T == 1 or verify_two)
+        and os.environ.get("QWEN_GDN_RECURRENT_FUSED") == "1"
+        and os.environ.get("QWEN_GDN_FRONTEND_FUSED") == "1"
+        and recurrent_state is not None
+        and A_neg_precomputed is not None
+        and not allow_neg_eigval
+    )
+
+    # Beta and g. The native decode front end consumes raw a/b and computes
+    # sigmoid(b), softplus(a + dt_bias), and the recurrent decay on Tensix.
     if _mega_extracted:
         a = a_raw
-        beta = ttnn.sigmoid(b_raw, memory_config=mc)
+        beta = b_raw if native_decode_frontend else ttnn.sigmoid(b_raw, memory_config=mc)
     elif ab_proj_weight is not None:
         ab = ttnn.linear(hidden_states, ab_proj_weight, memory_config=mc, compute_kernel_config=ckc)
         num_v = num_v_heads if num_v_heads is not None else num_heads
@@ -679,26 +839,52 @@ def gated_deltanet_forward_ttnn(
         b_raw = ab[:, :, num_v:]
         b_raw = ttnn.to_layout(b_raw, ttnn.TILE_LAYOUT)
         ttnn.deallocate(ab)
-        beta = ttnn.sigmoid(b_raw, memory_config=mc)
+        beta = b_raw if native_decode_frontend else ttnn.sigmoid(b_raw, memory_config=mc)
     else:
-        beta = ttnn.sigmoid(
-            ttnn.linear(hidden_states, b_proj_weight, memory_config=mc, compute_kernel_config=ckc),
-            memory_config=mc,
-        )
+        b_raw = ttnn.linear(hidden_states, b_proj_weight, memory_config=mc, compute_kernel_config=ckc)
+        beta = b_raw if native_decode_frontend else ttnn.sigmoid(b_raw, memory_config=mc)
         a = ttnn.linear(hidden_states, a_proj_weight, memory_config=mc, compute_kernel_config=ckc)
-    if allow_neg_eigval:
-        beta = ttnn.multiply(beta, 2.0, memory_config=mc)
-    a_biased = ttnn.add(a, dt_bias, memory_config=mc)
-    sp = ttnn.softplus(a_biased, memory_config=mc)
-    if A_neg_precomputed is not None:
-        g = ttnn.multiply(A_neg_precomputed, sp, memory_config=mc)
+    if native_decode_frontend:
+        g = a
     else:
-        A = ttnn.exp(A_log, memory_config=mc)
-        A_neg = ttnn.neg(A, memory_config=mc)
-        g = ttnn.multiply(A_neg, sp, memory_config=mc)
+        if allow_neg_eigval:
+            beta = ttnn.multiply(beta, 2.0, memory_config=mc)
+        a_biased = ttnn.add(a, dt_bias, memory_config=mc)
+        sp = ttnn.softplus(a_biased, memory_config=mc)
+        if A_neg_precomputed is not None:
+            g = ttnn.multiply(A_neg_precomputed, sp, memory_config=mc)
+        else:
+            A = ttnn.exp(A_log, memory_config=mc)
+            A_neg = ttnn.neg(A, memory_config=mc)
+            g = ttnn.multiply(A_neg, sp, memory_config=mc)
 
-    # Gated delta rule: chunk prefill (fp32 seq kernel) vs decode (optimized T=1) vs recurrent fallback
-    if mode == "chunk" and T > 1:
+    output_prepared = False
+    if verify_two:
+        # Both paths preserve the two recurrent prefix states without committing.
+        live_state = ttnn.reshape(recurrent_state, [num_v_heads, head_k_dim, head_v_dim])
+        decay_bias_tokens = ttnn.reshape(dt_bias, [num_v_heads, 1, 1])
+        decay_scale_tokens = ttnn.reshape(A_neg_precomputed, [num_v_heads, 1, 1])
+        if native_verify_output_runner is not None and _mega_extracted:
+            o, state_s1, state_s2 = native_verify_output_runner(
+                q, k, v, a, b_raw, decay_bias_tokens, decay_scale_tokens,
+                chunk_seq_masks["ones_32"], live_state, gate_raw, o_norm_weight,
+            )
+            output_prepared = True
+        else:
+            o_tokens, state_s1, state_s2 = ttnn.transformer.verify_two_gated_delta_rule(
+                q, k, v, a, b_raw, decay_bias_tokens, decay_scale_tokens,
+                chunk_seq_masks["ones_32"], live_state,
+            )
+            if native_output_runner is not None and _mega_extracted:
+                o = o_tokens
+            else:
+                o = ttnn.permute(o_tokens, (1, 0, 2, 3))
+        new_state = (
+            ttnn.reshape(state_s1, [1, num_v_heads, head_k_dim, head_v_dim]),
+            ttnn.reshape(state_s2, [1, num_v_heads, head_k_dim, head_v_dim]),
+        )
+    # Gated delta rule: chunk prefill (fp32 seq kernel) vs decode (optimized T=1) vs recurrent fallback.
+    elif mode == "chunk" and T > 1:
         o, new_state = chunk_gated_delta_rule_seq_adapter(
             q=q,
             k=k,
@@ -712,7 +898,28 @@ def gated_deltanet_forward_ttnn(
             valid_len=valid_len,
         )
     elif T == 1:
-        if use_inplace_state and recurrent_state is not None:
+        if os.environ.get("QWEN_GDN_RECURRENT_FUSED") == "1" and recurrent_state is not None:
+            q_input = q if native_decode_frontend else l2_norm_ttnn(q, dim=-1)
+            k_input = k if native_decode_frontend else l2_norm_ttnn(k, dim=-1)
+            o, fused_state = ttnn.transformer.chunk_gated_delta_rule(
+                q_input,
+                k_input,
+                v,
+                g,
+                beta,
+                initial_state=recurrent_state,
+                output_final_state=True,
+                chunk_size=32,
+                memory_config=mc,
+                compute_kernel_config=ckc,
+                fuse_decode_frontend=native_decode_frontend,
+                decay_bias=dt_bias if native_decode_frontend else None,
+                decay_scale=A_neg_precomputed if native_decode_frontend else None,
+                ones=chunk_seq_masks["ones_32"] if native_decode_frontend else None,
+            )
+            o = ttnn.to_layout(o, ttnn.TILE_LAYOUT, memory_config=mc)
+            new_state = fused_state
+        elif use_inplace_state and recurrent_state is not None:
             o, new_state = recurrent_gated_delta_rule_decode_inplace_ttnn(
                 q=q,
                 k=k,
@@ -743,21 +950,33 @@ def gated_deltanet_forward_ttnn(
             device=device,
         )
 
-    # Output norm + projection (clip before o_proj to avoid sparse overflow)
-    if use_gate and g_proj_weight is not None:
-        if _mega_extracted:
-            gate = ttnn.reshape(gate_raw, [B, T, num_v_heads, head_v_dim], memory_config=mc)
+    # Output norm + projection (clip before o_proj to avoid sparse overflow).
+    # The native decode path consumes the head-major recurrent output and the
+    # unreshaped mega-projection gate, then emits projection layout.
+    if not output_prepared:
+        if (T == 1 or verify_two) and native_output_runner is not None and _mega_extracted:
+            # The native kernel emits the packed projection input directly.
+            o = native_output_runner(o, gate_raw, o_norm_weight)
         else:
-            gate = ttnn.linear(hidden_states, g_proj_weight, memory_config=mc, compute_kernel_config=ckc)
-            gate = ttnn.reshape(gate, [B, T, num_v_heads, head_v_dim], memory_config=mc)
-        o = rms_norm_gated_ttnn(o, gate, o_norm_weight, eps=norm_eps, memory_config=mc)
-    else:
-        o = rms_norm_ttnn(o, o_norm_weight, eps=norm_eps, memory_config=mc)
+            if use_gate and g_proj_weight is not None:
+                if _mega_extracted:
+                    gate = ttnn.reshape(gate_raw, [B, T, num_v_heads, head_v_dim], memory_config=mc)
+                else:
+                    gate = ttnn.linear(hidden_states, g_proj_weight, memory_config=mc, compute_kernel_config=ckc)
+                    gate = ttnn.reshape(gate, [B, T, num_v_heads, head_v_dim], memory_config=mc)
+                o = rms_norm_gated_ttnn(o, gate, o_norm_weight, eps=norm_eps, memory_config=mc)
+            else:
+                o = rms_norm_ttnn(o, o_norm_weight, eps=norm_eps, memory_config=mc)
 
-    o = ttnn.clip(o, min=-1e4, max=1e4, memory_config=mc)
-    o = ttnn.reshape(o, [B, T, num_v_heads * head_v_dim], memory_config=mc)
-    if mc is not None:
-        o = ttnn.to_memory_config(o, mc)
-    o = ttnn.linear(o, o_proj_weight, memory_config=mc, compute_kernel_config=ckc)
+            o = ttnn.clip(o, min=-1e4, max=1e4, memory_config=mc)
+            o = ttnn.reshape(o, [B, T, num_v_heads * head_v_dim], memory_config=mc)
+    o = decode_linear(
+        o,
+        o_proj_weight,
+        program_config=out_decode_program_config if T == 1 else None,
+    )
+
+    if flat_decode:
+        o = ttnn.reshape(o, [1, 1, B, o.shape[-1]])
 
     return o, new_state, new_conv_q, new_conv_k, new_conv_v, new_fused_conv_state

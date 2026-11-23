@@ -89,7 +89,11 @@ class Qwen36ModelArgs(ModelArgs):
         if mesh_device is not None:
             import ttnn
 
-            self.weight_dtype = ttnn.bfloat8_b
+            self.weight_dtype = (
+                ttnn.bfloat4_b
+                if os.environ.get("QWEN36_BFP4_WEIGHTS") == "1"
+                else ttnn.bfloat8_b
+            )
             self.act_dtype = ttnn.bfloat16
         else:
             self.weight_dtype = None
@@ -275,6 +279,8 @@ class Qwen36ModelArgs(ModelArgs):
 
         if dtype == ttnn.bfloat8_b:
             suffix = "tensor_cache_bfp8"
+        elif dtype == ttnn.bfloat4_b:
+            suffix = "tensor_cache_bfp4_mixed"
         else:
             suffix = "tensor_cache_bf16"
         if self.num_devices > 1:
@@ -287,13 +293,17 @@ class Qwen36ModelArgs(ModelArgs):
         Overrides base meta-key loader."""
         from models.demos.blackhole.qwen36.tt.weight_mapping import (
             is_fp8_checkpoint,
+            load_qwen36_mtp_state_dict,
             load_qwen36_state_dict_fp8,
             remap_qwen36_state_dict,
         )
 
         # Block FP8 checkpoints: dequant + remap for TP loaders (skip the HF model).
         if is_fp8_checkpoint(self.CKPT_DIR):
-            return load_qwen36_state_dict_fp8(self.CKPT_DIR)
+            state_dict = load_qwen36_state_dict_fp8(self.CKPT_DIR)
+            if os.environ.get("QWEN36_MTP") == "1":
+                state_dict.update(load_qwen36_mtp_state_dict(self.CKPT_DIR))
+            return state_dict
 
         # Import the HF classes directly rather than going through AutoModelForCausalLM.
         # Serving out-of-tree, vllm.transformers_utils.config registers vLLM's OWN
@@ -319,4 +329,6 @@ class Qwen36ModelArgs(ModelArgs):
         model = Qwen3_5ForCausalLM.from_pretrained(self.CKPT_DIR, config=text_config, dtype="auto")
         state_dict = remap_qwen36_state_dict(model.state_dict())
         del model
+        if os.environ.get("QWEN36_MTP") == "1":
+            state_dict.update(load_qwen36_mtp_state_dict(self.CKPT_DIR))
         return state_dict

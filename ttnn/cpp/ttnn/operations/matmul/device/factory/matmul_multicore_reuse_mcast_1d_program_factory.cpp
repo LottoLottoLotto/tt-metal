@@ -5,6 +5,7 @@
 #include "ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.hpp"
 #include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <utility>
 
 #include "hostdevcommon/common_values.hpp"
@@ -517,6 +518,42 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_mcast_in0_
     std::map<std::string, std::string> mm_kernel_defines;
     std::map<std::string, std::string> mm_kernel_in0_sender_writer_defines;
     std::map<std::string, std::string> mm_kernel_in1_sender_writer_defines;
+    const bool qwen_gateup_packed =
+        std::getenv("QWEN36_FUSED_GATE_UP_PACKED") != nullptr && packer_l1_acc_en && !in1_is_sharded &&
+        !use_global_cb &&
+        B == 1 && M == 1 && K == 128 && N == 768 &&
+        (in0_block_w == 2 || in0_block_w == 4) && out_block_w == 8 &&
+        per_core_N == 8 && num_cores_with_work == 96 && compute_with_storage_grid_size.x == 11;
+    TT_FATAL(
+        std::getenv("QWEN36_GATEUP_REQUIRE_PACKED") == nullptr ||
+            !(packer_l1_acc_en && B == 1 && M == 1 && K == 128 && N == 768) || qwen_gateup_packed,
+        "Qwen gate/up packed path was required but shape/configuration guards did not match");
+    if (qwen_gateup_packed) {
+        const uint32_t cb_slots = std::getenv("QWEN36_GATEUP_CB_SLOTS") != nullptr
+                                      ? std::strtoul(std::getenv("QWEN36_GATEUP_CB_SLOTS"), nullptr, 10)
+                                      : 2;
+        const uint32_t outstanding = std::getenv("QWEN36_GATEUP_OUTSTANDING") != nullptr
+                                         ? std::strtoul(std::getenv("QWEN36_GATEUP_OUTSTANDING"), nullptr, 10)
+                                         : 1;
+        TT_FATAL(cb_slots >= 2 && cb_slots <= 8, "Qwen gate/up CB slots must be in [2, 8], got {}", cb_slots);
+        TT_FATAL(
+            outstanding >= 1 && outstanding <= 4 && outstanding < cb_slots,
+            "Qwen gate/up outstanding reads must be in [1, 4] and smaller than CB slots; got {} reads, {} slots",
+            outstanding,
+            cb_slots);
+        in1_CB_tiles = in1_block_tiles * cb_slots;
+        in1_CB_size = in1_CB_tiles * in1_aligned_tile_size;
+        mm_kernel_in1_sender_writer_defines["QWEN_GATEUP_PACKED_LAYOUT"] = "1";
+        mm_kernel_in1_sender_writer_defines["QWEN_GATEUP_CB_SLOTS"] = std::to_string(cb_slots);
+        mm_kernel_in1_sender_writer_defines["QWEN_GATEUP_OUTSTANDING"] = std::to_string(outstanding);
+        if (outstanding > 1) {
+            mm_kernel_in1_sender_writer_defines["QWEN_GATEUP_PIPELINED"] = "1";
+        }
+    }
+    if (std::getenv("QWEN36_GATEUP_INSTRUMENT") != nullptr) {
+        mm_kernel_defines["QWEN_GATEUP_PIPELINE_INSTRUMENT"] = "1";
+        mm_kernel_in1_sender_writer_defines["QWEN_GATEUP_PIPELINE_INSTRUMENT"] = "1";
+    }
     if (bias_tensor.has_value()) {
         mm_kernel_defines["FUSE_BIAS"] = "1";
         mm_kernel_in1_sender_writer_defines["FUSE_BIAS"] = "1";
@@ -3188,6 +3225,88 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
     uint32_t in2_CB_tiles = in2_block_tiles;
     uint32_t in2_CB_size = in2_CB_tiles * in0_single_tile_size;
 
+    const bool qwen_gateup_packed =
+        std::getenv("QWEN36_FUSED_GATE_UP_PACKED") != nullptr && packer_l1_acc_en && !in1_is_sharded &&
+        in0_B == 1 && M == 1 && K == 128 && N == 768 &&
+        (in0_block_w == 2 || in0_block_w == 4) && out_block_w == 8 &&
+        per_core_N == 8 && compute_with_storage_grid_size.x == 11;
+    TT_FATAL(
+        std::getenv("QWEN36_GATEUP_REQUIRE_PACKED") == nullptr ||
+            !(packer_l1_acc_en && in0_B == 1 && M == 1 && K == 128 && N == 768) || qwen_gateup_packed,
+        "Qwen gate/up packed path was required but guards did not match: in1_sharded={}, B={}, M={}, K={}, N={}, "
+        "in0_block_w={}, out_block_w={}, per_core_N={}, grid={}",
+        in1_is_sharded,
+        in0_B,
+        M,
+        K,
+        N,
+        in0_block_w,
+        out_block_w,
+        per_core_N,
+        compute_with_storage_grid_size);
+
+    const bool qwen_lmhead_packed =
+        std::getenv("QWEN36_LM_HEAD_PACKED") != nullptr && !in1_is_sharded &&
+        in0_B == 1 && M == 1 && K == 128 && N == 7760 &&
+        (in0_block_w == 2 || in0_block_w == 4 || in0_block_w == 8) &&
+        out_block_w == 71 && per_core_N == 71 &&
+        compute_with_storage_grid_size.x == 11 && compute_with_storage_grid_size.y == 10;
+    TT_FATAL(
+        std::getenv("QWEN36_LM_HEAD_REQUIRE_PACKED") == nullptr ||
+            !(in0_B == 1 && M == 1 && K == 128 && N == 7760) || qwen_lmhead_packed,
+        "Qwen LM head packed path was required but guards did not match: in1_sharded={}, B={}, M={}, K={}, N={}, "
+        "in0_block_w={}, out_block_w={}, per_core_N={}, grid={}",
+        in1_is_sharded,
+        in0_B,
+        M,
+        K,
+        N,
+        in0_block_w,
+        out_block_w,
+        per_core_N,
+        compute_with_storage_grid_size);
+
+    const bool qwen_gdn_mega_packed =
+        std::getenv("QWEN_GDN_MEGA_PACKED") != nullptr && packer_l1_acc_en && !in1_is_sharded &&
+        in0_B == 1 && M == 1 && K == 128 && N == 386 &&
+        (in0_block_w == 2 || in0_block_w == 4 || in0_block_w == 8) &&
+        out_block_w == 4 && per_core_N == 4 &&
+        compute_with_storage_grid_size.x == 11 && compute_with_storage_grid_size.y == 10;
+    TT_FATAL(
+        std::getenv("QWEN_GDN_MEGA_REQUIRE_PACKED") == nullptr ||
+            !(packer_l1_acc_en && in0_B == 1 && M == 1 && K == 128 && N == 386) || qwen_gdn_mega_packed,
+        "Qwen GDN mega packed path was required but guards did not match: in1_sharded={}, B={}, M={}, K={}, N={}, "
+        "in0_block_w={}, out_block_w={}, per_core_N={}, grid={}",
+        in1_is_sharded,
+        in0_B,
+        M,
+        K,
+        N,
+        in0_block_w,
+        out_block_w,
+        per_core_N,
+        compute_with_storage_grid_size);
+
+    const bool qwen_down_packed =
+        std::getenv("QWEN36_MLP_DOWN_PACKED") != nullptr && packer_l1_acc_en && !in1_is_sharded &&
+        in0_B == 1 && M == 1 && K == 384 && N == 128 &&
+        in0_block_w == 8 && out_block_w == 2 && per_core_N == 2 &&
+        compute_with_storage_grid_size.x == 11 && compute_with_storage_grid_size.y == 6;
+    TT_FATAL(
+        std::getenv("QWEN36_MLP_DOWN_REQUIRE_PACKED") == nullptr ||
+            !(packer_l1_acc_en && in0_B == 1 && M == 1 && K == 384 && N == 128) || qwen_down_packed,
+        "Qwen MLP down packed path was required but guards did not match: in1_sharded={}, B={}, M={}, K={}, N={}, "
+        "in0_block_w={}, out_block_w={}, per_core_N={}, grid={}",
+        in1_is_sharded,
+        in0_B,
+        M,
+        K,
+        N,
+        in0_block_w,
+        out_block_w,
+        per_core_N,
+        compute_with_storage_grid_size);
+
     uint32_t in1_block_tiles = out_block_w * in0_block_w;
     uint32_t in1_CB_tiles = in1_block_tiles;
     if (in1_B * num_blocks > 1) {
@@ -3198,6 +3317,21 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
         in1_CB_tiles = per_core_N * in1_shard_height_in_tiles;
     }
 
+    if (qwen_gateup_packed || qwen_down_packed) {
+        const char* cb_slots_env = qwen_down_packed ? "QWEN36_MLP_DOWN_CB_SLOTS" : "QWEN36_GATEUP_CB_SLOTS";
+        const uint32_t cb_slots =
+            std::getenv(cb_slots_env) != nullptr ? std::strtoul(std::getenv(cb_slots_env), nullptr, 10) : 2;
+        TT_FATAL(cb_slots >= 2 && cb_slots <= 8, "Qwen packed CB slots must be in [2, 8], got {}", cb_slots);
+        in1_CB_tiles = in1_block_tiles * cb_slots;
+    }
+    if (qwen_lmhead_packed || qwen_gdn_mega_packed) {
+        const char* cb_slots_env =
+            qwen_gdn_mega_packed ? "QWEN_GDN_MEGA_CB_SLOTS" : "QWEN36_LM_HEAD_CB_SLOTS";
+        const uint32_t cb_slots =
+            std::getenv(cb_slots_env) != nullptr ? std::strtoul(std::getenv(cb_slots_env), nullptr, 10) : 2;
+        TT_FATAL(cb_slots >= 2 && cb_slots <= 8, "Qwen packed CB slots must be in [2, 8], got {}", cb_slots);
+        in1_CB_tiles = in1_block_tiles * cb_slots;
+    }
     uint32_t in1_CB_size = in1_CB_tiles * in1_aligned_tile_size;
 
     uint32_t out_block_tiles = out_block_h * out_block_w;
@@ -3213,6 +3347,18 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
     uint32_t in3_block_tiles = out_block_w;
     uint32_t in3_CB_tiles = in3_block_tiles;  // No double buffer
     uint32_t in3_CB_size = in3_CB_tiles * bias_aligned_tile_size;
+    if (qwen_lmhead_packed) {
+        constexpr uint32_t blackhole_l1_bytes = 1572864;
+        constexpr uint32_t required_unused_l1_bytes = 16384;
+        const uint32_t cb_bytes_upper_bound =
+            in0_CB_size + in1_CB_size + out_CB_size + interm0_CB_size +
+            (bias_tensor.has_value() ? in3_CB_size : 0);
+        TT_FATAL(
+            cb_bytes_upper_bound <= blackhole_l1_bytes - required_unused_l1_bytes,
+            "Qwen LM head CB allocation must preserve 16 KiB L1: CB bytes={}, limit={}",
+            cb_bytes_upper_bound,
+            blackhole_l1_bytes - required_unused_l1_bytes);
+    }
 
     CoreCoord start_core = sub_device_start_core;
     uint32_t start_core_x = start_core.x;
@@ -3504,6 +3650,56 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
     std::map<std::string, std::string> mm_kernel_defines;
     std::map<std::string, std::string> mm_kernel_in0_sender_writer_defines;
     std::map<std::string, std::string> mm_kernel_in1_sender_writer_defines;
+    if (qwen_gateup_packed || qwen_down_packed) {
+        const char* cb_slots_env = qwen_down_packed ? "QWEN36_MLP_DOWN_CB_SLOTS" : "QWEN36_GATEUP_CB_SLOTS";
+        const char* outstanding_env =
+            qwen_down_packed ? "QWEN36_MLP_DOWN_OUTSTANDING" : "QWEN36_GATEUP_OUTSTANDING";
+        const uint32_t cb_slots =
+            std::getenv(cb_slots_env) != nullptr ? std::strtoul(std::getenv(cb_slots_env), nullptr, 10) : 2;
+        const uint32_t outstanding =
+            std::getenv(outstanding_env) != nullptr ? std::strtoul(std::getenv(outstanding_env), nullptr, 10) : 1;
+        TT_FATAL(
+            outstanding >= 1 && outstanding <= 4 && outstanding < cb_slots,
+            "Qwen gate/up outstanding reads must be in [1, 4] and smaller than CB slots; got {} reads, {} slots",
+            outstanding,
+            cb_slots);
+        const uint32_t packed_k_tiles = qwen_down_packed ? 384 : 128;
+        mm_kernel_in1_sender_writer_defines["QWEN_PACKED_K_TILES"] = std::to_string(packed_k_tiles);
+        mm_kernel_in1_sender_writer_defines["QWEN_GATEUP_PACKED_LAYOUT"] = "1";
+        mm_kernel_in1_sender_writer_defines["QWEN_GATEUP_CB_SLOTS"] = std::to_string(cb_slots);
+        mm_kernel_in1_sender_writer_defines["QWEN_GATEUP_OUTSTANDING"] = std::to_string(outstanding);
+        if (outstanding > 1) {
+            mm_kernel_in1_sender_writer_defines["QWEN_GATEUP_PIPELINED"] = "1";
+        }
+    }
+    if (qwen_lmhead_packed || qwen_gdn_mega_packed) {
+        const char* cb_slots_env =
+            qwen_gdn_mega_packed ? "QWEN_GDN_MEGA_CB_SLOTS" : "QWEN36_LM_HEAD_CB_SLOTS";
+        const char* outstanding_env =
+            qwen_gdn_mega_packed ? "QWEN_GDN_MEGA_OUTSTANDING" : "QWEN36_LM_HEAD_OUTSTANDING";
+        const uint32_t cb_slots =
+            std::getenv(cb_slots_env) != nullptr ? std::strtoul(std::getenv(cb_slots_env), nullptr, 10) : 2;
+        const uint32_t outstanding =
+            std::getenv(outstanding_env) != nullptr ? std::strtoul(std::getenv(outstanding_env), nullptr, 10) : 1;
+        TT_FATAL(
+            outstanding == 1 && outstanding < cb_slots,
+            "Qwen irregular packed reader requires one asynchronous read and at least two CB slots; "
+            "got reads={}, slots={}",
+            outstanding,
+            cb_slots);
+        mm_kernel_in1_sender_writer_defines["QWEN_LMHEAD_PACKED_LAYOUT"] = "1";
+        mm_kernel_in1_sender_writer_defines["QWEN_LMHEAD_CB_SLOTS"] = std::to_string(cb_slots);
+        mm_kernel_in1_sender_writer_defines["QWEN_LMHEAD_OUTSTANDING"] = std::to_string(outstanding);
+        mm_kernel_in1_sender_writer_defines["QWEN_PACKED_FULL_WORKER_COLS"] =
+            std::to_string(qwen_gdn_mega_packed ? 4 : 71);
+        mm_kernel_in1_sender_writer_defines["QWEN_PACKED_LAST_WORKER"] =
+            std::to_string(qwen_gdn_mega_packed ? 96 : 109);
+        mm_kernel_in1_sender_writer_defines["QWEN_PACKED_PAGES_PER_WORKER_PER_BANK"] =
+            std::to_string(qwen_gdn_mega_packed ? 64 : 1136);
+        if (qwen_lmhead_packed && std::getenv("QWEN36_LM_HEAD_INSTRUMENT") != nullptr) {
+            mm_kernel_in1_sender_writer_defines["QWEN_LMHEAD_PIPELINE_INSTRUMENT"] = "1";
+        }
+    }
     if (bias_tensor.has_value()) {
         mm_kernel_defines["FUSE_BIAS"] = "1";
         mm_kernel_in1_sender_writer_defines["FUSE_BIAS"] = "1";
@@ -3663,7 +3859,11 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
     }
 
     in1_sender_writer_kernel_desc.kernel_source =
-        "ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in1_sender_writer_padding.cpp";
+        qwen_lmhead_packed || qwen_gdn_mega_packed
+            ? "ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/"
+              "reader_bmm_tile_layout_qwen_lmhead_packed.cpp"
+            : "ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/"
+              "reader_bmm_tile_layout_in1_sender_writer_padding.cpp";
     in1_sender_writer_kernel_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
     in1_sender_writer_kernel_desc.core_ranges = all_cores_with_work;
     in1_sender_writer_kernel_desc.compile_time_args = in1_sender_writer_compile_time_args;

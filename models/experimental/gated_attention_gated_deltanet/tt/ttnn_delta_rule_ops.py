@@ -255,19 +255,22 @@ def fused_decay_and_write_ttnn(
     K = h.shape[2]
     V = h.shape[3]
 
+    # A 32-slot recurrent state is 32 MiB per intermediate and cannot coexist
+    # with the decode trace's circular buffers in P150 L1. Keep the low-latency
+    # L1 path through batch 16 and spill larger fixed batches to DRAM.
+    state_mc = ttnn.L1_MEMORY_CONFIG if int(B) <= 16 else ttnn.DRAM_MEMORY_CONFIG
+
     # decay_t: [B,H] -> [B,H,1,1] (already exp(g) in BF16)
-    decay = ttnn.reshape(decay_t, [B, H, 1, 1], memory_config=ttnn.L1_MEMORY_CONFIG)
+    decay = ttnn.reshape(decay_t, [B, H, 1, 1], memory_config=state_mc)
 
     # beta: [B,H] -> [B,H,1,1]
-    beta_expanded = ttnn.reshape(beta_t, [B, H, 1, 1], memory_config=ttnn.L1_MEMORY_CONFIG)
+    beta_expanded = ttnn.reshape(beta_t, [B, H, 1, 1], memory_config=state_mc)
 
-    # Decode opt: keep state-write operands in L1 (tiny at B=1).
-    _L1 = ttnn.L1_MEMORY_CONFIG
-    k_col = ttnn.reshape(k_t, [B, H, K, 1], memory_config=_L1)
-    d_row = ttnn.reshape(delta, [B, H, 1, V], memory_config=_L1)
+    k_col = ttnn.reshape(k_t, [B, H, K, 1], memory_config=state_mc)
+    d_row = ttnn.reshape(delta, [B, H, 1, V], memory_config=state_mc)
 
-    k_col = ttnn.to_memory_config(k_col, _L1)
-    d_row = ttnn.to_memory_config(d_row, _L1)
+    k_col = ttnn.to_memory_config(k_col, state_mc)
+    d_row = ttnn.to_memory_config(d_row, state_mc)
 
     matmul_compute_cfg = ttnn.WormholeComputeKernelConfig(
         math_fidelity=ttnn.MathFidelity.HiFi2,
@@ -279,7 +282,7 @@ def fused_decay_and_write_ttnn(
     outer = ttnn.matmul(
         k_col,
         d_row,
-        memory_config=_L1,
+        memory_config=state_mc,
         compute_kernel_config=matmul_compute_cfg,
         program_config=None,
     )
@@ -288,13 +291,13 @@ def fused_decay_and_write_ttnn(
     outer = ttnn.multiply(
         outer,
         beta_expanded,
-        memory_config=_L1,
+        memory_config=state_mc,
     )
 
     # apply_decay=False: h already decayed (decay->read->write order).
     if apply_decay:
-        h = ttnn.multiply(h, decay, memory_config=_L1)
-    h = ttnn.add(h, outer, memory_config=_L1)
+        h = ttnn.multiply(h, decay, memory_config=state_mc)
+    h = ttnn.add(h, outer, memory_config=state_mc)
 
     return h
 

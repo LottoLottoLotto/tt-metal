@@ -51,17 +51,18 @@ constexpr uint32_t cb_L_inv_1 = tt::CBIndex::c_15;
 constexpr uint32_t cb_L_inv_2 = tt::CBIndex::c_16;
 constexpr uint32_t cb_L_inv_3 = tt::CBIndex::c_17;
 
+// Ct == Kt == Vt == 4, so every phase buffer below has 16 fp32 tiles.
+// Reuse each CB only after its prior value has been popped.
 constexpr uint32_t cb_v_cor = tt::CBIndex::c_18;
-constexpr uint32_t cb_k_cum = tt::CBIndex::c_19;
-
-constexpr uint32_t cb_v_prime = tt::CBIndex::c_20;
-constexpr uint32_t cb_v_new = tt::CBIndex::c_21;
-constexpr uint32_t cb_o_inter = tt::CBIndex::c_22;
-constexpr uint32_t cb_intra_v = tt::CBIndex::c_23;
-constexpr uint32_t cb_out = tt::CBIndex::c_24;
-constexpr uint32_t cb_s_upd = tt::CBIndex::c_25;
-constexpr uint32_t cb_S_tmp = tt::CBIndex::c_26;
+constexpr uint32_t cb_intra_v = cb_v_cor;
 constexpr uint32_t cb_final_state = tt::CBIndex::c_27;
+constexpr uint32_t cb_k_cum = tt::CBIndex::c_19;
+constexpr uint32_t cb_S_tmp = cb_k_cum;
+constexpr uint32_t cb_v_prime = tt::CBIndex::c_20;
+constexpr uint32_t cb_o_inter = cb_v_prime;
+constexpr uint32_t cb_s_upd = cb_v_prime;
+constexpr uint32_t cb_v_new = tt::CBIndex::c_21;
+constexpr uint32_t cb_out = tt::CBIndex::c_24;
 
 // Reconfigure sources + packer and re-init the matmul MOP for a new in0 @ in1 -> out matmul.
 // Matmul maps in0 -> SrcB and in1 -> SrcA, so the source reconfig uses SrcOrder::Reverse.

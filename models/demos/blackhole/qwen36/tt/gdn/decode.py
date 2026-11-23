@@ -8,6 +8,8 @@ Operates on the gdn instance: reads weights from `gdn.weights`, config dims from
 memory_config, and the `gated_deltanet_forward_ttnn` kwargs are verbatim.
 """
 import ttnn
+from models.demos.blackhole.qwen36.tt.gdn.native_frontend import native_frontend
+from models.demos.blackhole.qwen36.tt.gdn.native_output import native_output
 from models.demos.blackhole.qwen36.tt.gdn.state import init_recurrent_state, split_fused_conv_state
 from models.experimental.gated_attention_gated_deltanet.tt.ttnn_gated_deltanet import gated_deltanet_forward_ttnn
 
@@ -38,6 +40,91 @@ def recurrent_forward(gdn, x, mode="recurrent", chunk_size=None, valid_len=None)
 
     # Chunk-parallel prefill via the C++ gated_delta_attn_seq kernel (float32, chunk_size=128).
     seq_masks = w.chunk_seq_masks_long
+    persistent_recurrent_state = gdn.recurrent_state
+    recurrent_input = persistent_recurrent_state
+    recurrent_row_dram = None
+    if mode == "chunk" and persistent_recurrent_state.layout == ttnn.ROW_MAJOR_LAYOUT:
+        # The legacy prefill kernel still consumes tiles. This one-time
+        # prefill-boundary conversion is not present on the decode path.
+        recurrent_row_dram = ttnn.to_memory_config(
+            persistent_recurrent_state,
+            ttnn.DRAM_MEMORY_CONFIG,
+        )
+        recurrent_input = ttnn.to_layout(
+            recurrent_row_dram,
+            ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+    native_state_address = None
+    native_conv_address = None
+    if T == 1 and gdn.native_recurrent:
+        assert gdn.recurrent_state is not None, "native GDN requested without recurrent state"
+        assert gdn.recurrent_state.dtype == ttnn.bfloat16, "native GDN requires BF16 recurrent state"
+        assert gdn.recurrent_state.memory_config().buffer_type == ttnn.BufferType.L1, (
+            "native GDN requested but persistent recurrent state is not L1-resident"
+        )
+        if gdn.native_frontend:
+            assert w.A_neg is not None, "native GDN front end requested without precomputed decay scale"
+        native_state_address = int(persistent_recurrent_state.buffer_address())
+        assert gdn.fused_conv_state is not None, "native GDN requested without fused convolution state"
+        assert gdn.fused_conv_state.memory_config().buffer_type == ttnn.BufferType.L1, (
+            "native GDN requested but persistent convolution state is not L1-resident"
+        )
+        native_conv_address = int(gdn.fused_conv_state.buffer_address())
+
+    native_frontend_runner = None
+    if (T == 1 or mode == "verify_two") and gdn.native_frontend:
+        if T == 1:
+            if gdn.native_frontend_output is None:
+                from models.demos.blackhole.qwen36.tt.gdn.native_frontend import allocate_native_frontend
+                gdn.native_frontend_output = allocate_native_frontend(gdn.device)
+            frontend_output = gdn.native_frontend_output
+        else:
+            if gdn.native_frontend_output_m2 is None:
+                from models.demos.blackhole.qwen36.tt.gdn.native_frontend import allocate_native_frontend_m2
+                gdn.native_frontend_output_m2 = allocate_native_frontend_m2(gdn.device, gdn.fused_conv_state)
+            frontend_output = gdn.native_frontend_output_m2
+        def native_frontend_runner(mega, _taps, _bias, conv_state):
+            return native_frontend(
+                mega,
+                w.native_frontend_weight_taps,
+                w.native_frontend_bias,
+                conv_state,
+                frontend_output,
+            )
+        native_frontend_runner.conv_s1 = frontend_output.conv_s1
+        native_frontend_runner.conv_s2 = frontend_output.conv_s2
+
+    native_verify_output_runner = None
+    if mode == "verify_two" and gdn.native_frontend and gdn.native_output and gdn.native_recurrent:
+        if not hasattr(gdn, "_fused_verify_output"):
+            from models.demos.blackhole.qwen36.tt.gdn.fused_verify_output import FusedVerifyOutput
+            gdn._fused_verify_output = FusedVerifyOutput(gdn.device)
+        native_verify_output_runner = gdn._fused_verify_output
+
+    native_output_runner = None
+    if (T == 1 or mode == "verify_two") and gdn.native_output and native_verify_output_runner is None:
+        if T == 1:
+            if gdn.native_output_output is None:
+                from models.demos.blackhole.qwen36.tt.gdn.native_output import NativeOutput, allocate_native_output
+                shared = type(gdn)._shared_native_output_value
+                if shared is None:
+                    shared = allocate_native_output(gdn.device).value
+                    type(gdn)._shared_native_output_value = shared
+                gdn.native_output_output = NativeOutput(value=shared)
+            output_state = gdn.native_output_output
+        else:
+            if gdn.native_output_output_m2 is None:
+                from models.demos.blackhole.qwen36.tt.gdn.native_output import NativeOutput, allocate_native_output_m2
+                shared = type(gdn)._shared_native_output_value_m2
+                if shared is None:
+                    shared = allocate_native_output_m2(gdn.device).value
+                    type(gdn)._shared_native_output_value_m2 = shared
+                gdn.native_output_output_m2 = NativeOutput(value=shared)
+            output_state = gdn.native_output_output_m2
+
+        def native_output_runner(recurrent, gate, gamma):
+            return native_output(recurrent, gate, gamma, output_state)
 
     output, new_state, new_conv_q, new_conv_k, new_conv_v, new_fused_conv = gated_deltanet_forward_ttnn(
         hidden_states=x,
@@ -65,7 +152,7 @@ def recurrent_forward(gdn, x, mode="recurrent", chunk_size=None, valid_len=None)
         use_gate=True,
         norm_eps=gdn.norm_eps,
         device=gdn.device,
-        recurrent_state=gdn.recurrent_state,
+        recurrent_state=recurrent_input,
         conv_state_q=gdn.conv_state_q,
         conv_state_k=gdn.conv_state_k,
         conv_state_v=gdn.conv_state_v,
@@ -80,37 +167,83 @@ def recurrent_forward(gdn, x, mode="recurrent", chunk_size=None, valid_len=None)
         qkv_proj_weight=w.qkv_proj_weight,
         q_dim=gdn.cfg.q_dim,
         k_dim=gdn.cfg.k_dim,
-        compute_kernel_config=gdn.compute_kernel_config_decode if mode == "recurrent" else gdn.compute_kernel_config,
+        compute_kernel_config=gdn.compute_kernel_config_decode if mode in ("recurrent", "verify_two") else gdn.compute_kernel_config,
         A_neg_precomputed=w.A_neg,
         fused_conv_weight_taps=w.fused_conv_weight_taps,
         fused_conv_bias_dev=w.fused_conv_bias_dev,
         fused_conv_state=gdn.fused_conv_state,
         fused_conv_state_split=getattr(gdn, "split_conv_state", None),
         ab_proj_weight=w.ab_proj_weight,
-        mega_fused_weight=w.mega_fused_weight,
+        mega_fused_weight=w.mega_fused_weight_decode if mode in ("recurrent", "verify_two") else w.mega_fused_weight,
         mega_qkv_dim=w.mega_qkv_dim,
         mega_a_dim=w.mega_a_dim,
         mega_b_dim=w.mega_b_dim,
         mega_g_dim=w.mega_g_dim,
+        mega_decode_program_config=gdn.mega_decode_program_config if mode in ("recurrent", "verify_two") else None,
+        out_decode_program_config=gdn.out_decode_program_config,
         use_inplace_state=gdn.use_inplace_state,
         chunk_seq_masks=seq_masks,
         valid_len=valid_len,
+        native_frontend_runner=native_frontend_runner,
+        native_output_runner=native_output_runner,
+        native_verify_output_runner=native_verify_output_runner,
     )
+    if mode == "verify_two":
+        return output, new_state, new_fused_conv
 
-    if gdn._chunk_inplace_state and mode == "chunk":
+    if recurrent_input is not persistent_recurrent_state:
+        if list(new_state.shape) != list(persistent_recurrent_state.shape):
+            new_state = ttnn.reshape(new_state, list(persistent_recurrent_state.shape))
+        new_state_row = ttnn.to_layout(
+            new_state,
+            ttnn.ROW_MAJOR_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        ttnn.copy(new_state_row, persistent_recurrent_state)
+        ttnn.deallocate(new_state_row)
+        ttnn.deallocate(new_state)
+        ttnn.deallocate(recurrent_input)
+        ttnn.deallocate(recurrent_row_dram)
+        new_state = persistent_recurrent_state
+    if (gdn._chunk_inplace_state or gdn.use_inplace_state) and mode == "chunk":
         # Per-chunk traced-prefill replay: write state into the persistent external
         # buffers in place so it carries across execute_trace() calls. gdn.recurrent_state
         # and gdn.fused_conv_state keep pointing at the same (baked) buffer addresses.
-        if list(new_state.shape) != list(gdn.recurrent_state.shape):
-            new_state = ttnn.reshape(new_state, list(gdn.recurrent_state.shape))
-        ttnn.copy(new_state, gdn.recurrent_state)
-        ttnn.deallocate(new_state)
+        if new_state is not gdn.recurrent_state:
+            if list(new_state.shape) != list(gdn.recurrent_state.shape):
+                new_state = ttnn.reshape(new_state, list(gdn.recurrent_state.shape))
+            ttnn.copy(new_state, gdn.recurrent_state)
+            ttnn.deallocate(new_state)
         if new_fused_conv is not None and not isinstance(new_fused_conv, list):
-            if new_fused_conv.layout != ttnn.TILE_LAYOUT:
-                new_fused_conv = ttnn.to_layout(new_fused_conv, ttnn.TILE_LAYOUT)
+            if new_fused_conv.layout != ttnn.ROW_MAJOR_LAYOUT:
+                conv_row_dram = ttnn.to_layout(
+                    new_fused_conv,
+                    ttnn.ROW_MAJOR_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+                ttnn.deallocate(new_fused_conv)
+                new_fused_conv = ttnn.to_memory_config(
+                    conv_row_dram,
+                    gdn.fused_conv_state.memory_config(),
+                )
+                ttnn.deallocate(conv_row_dram)
             ttnn.copy(new_fused_conv, gdn.fused_conv_state)
             ttnn.deallocate(new_fused_conv)
         return output
+
+    if native_state_address is not None:
+        assert int(new_state.buffer_address()) == native_state_address, (
+            "native GDN replaced the persistent recurrent-state buffer"
+        )
+        assert new_state.memory_config().buffer_type == ttnn.BufferType.L1, (
+            "native GDN moved persistent recurrent state out of L1"
+        )
+        assert new_fused_conv is not None and not isinstance(new_fused_conv, list), (
+            "native GDN replaced fused convolution state with split buffers"
+        )
+        assert int(new_fused_conv.buffer_address()) == native_conv_address, (
+            "native GDN replaced the persistent convolution-state buffer"
+        )
 
     gdn.recurrent_state = new_state
     if isinstance(new_fused_conv, list):
