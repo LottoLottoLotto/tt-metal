@@ -92,11 +92,11 @@ inline void _emit_gcd_step_() {
 }
 
 inline void _record_gcd_replay_() {
-    lltt::record(GCD_REPLAY_START, GCD_REPLAY_LEN);
+    TT_REPLAY(GCD_REPLAY_START, GCD_REPLAY_LEN, 0, 0, 0, 1);
     _emit_gcd_step_<GCD_LREG_A, GCD_LREG_TMP>();
     _emit_gcd_step_<GCD_LREG_TMP, GCD_LREG_A>();
 
-    lltt::record(GCD_PROLOGUE_START, GCD_PROLOGUE_LEN);
+    TT_REPLAY(GCD_PROLOGUE_START, GCD_PROLOGUE_LEN, 0, 0, 0, 1);
     _emit_gcd_prologue_();
 }
 

@@ -58,7 +58,7 @@ inline void mac_init() {
     // is what we want; only the store overrides it, with the auto-advancing mod set above.
     constexpr sfpi::DataLayout dst_fmt = is_fp32_dest_acc_en ? sfpi::DataLayout::F32 : sfpi::DataLayout::FSrcB;
 
-    lltt::record<lltt::NoExec>(MAC_REPLAY_SLOT, mac_replay_len<is_fp32_dest_acc_en>);
+    TT_REPLAY(MAC_REPLAY_SLOT, mac_replay_len<is_fp32_dest_acc_en>, 0, 0, 0, 1);
     sfpi::vFloat a = sfpi::dst_reg[0].mode<dst_fmt>();
     sfpi::vFloat b = sfpi::dst_reg[32].mode<dst_fmt>();
     sfpi::vFloat c = sfpi::dst_reg[64].mode<dst_fmt>();

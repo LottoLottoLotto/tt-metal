@@ -109,7 +109,7 @@ inline void _llk_unpack_AB_reduce_mop_config_(const ckernel::TensorShape tensor_
         if (_llk_unpack_AB_reduce_scaler_whole_tile_(tensor_shape, tensor_shape_scaler))
         {
             constexpr std::uint32_t whole_tile_replay_len = 2;
-            lltt::record<lltt::NoExec>(0, whole_tile_replay_len);
+            TT_REPLAY(0, whole_tile_replay_len, 0, 1);
             TTI_UNPACR(SrcA, 0b0, 0, 0, 0, 1, 1 /*SetDatValid*/, p_unpacr::RAREFYB_DISABLE, 0, 0, 0, 0, 1);
             TTI_UNPACR(SrcB, 0b0, 0, 0, 0, 1, 1 /*SetDatValid*/, p_unpacr::RAREFYB_DISABLE, 0, 0, 0, 0, 1);
             ckernel_template tmp(1, 1, TT_OP_REPLAY(0, whole_tile_replay_len), 0, 0);
@@ -117,7 +117,7 @@ inline void _llk_unpack_AB_reduce_mop_config_(const ckernel::TensorShape tensor_
             return;
         }
         const std::uint32_t replay_len = (clear_scaler ? 1 : 0) + 3;
-        lltt::record<lltt::NoExec>(0, replay_len);
+        TT_REPLAY(0, replay_len, 0, 1);
         if (clear_scaler)
         {
             TTI_UNPACR_NOP(p_unpacr_nop::UNP0, p_unpacr_nop::UNP_ZEROSRC);
@@ -142,7 +142,7 @@ inline void _llk_unpack_AB_reduce_mop_config_(const ckernel::TensorShape tensor_
     const bool clear_scaler       = swap_operands && _llk_unpack_AB_reduce_scaler_row_only_(tensor_shape_scaler);
 
     const std::uint32_t replay_len = (clear_data ? 1 : 0) + (clear_scaler ? 1 : 0) + 2;
-    lltt::record<lltt::NoExec>(0, replay_len);
+    TT_REPLAY(0, replay_len, 0, 1);
     if (clear_data)
     {
         TTI_UNPACR_NOP(data_unpacker, data_clear_val);

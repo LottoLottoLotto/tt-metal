@@ -33,7 +33,7 @@ inline void _calculate_where_(
 #ifdef DISABLE_SFPLOADMACRO
     int offset3 = (dst_index_out * 32) << 1;
 
-    lltt::record(0, 6);
+    TT_REPLAY(0, 6, 0, 1);
     TT_SFPLOAD(p_sfpu::LREG0, mod0, ADDR_MOD_3, offset0);
     TT_SFPLOAD(p_sfpu::LREG1, mod0, ADDR_MOD_3, offset1);
     TTI_SFPSETCC(0, p_sfpu::LREG0, 0, sfpi::SFPSETCC_MOD1_LREG_EQ0);
@@ -55,7 +55,7 @@ inline void _calculate_where_(
         // SFPLOAD L0=Dst[offset2] | SFPENCC (LaneEnabled=true)     |
         // (next SFPLOAD L0)       |                                | SFPSTORE Dst[offset0]=L0
 
-        lltt::record(0, 3);
+        TT_REPLAY(0, 3, 0, 1);
         TT_SFPLOADMACRO((0 << 2), mod0, ADDR_MOD_3, offset0);
         TT_SFPLOADMACRO((2 << 2), mod0, ADDR_MOD_3, offset1);
         TT_SFPLOAD(0, mod0, ADDR_MOD_2, offset2);
@@ -76,7 +76,7 @@ inline void _calculate_where_(
 
         int offset3 = (dst_index_out * 32) << 1;
 
-        lltt::record(0, 4);
+        TT_REPLAY(0, 4, 0, 1);
         TT_SFPLOADMACRO((1 << 2), mod0, ADDR_MOD_3, offset0);
         TT_SFPLOADMACRO((2 << 2), mod0, ADDR_MOD_3, offset1);
         TT_SFPLOAD(0, mod0, ADDR_MOD_3, offset2);

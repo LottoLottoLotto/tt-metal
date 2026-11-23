@@ -478,7 +478,7 @@ static_assert(
  */
 template <HorizontalFold fold>
 inline void record_horizontal_reduce_stage() {
-    lltt::record(horizontal_stage_replay_start<fold>(), horizontal_stage_replay_len<fold>());
+    TT_REPLAY(horizontal_stage_replay_start<fold>(), horizontal_stage_replay_len<fold>(), 0, 1);
     horizontal_reduce_rotate_first();
     horizontal_reduce_rotate_step();
     horizontal_reduce_fold<fold>();
@@ -1205,7 +1205,7 @@ template <InstrModLoadStore INSTRUCTION_MODE, PoolType pool_type>
 inline void init_reduce_max_min_int32() {
     _init_sfpu_config_reg();
 
-    lltt::record(0, COL_MAX_MANUAL_REPLAY_LEN);
+    TT_REPLAY(0, COL_MAX_MANUAL_REPLAY_LEN, 0, 1);
     TTI_SFPSWAP(0, p_sfpu::LREG7, p_sfpu::LREG6, 1);
     TTI_SFPSWAP(0, p_sfpu::LREG6, p_sfpu::LREG5, 1);
     TTI_SFPSWAP(0, p_sfpu::LREG5, p_sfpu::LREG4, 1);
@@ -1224,7 +1224,7 @@ template <PoolType pool_type>
 inline void init_reduce_max_min_int32_signed() {
     _init_sfpu_config_reg();
 
-    lltt::record(0, COL_MAX_INT32_SIGNED_REPLAY_LEN);
+    TT_REPLAY(0, COL_MAX_INT32_SIGNED_REPLAY_LEN, 0, 1);
     _emit_int32_signed_cswap_<p_sfpu::LREG7, p_sfpu::LREG6>();
     _emit_int32_signed_cswap_<p_sfpu::LREG6, p_sfpu::LREG5>();
     _emit_int32_signed_cswap_<p_sfpu::LREG5, p_sfpu::LREG4>();
@@ -1273,7 +1273,7 @@ inline void init_reduce_max_min([[maybe_unused]] std::uint32_t num_cols) {
     // When clearing high bits (UInt16 in 32-bit dest), two extra SFPAND ops mask the garbage high bits
     // of the manually loaded face-1 columns (LREG0/LREG1) before the compare-and-swap, so the buffer
     // grows from 9 to 11 instructions.
-    lltt::record<lltt::NoExec>(0, col_max_loadmacro_replay_len<clear_high_bits>());
+    TT_REPLAY(0, col_max_loadmacro_replay_len<clear_high_bits>(), 0, 1);
     TTI_INCRWC(0, 4, 0, 0);
     TTI_SFPLOADMACRO(5, INSTRUCTION_MODE, ADDR_MOD_3, 2);
     TTI_SFPLOAD(p_sfpu::LREG0, INSTRUCTION_MODE, ADDR_MOD_3, 16);
@@ -1326,7 +1326,7 @@ inline void init_reduce_sum_avg() {
     if constexpr (is_integer_mode) {
         // Integer replay buffer: 6 sequential instructions (1-cycle SFPIADD latency, no NOPs needed)
         // Positions 0-2 form a natural half-reduce for LREG0-3 (reusable via replay(0, 3))
-        lltt::record(0, COL_SUM_INT_REPLAY_LEN);
+        TT_REPLAY(0, COL_SUM_INT_REPLAY_LEN, 0, 1);
 
         // Upper face column summation (LREG0-3)
         TTI_SFPIADD(0, p_sfpu::LREG3, p_sfpu::LREG2, 4);  // LREG2 = LREG2 + LREG3
@@ -1341,7 +1341,7 @@ inline void init_reduce_sum_avg() {
         // Float replay buffer: 10 instructions total
         // Positions 0-5: Full reduce, interleaved to eliminate NOPs (B hides A's 2-cycle latency)
         // Positions 6-9: Half reduce for LREG0-3 only, with NOP for dependent SFPADD chain
-        lltt::record(0, COL_SUM_FLOAT_REPLAY_LEN);
+        TT_REPLAY(0, COL_SUM_FLOAT_REPLAY_LEN, 0, 1);
 
         // Full reduce (positions 0-5): interleaved upper/lower face summation
         TTI_SFPADD(p_sfpu::LREG2, p_sfpu::LCONST_1, p_sfpu::LREG3, p_sfpu::LREG2, 0);  // A1

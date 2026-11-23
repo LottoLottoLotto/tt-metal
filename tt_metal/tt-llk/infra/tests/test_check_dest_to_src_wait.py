@@ -263,8 +263,8 @@ def test_one_function_wait_does_not_cover_another(tmp_path):
 @pytest.mark.parametrize(
     "record",
     [
-        "lltt::record(0, 4);",
-        "lltt::record<lltt::NoExec>(0, 4);",
+        "TT_REPLAY(0, 4, 0, 1);",
+        "TT_REPLAY(0, 4, 0, 1);",
     ],
 )
 def test_record_only_moves_are_not_checked(tmp_path, record):
@@ -306,7 +306,7 @@ def test_wait_recorded_with_the_moves_is_checked(tmp_path, wait, warns):
         f"""
         inline void _mop_config_()
         {{
-            lltt::record<lltt::NoExec>(0, 2);
+            TT_REPLAY(0, 2, 0, 1);
             {wait}
             TTI_MOVD2A(0, 0, ADDR_MOD_1, p_movd2a::MOV_4_ROWS, 0);
             std::uint32_t replay_instr = TT_OP_REPLAY(0, 2, 0, 0);
@@ -358,7 +358,7 @@ def test_exec_record_is_still_checked(tmp_path):
         """
         inline void _thing_()
         {
-            lltt::record<lltt::Exec>(0, 4);
+            TT_REPLAY(0, 4, 1, 1);
             TTI_MOVD2B(0, 0, ADDR_MOD_0, p_movd2b::MOV_4_ROWS, 0);
         }
         """,
@@ -377,7 +377,7 @@ def test_record_span_ends_with_its_block(tmp_path):
         {
             if constexpr (A)
             {
-                lltt::record(0, 1);
+                TT_REPLAY(0, 1, 0, 1);
                 TTI_MOVD2B(0, 0, ADDR_MOD_0, p_movd2b::MOV_4_ROWS, 0);
             }
             else
@@ -449,7 +449,7 @@ def test_recorded_wait_in_a_helper_does_not_cover_callers(tmp_path):
         """
         inline void record_srcb_wait()
         {
-            lltt::record(0, 1);
+            TT_REPLAY(0, 1, 0, 1);
             TTI_STALLWAIT(p_stall::STALL_MATH, p_stall::MATH | p_stall::SRCB_VLD);
         }
 

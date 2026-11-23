@@ -66,7 +66,7 @@ inline void mac_init() {
     // with the auto-advancing mod set above.
     constexpr sfpi::DataLayout dst_fmt = is_fp32_dest_acc_en ? sfpi::DataLayout::F32 : sfpi::DataLayout::FSrcB;
 
-    lltt::record<lltt::NoExec>(MAC_REPLAY_SLOT, mac_replay_len<is_fp32_dest_acc_en>);
+    TT_REPLAY(MAC_REPLAY_SLOT, mac_replay_len<is_fp32_dest_acc_en>, 0, 1);
     sfpi::vFloat a0 = sfpi::dst_reg[0].mode<dst_fmt>();
     sfpi::vFloat b0 = sfpi::dst_reg[32].mode<dst_fmt>();
     sfpi::vFloat c0 = sfpi::dst_reg[64].mode<dst_fmt>();
