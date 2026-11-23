@@ -56,7 +56,7 @@ class Qwen36GatedDeltaNet:
 
     def __init__(self, mesh_device, config: GDNConfig, state_dict, tensor_cache_path=None, pack_decode_mega=False):
         """pack_decode_mega: single-request 35B decode stores the decode-only mega weight bank-packed and runs it
-        through PackedDecodeMatmul (bitwise the stock matmul; the batched path must not use it)."""
+        through PackedDecodeMatmul (bitwise the stock matmul); single-request and batched decode both read it."""
         self.device = mesh_device
         self.cfg = config
 
@@ -87,6 +87,7 @@ class Qwen36GatedDeltaNet:
         self.weights = load_gdn_weights(mesh_device, config, state_dict, tensor_cache_path,
                                         pack_decode_mega_cores=mega_cores)
         self.mega_decode_runner = None
+        self.out_decode_runner = None
         self.native_frontend_output = None
         self.native_frontend_output_m2 = None
         self.native_frontend_output_many = {}
@@ -183,6 +184,16 @@ class Qwen36GatedDeltaNet:
                 # Verification rows share one tile row: the decode config also serves M=2..32
                 # and keeps each row's accumulation order identical to a decode step.
                 self.out_verify_program_config = self.out_decode_program_config
+            if mega_cores and self.out_verify_program_config is self.out_decode_program_config:
+                from models.demos.blackhole.qwen36.tt.packed_matmul import packed_decode_runner, packed_projections
+
+                if "out" in packed_projections() and self.weights.o_proj_weight.dtype in (
+                    ttnn.bfloat4_b, ttnn.bfloat8_b
+                ):
+                    # Single-request decode/verify out_proj: decode-only bank-packed copy, exact.
+                    self.out_decode_runner = packed_decode_runner(
+                        self.weights.o_proj_weight, self.out_decode_program_config, self.compute_kernel_config_decode,
+                    )
         if not Qwen36GatedDeltaNet._logged_effective_config:
             logger.info(
                 "GDN effective config: implementation={} recurrent_fused={} frontend_fused={} output_fused={} "

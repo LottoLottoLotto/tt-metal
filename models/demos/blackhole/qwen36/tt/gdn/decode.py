@@ -301,6 +301,7 @@ def recurrent_forward(gdn, x, mode="recurrent", chunk_size=None, valid_len=None,
         mega_g_dim=w.mega_g_dim,
         mega_decode_program_config=gdn.mega_decode_program_config if mode == "recurrent" or verifying else None,
         mega_decode_runner=gdn.mega_decode_runner if mode == "recurrent" or verifying else None,
+        out_decode_runner=gdn.out_decode_runner if mode == "recurrent" or verifying else None,
         out_decode_program_config=(
             gdn.out_verify_program_config if verifying else gdn.out_decode_program_config
         ),

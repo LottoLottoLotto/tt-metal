@@ -116,7 +116,6 @@ class TreeTargetVerifier(TargetVerifier):
             previous = x
             x, candidate = layer.verify_many(
                 x, cos, sin, self.positions, self.page_table, fork_position=self.fork_position,
-                final_norm=self.model.verify_final_norm(index),
             )
             ttnn.deallocate(previous)
             if index in self.features:
@@ -124,9 +123,8 @@ class TreeTargetVerifier(TargetVerifier):
             candidates.append(candidate)
         ttnn.deallocate(cos)
         ttnn.deallocate(sin)
-        hidden = self.model.verify_hidden(x)
-        if hidden is not x:
-            ttnn.deallocate(x)
+        hidden = self.model._final_norm_decode(x)
+        ttnn.deallocate(x)
         return hidden, candidates
 
     def accept_branches(self, logits):

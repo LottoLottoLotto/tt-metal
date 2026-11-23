@@ -521,6 +521,7 @@ def gated_deltanet_forward_ttnn(
     mega_g_dim=None,
     mega_decode_program_config=None,
     mega_decode_runner=None,  # bank-packed decode mega weight: the runner must serve every T<=32 decode/verify call
+    out_decode_runner=None,  # bank-packed decode out_proj (PackedDecodeMatmul): T<=32 decode/verify calls
     out_decode_program_config=None,
     decode_program_configs=None,  # T=1 per-projection configs: {"qkv","a","b","g"}
     fused_conv_stacked_taps=None,  # [1,K,D] tiled taps for the one-shot T=1 conv
@@ -653,7 +654,8 @@ def gated_deltanet_forward_ttnn(
         )
         o, core_state, core_conv = native_core_runner(mega_out)
         ttnn.deallocate(mega_out)
-        o = decode_linear(o, o_proj_weight, program_config=out_decode_program_config)
+        o = (out_decode_runner(o, output_memory_config=mc, compute_kernel_config=ckc) if out_decode_runner is not None
+             else decode_linear(o, o_proj_weight, program_config=out_decode_program_config))
         if verifying:
             candidates = tuple(
                 ttnn.reshape(candidate, [1, num_v_heads, head_k_dim, head_v_dim]) for candidate in core_state
@@ -1209,11 +1211,14 @@ def gated_deltanet_forward_ttnn(
 
             o = ttnn.clip(o, min=-1e4, max=1e4, memory_config=mc)
             o = ttnn.reshape(o, [B, T, num_v_heads * head_v_dim], memory_config=mc)
-    o = decode_linear(
-        o,
-        o_proj_weight,
-        program_config=out_decode_program_config if (T == 1 or verifying) else None,
-    )
+    if out_decode_runner is not None and (T == 1 or verifying) and B == 1:
+        o = out_decode_runner(o, output_memory_config=mc, compute_kernel_config=ckc)
+    else:
+        o = decode_linear(
+            o,
+            o_proj_weight,
+            program_config=out_decode_program_config if (T == 1 or verifying) else None,
+        )
 
     if flat_decode:
         o = ttnn.reshape(o, [1, 1, B, o.shape[-1]])

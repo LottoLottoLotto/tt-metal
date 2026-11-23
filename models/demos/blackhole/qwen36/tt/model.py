@@ -24,17 +24,34 @@ from models.demos.blackhole.qwen36.tt.packed_matmul import repack_for_worker_ban
 from models.tt_transformers.tt.common import Mode, get_block_size, num_blocks_in_seq
 
 
-class DeviceEmbedding:
-    """Batch-one embedding with a device-resident table.
-
-    Token lookups stay on device: the MTP cycle derives its next tokens on device, and prefill
-    and decode trace capture forbid device-to-host reads. ``weight`` stays the host table for
-    host-side single-row callers.
-    """
+class HostEmbedding:
+    """Batch-one embedding without a persistent 1 GiB device table."""
 
     def __init__(self, mesh_device, weight):
         self.mesh_device = mesh_device
         self.weight = weight
+
+    def __call__(self, token_ids):
+        host_ids = ttnn.to_torch(token_ids).to(torch.long)
+        embedded = self.weight[host_ids].to(torch.bfloat16).contiguous()
+        return ttnn.from_torch(
+            embedded,
+            device=self.mesh_device,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+
+class DeviceEmbedding(HostEmbedding):
+    """Batch-one embedding with a device-resident table, for trace-replayed token lookups.
+
+    The MTP cycle derives its next tokens on device, so its embedding cannot round-trip
+    through the host. ``weight`` stays the host table for host-side single-row callers.
+    """
+
+    def __init__(self, mesh_device, weight):
+        super().__init__(mesh_device, weight)
         self.device_weight = ttnn.from_torch(
             weight.to(torch.bfloat16),
             device=mesh_device,
@@ -108,9 +125,12 @@ class Qwen36Model:
         # Framework Embedding (mesh-aware; replicates on 1-device mesh).
         from models.tt_transformers.tt.embedding import Embedding
         if self.num_devices == 1:
-            # The vocabulary table stays on device in every mode: traced prefill/decode and the
-            # MTP cycle (which picks its tokens on device) cannot round-trip token ids via host.
-            self.embd = DeviceEmbedding(mesh_device, state_dict["tok_embeddings.weight"])
+            # Decode touches one row at a time. Keeping the 1 GiB vocabulary
+            # table on host removes the dominant startup DMA and frees device
+            # DRAM for lazily cached routed experts. The traced MTP cycle picks
+            # its tokens on device, so it needs the table resident.
+            embedding_class = DeviceEmbedding if self._batched_single_device or os.environ.get("QWEN36_MTP") == "1" else HostEmbedding
+            self.embd = embedding_class(mesh_device, state_dict["tok_embeddings.weight"])
         else:
             from models.tt_transformers.tt.embedding import Embedding
 
@@ -197,8 +217,8 @@ class Qwen36Model:
             "lm_head", tensor_cache_path, ttnn.bfloat4_b if lm_head_bfp4 else ttnn.bfloat8_b
         )
         lm_head_bfp4 = lm_head_dtype == ttnn.bfloat4_b
-        # 35B (dim 2048, K=64 tiles): bank-packed weight read by PackedLMHead (the C++ packed path admits only
-        # K=128/160); bitwise the stock decode LM head.
+        # 35B (dim 2048, K=64 tiles): bank-packed weight read by PackedDecodeMatmul (the C++ packed path admits only
+        # K=128/160); bitwise the stock decode LM head for every 1-32 row call (decode buckets, packed prefill rows).
         self._lmhead_packed_generic = (
             args.dim == 2048 and os.environ.get("QWEN36_SINGLE_1D_DECODE") == "1"
             and os.environ.get("QWEN36_LM_HEAD_PACKED") != "0"
@@ -779,18 +799,6 @@ class Qwen36Model:
             compute_kernel_config=self.norm.compute_kernel_config_hifi2,
         )
 
-    def verify_final_norm(self, layer_index):
-        """Final-norm hook for a verification layer pass: the last layer of a fused-final-norm model
-        applies decode's fused residual+RMSNorm (same program, row-local), so every verification row
-        reaches the LM head with the bits a single-row decode produces. None elsewhere."""
-        if self._fuse_final_residual_norm and layer_index == len(self.layers) - 1:
-            return self._final_norm_residual_decode
-        return None
-
-    def verify_hidden(self, x):
-        """LM-head input from the last verification layer output (see verify_final_norm)."""
-        return x if self._fuse_final_residual_norm else self._final_norm_decode(x)
-
     def _final_norm_decode(self, x):
         """Final RMSNorm before the LM head (TP decode).
 
@@ -1237,7 +1245,7 @@ class Qwen36Model:
         if cos is None or sin is None:
             cos, sin = self.rope.get_rot_mats(positions_host.reshape(1, 2).to(torch.long))
         candidates = []
-        for index, layer in enumerate(self.layers):
+        for layer in self.layers:
             x, layer_candidates = layer.verify_two(
                 x,
                 cos,
@@ -1247,10 +1255,9 @@ class Qwen36Model:
                 shadow_fill_page_table=shadow_fill_page_table if layer.is_full_attention else None,
                 shadow_source_page=shadow_source_page,
                 shadow_same_page=shadow_same_page,
-                final_norm=self.verify_final_norm(index),
             )
             candidates.append(layer_candidates)
-        hidden = self.verify_hidden(x)
+        hidden = self._final_norm_decode(x)
         logits = self._lm_head(hidden)
         logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
         target_tokens = ttnn.argmax(logits_rm, dim=-1, keepdim=False)
@@ -1371,6 +1378,8 @@ class Qwen36Model:
         taps = config["dflash_config"]["target_layer_ids"]
         if max(taps) >= len(self.layers):
             raise ValueError("Draft feature taps exceed the target layer count")
+        if isinstance(self.embd, HostEmbedding) and not isinstance(self.embd, DeviceEmbedding):
+            self.embd = DeviceEmbedding(self.device, self.embd.weight)
         buckets = self._PREFILL_MASK_BUCKETS if feature_buckets is None else tuple(feature_buckets)
         if not buckets or max(buckets) < config["sliding_window"]:
             raise ValueError("Feature buckets must cover the draft sliding window")
@@ -1419,48 +1428,6 @@ class Qwen36Model:
         """Pick row 1 when flag else row 0 from a [1, 2, D] TILE tensor -> [1, 1, D]."""
         return ttnn.where(flag_tile, two_rows[:, 1:2, :], two_rows[:, 0:1, :])
 
-    def _verify_two_layers(self, x, cos, sin, positions, page_table):
-        """All decoder layers at M=2 (MTP verify) without committing; returns (last output, per-layer candidates)."""
-        candidates = []
-        for index, layer in enumerate(self.layers):
-            previous = x
-            x, layer_candidates = layer.verify_two(
-                x, cos, sin, positions, page_table,
-                shadow_fill_page_table=None, shadow_source_page=0, shadow_same_page=False,
-                final_norm=self.verify_final_norm(index),
-            )
-            ttnn.deallocate(previous)
-            candidates.append(layer_candidates)
-        return x, candidates
-
-    def _greedy_argmax(self, logits):
-        """uint32 argmax over the last dim of 1-2 tiled logit rows (TileArgmax; same ids as untilize + ttnn.argmax)."""
-        if getattr(self, "_tile_argmax", None) is None:
-            from models.demos.blackhole.qwen36.tt.tile_argmax import TileArgmax
-
-            self._tile_argmax = TileArgmax()
-        return self._tile_argmax(logits)
-
-    def _commit_verify_two(self, accepted, candidates):
-        """Commit every GDN layer's accepted M=2 candidate (S1 or S2, by the device flag) into its live L1 state in
-        one launch, then release the candidates. KV for both positions already sits in the live pages."""
-        from models.demos.blackhole.qwen36.tt.gdn.fused_commit_all import FusedCommitAll
-
-        entries = []
-        for layer, layer_candidates in zip(self.layers, candidates):
-            if layer.is_full_attention:
-                continue
-            (s1, s2), (c1, c2) = layer_candidates
-            entries.append((s1, s2, c1, c2, layer.attention.recurrent_state, layer.attention.fused_conv_state))
-        if not entries:
-            return
-        if getattr(self, "_fused_mtp_commit_all", None) is None:
-            self._fused_mtp_commit_all = FusedCommitAll()
-        self._fused_mtp_commit_all(accepted, entries)
-        for s1, s2, *_ in entries:
-            ttnn.deallocate(s1)
-            ttnn.deallocate(s2)
-
     def mtp_cycle_step(self):
         """One full MTP transaction on device: verify M=2, commit, draft next. Trace-safe."""
         tokens = self._mtp_tokens
@@ -1468,15 +1435,24 @@ class Qwen36Model:
         page_table = self._mtp_page_table
         cos, sin = self._mtp_rope_for_positions(positions)
         x = self.embd(tokens)
-        x, candidates = self._verify_two_layers(x, cos, sin, positions, page_table)
+        candidates = []
+        for layer in self.layers:
+            previous = x
+            x, layer_candidates = layer.verify_two(
+                x, cos, sin, positions, page_table,
+                shadow_fill_page_table=None, shadow_source_page=0, shadow_same_page=False,
+            )
+            ttnn.deallocate(previous)
+            candidates.append(layer_candidates)
         ttnn.deallocate(cos)
         ttnn.deallocate(sin)
-        hidden = self.verify_hidden(x)
-        if hidden is not x:
-            ttnn.deallocate(x)
+        hidden = self._final_norm_decode(x)
+        ttnn.deallocate(x)
         logits = self._lm_head(hidden)
-        targets = self._greedy_argmax(logits)  # [1, 2] uint32
+        logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
         ttnn.deallocate(logits)
+        targets = ttnn.argmax(logits_rm, dim=-1, keepdim=False)  # [1, 2] uint32
+        ttnn.deallocate(logits_rm)
         targets_i32 = ttnn.typecast(targets, ttnn.int32)
         draft = ttnn.typecast(tokens[:, 1:2], ttnn.int32)
         accepted = ttnn.eq(targets_i32[:, 0:1], draft)  # [1,1] int32 0/1
@@ -1485,7 +1461,19 @@ class Qwen36Model:
         flag_tile = ttnn.to_layout(ttnn.typecast(ttnn.reshape(accepted, [1, 1, 1]), ttnn.bfloat16), ttnn.TILE_LAYOUT)
 
         # Select and untilize directly into the fixed live GDN state buffers.
-        self._commit_verify_two(accepted, candidates)
+        from models.demos.blackhole.qwen36.tt.gdn.fused_commit import FusedCommit
+        for layer, layer_candidates in zip(self.layers, candidates):
+            if layer.is_full_attention:
+                continue  # KV for both positions already sits in the live page.
+            (s1, s2), (c1, c2) = layer_candidates
+            if not hasattr(layer.attention, "_fused_mtp_commit"):
+                layer.attention._fused_mtp_commit = FusedCommit()
+            layer.attention._fused_mtp_commit(
+                accepted, s1, s2, c1, c2,
+                layer.attention.recurrent_state, layer.attention.fused_conv_state,
+            )
+            ttnn.deallocate(s1)
+            ttnn.deallocate(s2)
 
         # Selected hidden and next committed token/position.
         sel_hidden = self._mtp_select_row(hidden, flag_tile)  # [1,1,dim]
@@ -1631,12 +1619,19 @@ class Qwen36Model:
         sampler = self.exact_sampler
         cos, sin = self._mtp_rope_for_positions(positions)
         x = self.embd(tokens)
-        x, candidates = self._verify_two_layers(x, cos, sin, positions, page_table)
+        candidates = []
+        for layer in self.layers:
+            previous = x
+            x, layer_candidates = layer.verify_two(
+                x, cos, sin, positions, page_table,
+                shadow_fill_page_table=None, shadow_source_page=0, shadow_same_page=False,
+            )
+            ttnn.deallocate(previous)
+            candidates.append(layer_candidates)
         ttnn.deallocate(cos)
         ttnn.deallocate(sin)
-        hidden = self.verify_hidden(x)
-        if hidden is not x:
-            ttnn.deallocate(x)
+        hidden = self._final_norm_decode(x)
+        ttnn.deallocate(x)
         logits = self._lm_head(hidden)
         # Retained (fixed address in the trace): the host redraws from it when a tie group was truncated.
         self._mtp_verify_logits = ttnn.reshape(logits, (1, 1, 2, self.args.vocab_size))
@@ -1646,7 +1641,19 @@ class Qwen36Model:
         accepted = ttnn.slice(cyc, (0, 2), (1, 3))  # [1,1] int32 0/1
         flag_tile = ttnn.to_layout(ttnn.typecast(ttnn.reshape(accepted, [1, 1, 1]), ttnn.bfloat16), ttnn.TILE_LAYOUT)
 
-        self._commit_verify_two(accepted, candidates)
+        from models.demos.blackhole.qwen36.tt.gdn.fused_commit import FusedCommit
+        for layer, layer_candidates in zip(self.layers, candidates):
+            if layer.is_full_attention:
+                continue  # KV for both positions already sits in the live page.
+            (s1, s2), (c1, c2) = layer_candidates
+            if not hasattr(layer.attention, "_fused_mtp_commit"):
+                layer.attention._fused_mtp_commit = FusedCommit()
+            layer.attention._fused_mtp_commit(
+                accepted, s1, s2, c1, c2,
+                layer.attention.recurrent_state, layer.attention.fused_conv_state,
+            )
+            ttnn.deallocate(s1)
+            ttnn.deallocate(s2)
 
         sel_hidden = self._mtp_select_row(hidden, flag_tile)  # [1,1,dim]
         ttnn.deallocate(hidden)
@@ -2657,11 +2664,16 @@ class Qwen36Model:
             for hl in host_logits
         ]
 
-    def prefill_paged_slots(self, token_ids_list, page_table, empty_slots, valid_lens=None, start_positions=None):
+    def prefill_paged_slots(
+        self, token_ids_list, page_table, empty_slots, valid_lens=None, start_positions=None, prefix=None
+    ):
         """Process prompt segments into independent live request slots.
 
         Tokens contain the full prefix; valid_lens is the cumulative end and
         start_positions the already-computed prefix length (zero for a new slot).
+        prefix (exact prefix resume, one dict per row or None): "resume" = snapshot payload a new
+        request restarts from at its start (instead of its slot), "snap_start" / "snap_end" =
+        callbacks publishing the state at the segment start / at a chunk-multiple end.
         State transfers remain on device and preserve the other decode slots.
         """
         N = len(token_ids_list)
@@ -2681,7 +2693,13 @@ class Qwen36Model:
             if starts[u] and not self._batched_single_device:
                 raise ValueError("Resumable prefill requires single-device batched serving")
             actuals.append(actual)
+        if prefix is not None and any(
+            act["resume"] is not None and act["resume"]["length"] != starts[u] for u, act in enumerate(prefix)
+        ):
+            raise ValueError("a resumed segment must start at its snapshot")
         packs, serial = self._plan_packed_prefill(actuals, starts)
+        if prefix is not None and any(prefix[u]["snap_start"] or prefix[u]["snap_end"] for _, m in packs for u in m):
+            raise ValueError("packed short prefills never cross a snapshot boundary")
 
         # Bind the persistent B=1 GDN prefill scratch: prefill runs B=1 and its per-sequence reset
         # would otherwise zero the batched [B,...] decode buffer (clobbering the live rows). This is
@@ -2707,13 +2725,18 @@ class Qwen36Model:
                 toks = token_ids_list[u]
                 actual = actuals[u]
                 start = starts[u]
-                if start:
+                act = prefix[u] if prefix is not None else {"resume": None, "snap_start": None, "snap_end": None}
+                if start and act["resume"] is None:
                     from models.demos.blackhole.qwen36.tt.batch_state import copy_state_rows
                     for dn, recurrent, convolution, *_ in prev:
                         copy_state_rows(recurrent, dn.recurrent_state, [int(empty_slots[u])], [0])
                         copy_state_rows(convolution, dn.fused_conv_state, [int(empty_slots[u])], [0])
+                if act["snap_start"] is not None:
+                    # The scratch now holds exactly the state at this chunk boundary.
+                    act["snap_start"](start, *self.prefix_snapshot(self._chunked_chunk_size or 2048))
                 lg = self.prefill_traced_chunked(
-                    toks[:, :actual], pt[u : u + 1], actual_len=actual, start_position=start
+                    toks[:, :actual], pt[u : u + 1], actual_len=actual, start_position=start,
+                    resume=act["resume"], snapshot=act["snap_end"],
                 )
                 host_logits[u] = ttnn.to_torch(lg).reshape(-1, self.args.vocab_size)[:1].float().view(1, 1, -1)
                 ttnn.deallocate(lg)
@@ -4930,13 +4953,27 @@ class Qwen36Model:
     ):
         """Generator decode forward. kv_cache accepted but unused (state is model-bound).
 
-        on_device_logits=True: return the raw vocab-sharded shard for the on-device sampler.
+        on_device_logits=True: return the raw vocab-sharded shard for the on-device sampler, or,
+        for single-device concurrent serving (no sampler module), the traced greedy argmax ids.
         """
         from models.demos.blackhole.qwen36.tt.generator_interface import unpack_rope
 
         cos, sin = unpack_rope(rot_mat_idxs)
+        if on_device_logits and self.sampling is None:
+            if not self._batched_single_device:
+                raise ValueError("on_device_logits=True requires a sampler or single-device concurrent serving")
+            logits = self._forward_decode(tokens, cos, sin, current_pos, page_table)
+            # uint32 [1, 1, B] straight from the tiled bucket rows: TileArgmax returns the ids of untilize +
+            # ttnn.argmax (the LM head emits exactly vocab_size columns; lowest column on ties, -0 == +0), the same
+            # greedy choice the host sampler makes over these logits, without the vocabulary-wide untilize.
+            if getattr(self, "_tile_argmax", None) is None:
+                from models.demos.blackhole.qwen36.tt.tile_argmax import TileArgmax
+
+                self._tile_argmax = TileArgmax()
+            token_ids = self._tile_argmax(logits)
+            ttnn.deallocate(logits)
+            return token_ids
         if on_device_logits:
-            assert self.sampling is not None, "on_device_logits=True but self.sampling is None"
             logits = self._forward_decode(tokens, cos, sin, current_pos, page_table, sharded_lm_head=True)
             # Sampler runs >=32-wide; pad B up to it (else shape mismatch). Extra slots unused.
             sampler_batch = self.sampling.tt_sampling.max_batch_size
@@ -4946,6 +4983,12 @@ class Qwen36Model:
             # Bare tensor (not a tuple): the traced path passes this straight to capture_trace().
             return logits
         logits = self._forward_decode(tokens, cos, sin, current_pos, page_table)
+        if self._batched_single_device:
+            # Untilize on device: the host then reads only the bucket's rows (not a 32-row tile)
+            # and skips a host-side untilize of every vocabulary row.
+            tiled = logits
+            logits = ttnn.to_layout(tiled, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(tiled)
         return logits, None
 
     def process_output_decode(self, tt_out, B, S=1, is_tokens=False, is_log_probs=False):
@@ -4960,6 +5003,10 @@ class Qwen36Model:
         if self.num_devices > 1:
             # TP: read one replica (get_device_tensors[0]), not ConcatMeshToTensor (~4x readback).
             full = ttnn.to_torch(ttnn.get_device_tensors(tt_out)[0]).float()
+        elif self._batched_single_device:
+            # Row-major BF16 bucket rows. vLLM's sampler widens only the rows it samples to
+            # float32 (the same values), so skip a full-width float copy here.
+            full = ttnn.to_torch(tt_out)
         else:
             full = ttnn.to_torch(tt_out).float()
         rows = full.reshape(-1, self.args.vocab_size)

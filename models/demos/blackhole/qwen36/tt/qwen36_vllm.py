@@ -57,9 +57,10 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
     _tt_allow_decode_trace_buffer_reuse = True
 
     # supports_async_decode=False: async decode assumes on-device token/position continuity, which
-    # corrupts Qwen's GDN scan. The generic single-device sampler path is force-argmax only; random and
-    # penalized requests use the exact vLLM-equivalent device sampler (device_sampling.py) when eligible,
-    # else the runner's host sampler.
+    # corrupts Qwen's GDN scan. The generic single-device sampler path is greedy argmax only (the MTP
+    # cycle's, or the concurrent decode trace's); random and penalized requests use the exact
+    # vLLM-equivalent device sampler (device_sampling.py) when eligible, else the runner's host sampler
+    # (logprob, structured-output, ... requests).
     model_capabilities = {
         # Exact prefix resume (prefix_resume.py): single-device, single-sequence traced prefill.
         "supports_prefix_caching": True,
@@ -95,7 +96,8 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         if not requested:
             return
         for model in self.model:
-            if model.sampling is not None:
+            if model.sampling is not None or model._batched_single_device:
+                # Concurrent single-device decode argmaxes inside its trace (greedy only).
                 continue
             mesh_shape = tuple(int(dim) for dim in model.mesh_device.shape)
             logits_per_device = math.ceil(model.args.vocab_size / model.num_devices)
@@ -185,6 +187,10 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         # Native checkpoints are validated as text-only by load_state_dict.
         if os.environ.get("QWEN36_GENERIC_BASELINE") != "1" and not os.path.isfile(os.path.join(args.CKPT_DIR, "native_manifest.json")):
             model.init_vision_model()
+        if model._batched_single_device:
+            # The greedy decode trace does not feed its argmax back into the token buffer:
+            # host token/position/RoPE inputs are authoritative every step, as for host sampling.
+            model._tt_vllm_always_refresh_decode_trace_inputs = True
         return cls([model], [args], mesh_device)
 
     def allocate_kv_cache(self, kv_cache_shape, dtype, num_layers):
@@ -278,7 +284,8 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
                 "(max_concurrency=1). Run the model at max_num_seqs=1 for image/video requests."
             )
             return self._prefill_forward_batched(
-                model, tokens, page_table, prompt_lens, empty_slots, kwargs.get("start_pos")
+                model, tokens, page_table, prompt_lens, empty_slots, kwargs.get("start_pos"),
+                kwargs.get("prefill_request_ids"), kwargs.get("prefill_final_rows"),
             )
         vision_tokens = self._compute_vision_tokens(model, kwargs)
         start_pos = kwargs.get("start_pos")
@@ -380,7 +387,8 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         return logits, torch.zeros(1, dtype=torch.long)
 
     def _prefill_forward_batched(
-        self, model, tokens, page_table, prompt_lens, empty_slots, start_positions=None
+        self, model, tokens, page_table, prompt_lens, empty_slots, start_positions=None,
+        request_ids=None, final_rows=None,
     ):
         """Prefill cumulative prefixes into their request-owned device state slots.
 
@@ -405,14 +413,55 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
             raise ValueError("Resumable Qwen prefill requires single-device batched serving")
         token_ids_list = [tokens[u : u + 1, : plens[u]].to(torch.int32) for u in range(N)]
         pt = page_table if isinstance(page_table, torch.Tensor) else ttnn.to_torch(page_table)
+        prefix = (
+            self._batched_prefix_plan(token_ids_list, pt, plens, starts, request_ids, final_rows)
+            if model.num_devices == 1 else None
+        )
         logger.info(f"Prefilling {N} user(s) into slots {empty_slots}: starts={starts}, ends={plens}")
         host_logits = model.prefill_paged_slots(
             token_ids_list, pt, empty_slots, valid_lens=plens,
-            **({"start_positions": starts} if model.num_devices == 1 else {}),
+            **({"start_positions": starts, "prefix": prefix} if model.num_devices == 1 else {}),
         )
         logits = torch.cat([hl.reshape(1, 1, -1) for hl in host_logits], dim=0)  # [N, 1, vocab]
         logger.info(f"Finished batched prefill of {N} user(s), starting decode...")
         return logits, torch.zeros(N, dtype=torch.long)
+
+    @staticmethod
+    def _batched_prefix_plan(token_ids_list, page_table, ends, starts, request_ids, final_rows):
+        """Per-row exact prefix-resume actions of one batched prefill turn (prefix_resume.py).
+
+        With prefix caching on, the scheduler ends every non-final chunk on a chunk boundary, so
+        each request runs [0, 2048), [2048, 4096), ... and a final [S, L) whatever the load, and a
+        request resumed at S restarts that schedule from the snapshot. A row publishes a snapshot
+        at its final segment's start S = L // 2048 * 2048 (the state its own schedule reached
+        there), at its end L when L is a chunk multiple, and at any boundary the scheduler asked
+        for because another cached prompt shares the prefix up to it."""
+        from vllm_tt_plugin.prefix_resume import REGISTRY
+
+        if request_ids is None or final_rows is None or not REGISTRY.active:
+            return None
+        chunk = REGISTRY.align
+        plan = []
+        for u, (request_id, start, end, final) in enumerate(zip(request_ids, starts, ends, final_rows)):
+            row_tokens, row_blocks = token_ids_list[u][0], page_table[u]
+
+            def publish(length, payload, nbytes, row_tokens=row_tokens, row_blocks=row_blocks):
+                REGISTRY.put(row_tokens, length, row_blocks, payload, nbytes)
+
+            resume = None
+            if start and REGISTRY.resuming(request_id):
+                resume = dict(REGISTRY.take(row_tokens, start, request_id=request_id), length=start)
+            snap_start = (
+                start > 0 and start % chunk == 0 and resume is None
+                and ((final and start == end // chunk * chunk) or REGISTRY.wanted(row_tokens, start))
+                and not REGISTRY.has(row_tokens, start)
+            )
+            plan.append({
+                "resume": resume,
+                "snap_start": publish if snap_start else None,
+                "snap_end": publish if final and end % chunk == 0 else None,
+            })
+        return plan
 
     # ---- Greedy, single-sequence native DFlash serving ----
     @staticmethod
@@ -914,6 +963,19 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
                 _sm = getattr(_m, "sampling", None)
                 if _sm is not None and hasattr(_sm, "set_trace_bucket"):
                     _sm.set_trace_bucket(B)
+        sampling_params = _read("sampling_params", 6)
+        if sampling_params is not None and model._batched_single_device:
+            # The runner requests device sampling only when every row is greedy. There is no
+            # sampler module on one device: the decode trace itself returns argmax ids, so run
+            # it as a deferred device-sampling step and read the ids.
+            _write("sampling_params", 6, None)
+            read_from_device = _read("read_from_device", 5)
+            _write("read_from_device", 5, False)
+            kwargs["defer_device_sampling"] = True
+            tt_out = super().decode_forward(*args, **kwargs)
+            if read_from_device is False:
+                return tt_out
+            return self.process_decode_output_host(self.read_decode_output(tt_out), is_tokens=True)
         return super().decode_forward(*args, **kwargs)
 
     def process_decode_output_host(self, tt_out, is_tokens=False):
@@ -983,8 +1045,9 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
             # is captured (single device, single sequence).
             from vllm_tt_plugin.prefix_resume import REGISTRY
 
-            resumable = enable_trace and not batched and model.num_devices == 1
-            if not enable_trace and not batched and model.num_devices == 1:
+            # Batched serving resumes per request inside the bound B=1 scratch (prefill_paged_slots).
+            resumable = enable_trace and model.num_devices == 1
+            if not enable_trace and model.num_devices == 1:
                 # Compile the resume state round trip (DRAM-staged copies into the fixed state
                 # buffers) before any trace is parked; the round trip itself is exact.
                 model._restore_gdn_snapshot(model._save_gdn_snapshot())
@@ -992,6 +1055,7 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
                 _PREFILL_WARMUP_CHUNK,
                 _BLOCK_SIZE,
                 int(os.environ.get("QWEN36_PREFIX_SNAPSHOTS", "8")) if resumable else 0,
+                fork_hints=batched,
             )
             if dflash:
                 # Target warmup committed every feature bucket through the

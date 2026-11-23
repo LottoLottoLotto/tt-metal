@@ -18,7 +18,9 @@ class Qwen36GatedAttention:
     Q and K are normalized with zero-centered RMSNorm before attention.
     """
 
-    def __init__(self, mesh_device, config: AttentionConfig, state_dict, tensor_cache_path=None):
+    def __init__(self, mesh_device, config: AttentionConfig, state_dict, tensor_cache_path=None, pack_decode=False):
+        """pack_decode: single-request 35B decode may serve the fused QKV / o_proj through decode-only bank-packed
+        copies (QWEN36_PACKED_PROJ=qkv,o; PackedDecodeMatmul, bitwise the stock matmul)."""
         self.device = mesh_device
         self.config = config
         self.optimized_27b = optimized_27b_attention()
@@ -61,6 +63,20 @@ class Qwen36GatedAttention:
                 # 2*4*2048 + 2*4*7*1088 + 7*(2048+4096) = 120320 B/core max.
                 for pc in self.decode_program_configs.values():
                     pc.in0_block_w = 4
+
+        self.decode_runners = {}
+        if pack_decode and not self.optimized_27b and os.environ.get("QWEN36_SINGLE_1D_DECODE") == "1":
+            from models.demos.blackhole.qwen36.tt.packed_matmul import packed_decode_runner, packed_projections
+
+            decode_ckc = ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=True, packer_l1_acc=True,
+            )
+            for name, weight in (("qkv", self.weights.qkv_fused), ("o", self.weights.o_proj)):
+                if (name in packed_projections() and weight is not None and name in self.decode_program_configs
+                        and weight.dtype in (ttnn.bfloat4_b, ttnn.bfloat8_b)):
+                    self.decode_runners[name] = packed_decode_runner(
+                        weight, self.decode_program_configs[name], decode_ckc
+                    )
 
         self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.LoFi,
@@ -114,6 +130,7 @@ class Qwen36GatedAttention:
                 paged_kv_cache_value=self.paged_kv_cache_value,
                 program_configs=self.decode_program_configs,
                 qkv_fused_weight=self.weights.qkv_fused,
+                decode_runners=self.decode_runners,
             )
         elif self.use_paged_attention and T > 1 and chunk_page_table is not None:
             # Branch A — paged prefill
@@ -212,6 +229,7 @@ class Qwen36GatedAttention:
             qkv_fused_k_dim=self.config.num_kv_heads * self.config.head_dim,
             qkv_fused_program_config=self.decode_program_configs.get("qkv"),
             verify_two=True,
+            decode_runners=self.decode_runners,
             shadow_fill_page_table=shadow_fill_page_table,
             shadow_source_page=shadow_source_page,
             shadow_same_page=shadow_same_page,

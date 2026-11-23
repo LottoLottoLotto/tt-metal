@@ -201,3 +201,207 @@ class BatchedExperts:
             ttnn.generic_op(tensors, self._programs[stage])
         ttnn.deallocate(activated)
         return out
+
+
+_FUSED_KERNEL = Path(__file__).resolve().parent / "kernels" / "streaming" / "fused_experts_kernel.cpp"
+
+
+class FusedBatchedExperts(BatchedExperts):
+    """``BatchedExperts`` for 1-8 rows (one row group) with gate/up and down in ONE program (fused_experts_kernel.cpp): every
+    gate/up core signals the down cores (semaphore) once its activation pages are written, and the down cores
+    prefetch their weight slices while gate/up finishes. Same tile math and accumulation order: bitwise equal."""
+
+    def __init__(self, device, gate_up, down, *, hidden, intermediate, stored_experts, top_k, rows):
+        if rows not in (1, 2, 4, 8):
+            raise ValueError("fused experts serve 1-8 decode rows (one row group)")
+        super().__init__(device, gate_up, down, hidden=hidden, intermediate=intermediate,
+                         stored_experts=stored_experts, top_k=top_k, rows=rows)
+        self._program = None
+        self._signature = None
+
+    def _build_fused(self, x, selection, routing, activated, out, defines=(), shared_slot=None, extra=None):
+        g_splits, d_splits = self.splits
+        _, vcs = _bank_args(self._bank_cores)
+        g_rows = _bank_workers(self.device, self._bank_cores, g_splits)
+        d_rows = _bank_workers(self.device, self._bank_cores, d_splits)
+        # (core, bank, g_part, g_vc, d_part, d_vc); a bank's down cores are its first d_splits gate/up cores.
+        no_part = 0xFFFFFFFF
+        workers = []
+        for bank, (g_row, d_row, (_, vc)) in enumerate(zip(g_rows, d_rows, vcs)):
+            if [(c.x, c.y) for c in d_row] != [(c.x, c.y) for c in g_row[:d_splits]]:
+                raise ValueError("fused experts need each bank's down cores among its gate/up cores")
+            for p, core in enumerate(g_row):
+                d_part = p if p < d_splits else no_part
+                workers.append((core, bank, p, (vc + p) & 0x3, d_part, (vc + p) & 0x3 if p < d_splits else 0))
+        down_noc = [self.device.worker_core_from_logical_core(c) for row in d_rows for c in row]
+        g_kt, d_kt = self.hidden // 32, self.intermediate // 32
+        g_n = 2 * self.intermediate // self.banks // 32
+        d_n = self.hidden // self.banks // 32
+        d_cols = d_n // d_splits
+        weight_tile = self.gate_up.get_tile()
+        weight_bytes = weight_tile.get_tile_size(self.gate_up.dtype)
+        g_block = g_kt * g_n * weight_bytes
+        d_block = d_kt * d_cols * weight_bytes
+        row_tile = ttnn.TileDescriptor(ttnn.Tile([self.tile_rows, 32]))
+        row_bytes = self.tile_rows * 64
+        cs = _row_ranges([w[0] for w in workers])
+        ds = _row_ranges([w[0] for w in workers if w[4] != no_part])
+        groups = self.row_groups
+        wt = ttnn.TileDescriptor(weight_tile)
+        cbs = [
+            _cb(cs, 0, ttnn.bfloat16, row_bytes, groups * g_kt, row_tile),
+            _cb(cs, 1, self.gate_up.dtype, weight_bytes, 3 * g_kt * g_n, wt),
+            _scratch_cb(cs, 2, self.metadata_width * 2),
+            _scratch_cb(cs, 3, g_kt * max(self.rows, 2) * 64),
+            _cb(cs, 4, ttnn.bfloat16, row_bytes, groups * g_n, row_tile),
+            _scratch_cb(cs, 5, self.rows * self.metadata_width * 2),
+            _cb(ds, 6, ttnn.bfloat16, row_bytes, 4 * groups * d_kt, row_tile),
+            _cb(ds, 7, self.down.dtype, weight_bytes, 8 * d_kt * d_cols, wt),
+            _scratch_cb(ds, 8, d_cols * 2048),
+            _cb(ds, 9, ttnn.bfloat16, row_bytes, d_cols * groups, row_tile),
+        ]
+        common = [
+            ("g_k_tiles", g_kt), ("g_per_core_n", g_n), ("g_splits", g_splits),
+            ("d_k_tiles", d_kt), ("d_per_core_n", d_n), ("d_cols", d_cols), ("d_splits", d_splits),
+            ("g_cores", len(workers)), ("banks", self.banks), ("rows", self.rows), ("tile_rows", self.tile_rows),
+            ("row_groups", groups), ("selected", self.selected), ("metadata_width", self.metadata_width),
+            ("inter_tiles", self.intermediate // 32),
+        ]
+        tensors = (x, selection, routing, activated, out)
+        addresses = [t.buffer_address() for t in tensors]
+        signal = [len(down_noc)] + [v for c in down_noc for v in (c.x, c.y)]
+        kernel = UnifiedKernelDescriptor(
+            kernel_source=str(_FUSED_KERNEL), core_ranges=cs,
+            defines=list(defines),
+            ncrisc_named_compile_time_args=common + [
+                ("shared_slot", shared_slot or 0),
+                ("g_weight_addr", self.gate_up.buffer_address()), ("g_page_bytes", _read_page(g_block, weight_bytes)),
+                ("g_pages", g_block // _read_page(g_block, weight_bytes)), ("g_block_bytes", g_block),
+                ("g_expert_bytes", g_kt * g_n * weight_bytes),
+                ("d_weight_addr", self.down.buffer_address()), ("d_page_bytes", _read_page(d_block, weight_bytes)),
+                ("d_pages", d_block // _read_page(d_block, weight_bytes)), ("d_block_bytes", d_block),
+                ("d_expert_bytes", d_kt * d_n * weight_bytes),
+            ],
+            brisc_compile_time_args=_brisc_accessors(tensors),
+            brisc_named_compile_time_args=common,
+            trisc_named_compile_time_args=common,
+            trisc_compute_config=ttnn.ComputeConfigDescriptor(
+                math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=True, math_approx_mode=False,
+            ),
+            per_core_runtime_args_descriptor=PerCoreRuntimeArgsDescriptor(
+                ncrisc_args=[(c, [bank, gvc, gp, dvc, dp]) for c, bank, gp, gvc, dp, dvc in workers],
+                brisc_args=[(c, addresses + [bank, gp, dp] + signal) for c, bank, gp, _, dp, _ in workers],
+                trisc_args=[(c, [gp, dp]) for c, _, gp, _, dp, _ in workers],
+            ),
+        )
+        kernels = list(kernel.get_kernel_descriptors().kernels)
+        sem_cores = cs
+        if extra is not None:
+            kernels, cbs, sem_cores = extra(kernels, cbs, cs, workers)
+        return ttnn.ProgramDescriptor(
+            kernels=kernels, cbs=cbs,
+            semaphores=[ttnn.SemaphoreDescriptor(id=i, core_ranges=sem_cores, initial_value=0) for i in (0, 1)],
+        )
+
+    def _check_x(self, x):
+        if (tuple(x.shape) != (1, 1, self.rows, self.hidden) or x.dtype != ttnn.bfloat16
+                or x.layout != ttnn.TILE_LAYOUT or tuple(x.get_tile().tile_shape) != (32, 32)
+                or x.memory_config().memory_layout != ttnn.TensorMemoryLayout.INTERLEAVED):
+            raise ValueError("fused experts x must be interleaved BF16 32x32 tiles [1,1,B,H]")
+
+    def __call__(self, x, selection, routing):
+        self._check_x(x)
+        activated = ttnn.empty(
+            [1, 1, self.selected * self.row_groups * self.banks, self.tile_rows * self.intermediate // self.banks],
+            dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+        )
+        out = ttnn.empty(
+            [1, 1, self.rows, self.hidden], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            device=self.device, memory_config=ttnn.L1_MEMORY_CONFIG,
+        )
+        tensors = [x, selection, routing, activated, out, self.gate_up, self.down]
+        signature = tuple((int(t.buffer_address()), str(t.memory_config())) for t in tensors)
+        if self._program is None or signature != self._signature:
+            self._program = self._build_fused(x, selection, routing, activated, out)
+            self._signature = signature
+        ttnn.generic_op(tensors, self._program)
+        ttnn.deallocate(activated)
+        return out
+
+
+_ROUTING_KERNEL = Path(__file__).resolve().parent / "kernels" / "routing_signal.cpp"
+
+
+class RoutedFusedExperts(FusedBatchedExperts):
+    """Router logits [1,1,R,E+32] -> MoE output for 1-2 decode rows in ONE program: BatchedTopKRouting's kernel
+    (routing_signal.cpp, one core per row beside the expert cores) + FusedBatchedExperts. Expert cores stage the
+    token rows, then wait for the routing core's signal (semaphore 1); each bank's part-0 core streams and multiplies
+    the always-selected shared expert first, overlapping routing. Bitwise equal to routing + experts."""
+
+    def __init__(self, device, gate_up, down, *, hidden, intermediate, stored_experts, top_k, rows, num_experts,
+                 shared_slot):
+        super().__init__(device, gate_up, down, hidden=hidden, intermediate=intermediate,
+                         stored_experts=stored_experts, top_k=top_k, rows=rows)
+        if num_experts % 32 or not num_experts <= shared_slot < 65536 or shared_slot >= stored_experts:
+            raise ValueError("routed experts need tile-aligned experts and the stored shared slot")
+        self.num_experts, self.top_k, self.shared_slot = num_experts, top_k, shared_slot
+        # BatchedTopKRouting's metadata width is the experts' metadata width.
+        if self.metadata_width != ((rows * top_k + 2 + 31) // 32) * 32:
+            raise ValueError("routing / expert metadata widths differ")
+
+    def _routing_part(self, logits, selection, weights):
+        def extra(kernels, cbs, expert_set, workers):
+            grid = self.device.compute_with_storage_grid_size()
+            taken = {(w[0].x, w[0].y) for w in workers}
+            column = next(cx for cx in range(grid.x) if all((cx, r) not in taken for r in range(self.rows)))
+            cores = [ttnn.CoreCoord(column, r) for r in range(self.rows)]
+            rset = ttnn.CoreRangeSet({ttnn.CoreRange(cores[0], cores[-1])})
+            merge = self.device.worker_core_from_logical_core(cores[0])
+            expert_noc = [self.device.worker_core_from_logical_core(w[0]) for w in workers]
+            args = [self.num_experts, self.top_k, self.shared_slot, self.rows, self.metadata_width]
+            args += _brisc_accessors((logits, selection, weights)) + [1, 10]  # ready semaphore, scratch CB index
+            addresses = [t.buffer_address() for t in (logits, selection, weights)]
+            signal = [len(expert_noc)] + [v for c in expert_noc for v in (c.x, c.y)]
+            routing = ttnn.KernelDescriptor(
+                kernel_source=str(_ROUTING_KERNEL), core_ranges=rset, compile_time_args=args,
+                runtime_args=[(c, addresses + [r, merge.x, merge.y] + signal) for r, c in enumerate(cores)],
+                config=ttnn.ReaderConfigDescriptor(),
+            )
+            scratch = ((self.num_experts // 32 + 1) * 64 + 128 + self.rows * 128
+                       + (self.rows + 1) * self.metadata_width * 2 + self.num_experts)
+            cbs = cbs + [_cb(rset, 10, ttnn.bfloat16, 2048, (scratch + 2047) // 2048,
+                             ttnn.TileDescriptor(ttnn.Tile((32, 32))))]
+            return kernels + [routing], cbs, ttnn.CoreRangeSet(list(expert_set.ranges()) + list(rset.ranges()))
+        return extra
+
+    def __call__(self, x, logits):
+        self._check_x(x)
+        if (tuple(logits.shape) != (1, 1, self.rows, self.num_experts + 32) or logits.dtype != ttnn.bfloat16
+                or logits.layout != ttnn.TILE_LAYOUT or logits.memory_config() != ttnn.L1_MEMORY_CONFIG):
+            raise ValueError("routed experts need interleaved L1 BF16 logit tiles [1,1,R,E+32]")
+
+        def empty(rows, dtype, width, layout=ttnn.ROW_MAJOR_LAYOUT):
+            return ttnn.empty([1, 1, rows, width], dtype=dtype, layout=layout, device=self.device,
+                              memory_config=ttnn.L1_MEMORY_CONFIG)
+
+        selection = empty(1, ttnn.uint16, self.metadata_width)
+        weights = empty(self.rows, ttnn.bfloat16, self.metadata_width)
+        activated = ttnn.empty(
+            [1, 1, self.selected * self.row_groups * self.banks, self.tile_rows * self.intermediate // self.banks],
+            dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+        )
+        out = empty(self.rows, ttnn.bfloat16, self.hidden, ttnn.TILE_LAYOUT)
+        tensors = [x, logits, selection, weights, activated, out, self.gate_up, self.down]
+        signature = tuple((int(t.buffer_address()), str(t.memory_config())) for t in tensors)
+        if self._program is None or signature != self._signature:
+            self._program = self._build_fused(
+                x, selection, weights, activated, out, defines=[("FUSED_ROUTING", "1")],
+                shared_slot=self.shared_slot, extra=self._routing_part(logits, selection, weights),
+            )
+            self._signature = signature
+        ttnn.generic_op(tensors, self._program)
+        for t in (selection, weights, activated):
+            ttnn.deallocate(t)
+        return out

@@ -180,9 +180,13 @@ class BatchedDecode:
 
     def __call__(self, gdn, x, positions):
         w = gdn.weights
-        mega = ttnn.linear(x, w.mega_fused_weight_decode, memory_config=ttnn.L1_MEMORY_CONFIG,
-                           compute_kernel_config=gdn.compute_kernel_config_decode,
-                           program_config=gdn.mega_decode_program_config)
+        if gdn.mega_decode_runner is not None:
+            # Bank-packed decode mega weight, dual-NoC packed reader: bitwise the stock matmul below.
+            mega = gdn.mega_decode_runner(x)
+        else:
+            mega = ttnn.linear(x, w.mega_fused_weight_decode, memory_config=ttnn.L1_MEMORY_CONFIG,
+                               compute_kernel_config=gdn.compute_kernel_config_decode,
+                               program_config=gdn.mega_decode_program_config)
         self._frontend(mega, w.native_frontend_weight_taps, w.native_frontend_bias,
                        gdn.fused_conv_state, positions)
         self._recurrence(mega, gdn.recurrent_state, w.native_decay_bias, w.native_decay_scale, positions)

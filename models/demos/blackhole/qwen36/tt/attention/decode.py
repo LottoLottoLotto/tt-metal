@@ -22,6 +22,7 @@ def decode_forward(
     paged_kv_cache_value=None,
     program_configs=None,
     qkv_fused_weight=None,
+    decode_runners=None,
 ):
     """Branch B — paged decode: paged_update_cache + paged_sdpa_decode via page_table."""
     output, _, _ = gated_attention_forward_ttnn(
@@ -55,5 +56,6 @@ def decode_forward(
         qkv_fused_q_dim=2 * config.num_heads * config.head_dim,
         qkv_fused_k_dim=config.num_kv_heads * config.head_dim,
         qkv_fused_program_config=(program_configs or {}).get("qkv"),
+        decode_runners=decode_runners,
     )
     return output

@@ -10,6 +10,9 @@ token rows the selection is the union of both tokens' slots (count in entry 31) 
 ``BatchedTopKRouting``: explicitly concurrent 1/2/4/8/16-row routing, with independent
 row workers and a device-only union merge. Its variable-width metadata is consumed by
 ``BatchedExperts``; it does not change the legacy one/two-row speculative contract.
+
+``ParallelTopKRouting``: ``BatchedTopKRouting``'s exact output for 1-2 decode rows with
+the top-k scan split over one core per logit tile.
 """
 
 from __future__ import annotations
@@ -227,6 +230,81 @@ class BatchedTopKRouting:
 
         selection = empty(1, self.width, ttnn.uint16)
         weights = empty(self.rows, self.width, ttnn.bfloat16)
+        tensors = [logits, selection, weights]
+        self._cache.run(tensors, lambda: self._build(tensors))
+        return selection, weights
+
+
+class ParallelTopKRouting:
+    """``BatchedTopKRouting``'s exact (selection, weights) for 1-2 decode rows, with the
+    top-k scan split over one core per 32-logit tile and row (cores ``(tile, row)``).
+
+    Each scan core posts its tile's top-k survivors to its row's finisher (tile 0), which
+    replays them through the same top-k (identical list by construction), runs the same
+    fixed-point softmax / shared gate and posts the token record to row 0's finisher for
+    the ascending union. Same output layout as ``BatchedTopKRouting``.
+    """
+
+    def __init__(self, device, num_experts, top_k, shared_slot, rows):
+        if rows not in (1, 2):
+            raise ValueError("parallel routing supports one or two token rows")
+        if num_experts % 32 or not 1 <= top_k <= min(num_experts, 31):
+            raise ValueError("need tile-aligned experts and 1 <= top_k <= min(experts, 31)")
+        if not num_experts <= shared_slot < 65536:
+            raise ValueError("shared slot must be a UINT16 id beyond the routed experts")
+        grid = device.compute_with_storage_grid_size()
+        self.tiles = num_experts // 32
+        if self.tiles > grid.x or rows > grid.y:
+            raise ValueError("parallel routing needs one core per logit tile and row")
+        self.device = device
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.shared_slot = shared_slot
+        self.rows = rows
+        self.width = ((rows * top_k + 2 + 31) // 32) * 32
+        self.cores = [ttnn.CoreCoord(t, r) for r in range(rows) for t in range(self.tiles)]
+        self.core_set = ttnn.CoreRangeSet(
+            {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(self.tiles - 1, rows - 1))}
+        )
+        self._finishers = [device.worker_core_from_logical_core(ttnn.CoreCoord(0, r)) for r in range(rows)]
+        self._cache = _CachedProgram()
+
+    def _build(self, tensors):
+        args = [self.num_experts, self.top_k, self.shared_slot, self.rows, self.width]
+        for tensor in tensors:
+            args.extend(_accessor_args(tensor))
+        addresses = [tensor.buffer_address() for tensor in tensors]
+        union = self._finishers[0]
+        # Layout mirrored in parallel_routing.cpp.
+        align = lambda n: (n + 15) // 16 * 16  # noqa: E731
+        record, token = align(self.top_k * 4), align((self.top_k + 1) * 4)
+        scratch = (64 + record + self.tiles * record + align((self.num_experts + 32) * 2) + token
+                   + self.rows * token + (self.rows + 1) * self.width * 2 + self.num_experts)
+        kernel = ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "parallel_routing.cpp"), core_ranges=self.core_set,
+            compile_time_args=args,
+            runtime_args=[
+                (c, addresses + [c.x, c.y, self._finishers[c.y].x, self._finishers[c.y].y, union.x, union.y])
+                for c in self.cores
+            ],
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        return ttnn.ProgramDescriptor(
+            kernels=[kernel], cbs=[_cb(0, (scratch + _TILE_BYTES - 1) // _TILE_BYTES, self.core_set)],
+            semaphores=[ttnn.SemaphoreDescriptor(id=i, core_ranges=self.core_set, initial_value=0) for i in (0, 1)],
+        )
+
+    def __call__(self, logits):
+        if (tuple(logits.shape) != (1, 1, self.rows, self.num_experts + 32)
+                or logits.dtype != ttnn.bfloat16 or logits.layout != ttnn.TILE_LAYOUT
+                or logits.memory_config() != ttnn.L1_MEMORY_CONFIG):
+            raise ValueError("parallel routing logits must be interleaved L1 BF16 tiles [1,1,R,E+32]")
+
+        def empty(rows, dtype):
+            return ttnn.empty([1, 1, rows, self.width], dtype=dtype, layout=ttnn.ROW_MAJOR_LAYOUT,
+                              device=self.device, memory_config=ttnn.L1_MEMORY_CONFIG)
+
+        selection, weights = empty(1, ttnn.uint16), empty(self.rows, ttnn.bfloat16)
         tensors = [logits, selection, weights]
         self._cache.run(tensors, lambda: self._build(tensors))
         return selection, weights

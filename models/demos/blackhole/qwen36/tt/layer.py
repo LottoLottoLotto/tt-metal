@@ -123,14 +123,17 @@ class Qwen36DecoderLayer:
         elif self.is_full_attention:
             attn_state = substate(state_dict, f"{prefix}.self_attn")
             attn_cache = (tensor_cache_path / prefix) if tensor_cache_path else None
-            self.attention = Qwen36GatedAttention(mesh_device, AttentionConfig.from_args(args), attn_state, attn_cache)
+            self.attention = Qwen36GatedAttention(
+                mesh_device, AttentionConfig.from_args(args), attn_state, attn_cache,
+                pack_decode=self.num_devices == 1 and not self._batched_single_device and args.dim == 2048,
+            )
         else:
             gdn_state = substate(state_dict, f"{prefix}.linear_attn")
             gdn_cache = (tensor_cache_path / prefix) if tensor_cache_path else None
             self.attention = Qwen36GatedDeltaNet(
                 mesh_device, GDNConfig.from_args(args), gdn_state, gdn_cache,
                 pack_decode_mega=(
-                    self.num_devices == 1 and not self._batched_single_device and args.dim == 2048
+                    self.num_devices == 1 and args.dim == 2048
                     and os.environ.get("QWEN_GDN_MEGA_PACKED") != "1"
                 ),
             )
@@ -197,11 +200,8 @@ class Qwen36DecoderLayer:
         shadow_fill_page_table=None,
         shadow_source_page=0,
         shadow_same_page=True,
-        final_norm=None,
     ):
-        """Execute this layer at M=2 without committing speculative state.
-
-        final_norm: the model's fused residual+RMSNorm (last layer only), exactly as decode applies it."""
+        """Execute this layer at M=2 without committing speculative state."""
         attn_input = self._decode_norm(self.attention_norm, x)
         if self.is_full_attention:
             attn_output, candidates = self.attention.verify_two(
@@ -224,16 +224,13 @@ class Qwen36DecoderLayer:
         # Moving them to [2, 1, D] would materialize two separately padded rows.
         ff_output = self.feed_forward.forward(ttnn.reshape(ff_input, [1, 1, 2, ff_input.shape[-1]]))
         ttnn.deallocate(ff_input)
-        ff_output = ttnn.reshape(ff_output, [1, 2, ff_output.shape[-1]])
-        output = ttnn.add(h, ff_output) if final_norm is None else final_norm(h, ff_output)
+        output = ttnn.add(h, ttnn.reshape(ff_output, [1, 2, ff_output.shape[-1]]))
         ttnn.deallocate(h)
         ttnn.deallocate(ff_output)
         return output, candidates
 
-    def verify_many(self, x, cos, sin, position_tensor, page_table, fork_position=0, final_norm=None):
-        """One shared tiled layer pass with transactional state for every prefix.
-
-        final_norm: the model's fused residual+RMSNorm (last layer only), exactly as decode applies it."""
+    def verify_many(self, x, cos, sin, position_tensor, page_table, fork_position=0):
+        """One shared tiled layer pass with transactional state for every prefix."""
         rows = int(x.shape[-2])
         if not 3 <= rows <= 32:
             raise ValueError("Wider verification requires 3..32 positions")
@@ -252,8 +249,7 @@ class Qwen36DecoderLayer:
             ttnn.reshape(ff_input, [1, 1, rows, ff_input.shape[-1]])
         )
         ttnn.deallocate(ff_input)
-        ff_output = ttnn.reshape(ff_output, [1, rows, ff_output.shape[-1]])
-        output = ttnn.add(h, ff_output) if final_norm is None else final_norm(h, ff_output)
+        output = ttnn.add(h, ttnn.reshape(ff_output, [1, rows, ff_output.shape[-1]]))
         ttnn.deallocate(h)
         ttnn.deallocate(ff_output)
         return output, candidates
@@ -285,14 +281,25 @@ class Qwen36DecoderLayer:
         return output
 
     def _can_fuse_decode_norm(self, x):
+        shape = tuple(x.shape)
+        if len(shape) == 4 and shape[:2] == (1, 1) and self._batched_single_device and self.args.dim == 2048:
+            # Batched decode rows [1,1,B,2048] are the same single tile row as [1,B,2048].
+            shape = shape[1:]
         return (
-            self._packed_norm_enabled and len(x.shape) == 3
-            and x.shape[0] == 1 and 1 <= x.shape[1] <= 32 and x.shape[2] == self.args.dim
+            self._packed_norm_enabled and len(shape) == 3
+            and shape[0] == 1 and 1 <= shape[1] <= 32 and shape[2] == self.args.dim
         )
 
     def _fused_decode_norm(self, norm, x, residual=None):
         # The same complete four BF16 tiles per width shard represent M=1,
-        # MTP's M=2, and DFlash/tree M<=32. No token interaction is added.
+        # MTP's M=2, DFlash/tree M<=32 and the batched decode buckets. No token interaction is added.
+        shape = list(x.shape)
+        if len(shape) == 4:
+            flat = shape[1:]
+            normed, summed = self._fused_decode_norm(
+                norm, ttnn.reshape(x, flat), None if residual is None else ttnn.reshape(residual, flat)
+            )
+            return ttnn.reshape(normed, shape), (x if residual is None else ttnn.reshape(summed, shape))
         runner = self._packed_norm_runners.get(norm)
         if runner is None:
             from models.demos.blackhole.qwen36.tt.residual_norm.fused_residual_norm import FusedResidualNorm

@@ -10,6 +10,7 @@ from one DRAM bank at a time instead of per_core_N scattered tiles per K row. Th
 in1 block contents in the identical order, so outputs are bitwise those of the stock matmul.
 """
 import math
+import os
 from pathlib import Path
 
 import torch
@@ -178,3 +179,33 @@ class PackedDecodeMatmul:
             ttnn.deallocate(out)
             raise
         return ttnn.reshape(out, shape[:-1] + [self.n_tiles * 32])
+
+
+def packed_decode_runner(weight, program_config, compute_kernel_config, output_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                         cb_slots=2, outstanding=1, dual_noc=True):
+    """Decode-only bank-packed copy of an interleaved BFP4/BFP8 weight plus its dual-NoC PackedDecodeMatmul, computing
+    exactly what the stock 1D-mcast `program_config` matmul computes: same in0_block_w (the only blocking that shapes
+    the accumulation), per_core_N and subblocks, laid out row-major on an 11-wide grid. The original weight stays in
+    place for prefill; the copy costs weight-size extra DRAM."""
+    pc = program_config
+    workers = -(-int(weight.padded_shape[-1]) // 32 // pc.per_core_N)
+    grid_y = -(-workers // 11)
+    config = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=(11, grid_y), in0_block_w=pc.in0_block_w, out_subblock_h=pc.out_subblock_h,
+        out_subblock_w=pc.out_subblock_w, per_core_M=pc.per_core_M, per_core_N=pc.per_core_N, fuse_batch=True,
+        fused_activation=None, mcast_in0=True,
+    )
+    host = ttnn.to_torch(weight)
+    packed = ttnn.from_torch(
+        repack_for_worker_banks(host.reshape(host.shape[-2], host.shape[-1]), full_cols=pc.per_core_N).reshape(
+            host.shape),
+        dtype=weight.dtype, layout=ttnn.TILE_LAYOUT, device=weight.device(), memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    return PackedDecodeMatmul(packed, config, compute_kernel_config, output_memory_config=output_memory_config,
+                              cb_slots=cb_slots, outstanding=outstanding, dual_noc=dual_noc)
+
+
+def packed_projections():
+    """QWEN36_PACKED_PROJ: comma list of single-request 35B decode projections served by packed_decode_runner
+    (out = GDN out_proj, o = attention o_proj, qkv = attention fused QKV)."""
+    return {p for p in os.environ.get("QWEN36_PACKED_PROJ", "").split(",") if p}

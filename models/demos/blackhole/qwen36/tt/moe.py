@@ -2,14 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3.5 MoE routing plus single-P150 expert execution."""
 
+import os
 from pathlib import Path
 import torch
 
 import ttnn
 
 from models.common.modules.moe.tt_moe_local import TTLocalMoEDecode, TTLocalMoEGate, decode_linear
-from models.common.modules.moe.batched_experts import BatchedExperts
-from models.common.modules.moe.selected_experts import BatchedTopKRouting
+from models.common.modules.moe.batched_experts import BatchedExperts, FusedBatchedExperts, RoutedFusedExperts
+from models.common.modules.moe.selected_experts import BatchedTopKRouting, ParallelTopKRouting
 from models.common.modules.moe.grouped_experts import GroupedExperts
 from models.common.modules.moe.grouped_routing import GroupedRouting, grouped_combine, prefill_valid_rows  # noqa: F401
 from models.demos.blackhole.qwen36.tt.weight_mapping import prepare_qwen35_moe_layer
@@ -102,17 +103,47 @@ class Qwen36MoE:
         return self._forward_routed(x, int(x.shape[-2]))
 
     def _forward_routed(self, flat, rows):
-        if rows not in self._batched:
-            routing = BatchedTopKRouting(
+        # QWEN36_MOE_ROUTING=batched: one routing core per row (BatchedTopKRouting); default for 1-2 rows: the
+        # top-k scan split over one core per logit tile (ParallelTopKRouting, identical output).
+        parallel = rows in (1, 2) and os.environ.get("QWEN36_MOE_ROUTING", "batched") == "parallel"
+        # QWEN36_MOE_FUSED (1/2/4/8 rows, identical output): 0 = routing, gate/up and down as three programs; 1 = routing,
+        # then gate/up + down in one program; routed = all three in one program (RoutedFusedExperts, UNTESTED); default 1 (verified exact).
+        # Batched buckets of 4 and 8 rows (one row group) take the same fused program; 16 rows (two row groups) need
+        # more down cores per bank than gate/up cores and keep the two programs.
+        mode = os.environ.get("QWEN36_MOE_FUSED", "1") if rows in (1, 2, 4, 8) else "0"
+        if mode == "routed" and rows not in (1, 2):
+            mode = "1"
+        fused = mode != "0"
+        if mode == "routed":
+            key = (rows, "routed")
+            if key not in self._batched:
+                self._batched[key] = RoutedFusedExperts(
+                    self.gate.mesh_device, self.experts.gate_up, self.experts.down,
+                    hidden=self.experts.hidden_size, intermediate=self.experts.intermediate_size,
+                    stored_experts=self.experts.num_experts + 1, top_k=self.gate.top_k, rows=rows,
+                    num_experts=self.gate.num_experts, shared_slot=self.experts.shared_slot,
+                )
+            packed = flat
+            if flat.memory_config().memory_layout != ttnn.TensorMemoryLayout.INTERLEAVED:
+                packed = ttnn.to_memory_config(flat, ttnn.L1_MEMORY_CONFIG)
+            logits = decode_linear(packed, self.gate.router, self.gate.router_program)
+            output = self._batched[key](packed, logits)
+            ttnn.deallocate(logits)
+            if packed is not flat:
+                ttnn.deallocate(packed)
+            return output
+        key = (rows, parallel, fused)
+        if key not in self._batched:
+            routing = (ParallelTopKRouting if parallel else BatchedTopKRouting)(
                 self.gate.mesh_device, self.gate.num_experts, self.gate.top_k, self.experts.shared_slot, rows,
             )
-            experts = BatchedExperts(
+            experts = (FusedBatchedExperts if fused else BatchedExperts)(
                 self.gate.mesh_device, self.experts.gate_up, self.experts.down,
                 hidden=self.experts.hidden_size, intermediate=self.experts.intermediate_size,
                 stored_experts=self.experts.num_experts + 1, top_k=self.gate.top_k, rows=rows,
             )
-            self._batched[rows] = routing, experts
-        routing, experts = self._batched[rows]
+            self._batched[key] = routing, experts
+        routing, experts = self._batched[key]
         packed = flat
         if flat.memory_config().memory_layout != ttnn.TensorMemoryLayout.INTERLEAVED:
             packed = ttnn.to_memory_config(flat, ttnn.L1_MEMORY_CONFIG)
