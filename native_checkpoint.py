@@ -81,8 +81,10 @@ def save_json(path, value):
 
 
 def local_file(root, name):
-    root = Path(root).resolve()
-    path = (root / name).resolve()
+    # Lexical containment: a Hugging Face cache snapshot holds symlinks into ../../blobs, so resolving the file
+    # would always leave the checkpoint directory.  `..` components are still rejected by the normalisation.
+    root = Path(os.path.abspath(root))
+    path = Path(os.path.abspath(root / name))
     if not path.is_relative_to(root) or path == root:
         raise ValueError(f"Artifact path escapes checkpoint: {name}")
     return path
