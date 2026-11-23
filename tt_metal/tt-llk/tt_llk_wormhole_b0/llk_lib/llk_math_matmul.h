@@ -741,11 +741,11 @@ inline void matmul_configure_mop_throttled(
 
     constexpr std::uint32_t outer_loops        = (THROTTLE_LEVEL > 3) ? 2 : (high_fidelity ? to_underlying(math_fidelity) : 1);
     const std::uint32_t inner_loops            = (!is_in1_16x32) ? 2 : 1;
-    constexpr std::uint32_t loop_instruction_0 = (THROTTLE_LEVEL == 5)   ? lltt::replay_insn(ckernel::math::replay_buf_offset + 1, 8)
-                                                 : (THROTTLE_LEVEL == 4) ? lltt::replay_insn(ckernel::math::replay_buf_offset + 2, 6)
+    constexpr std::uint32_t loop_instruction_0 = (THROTTLE_LEVEL == 5)   ? TT_OP_REPLAY(ckernel::math::replay_buf_offset + 1, 8, 0, 0)
+                                                 : (THROTTLE_LEVEL == 4) ? TT_OP_REPLAY(ckernel::math::replay_buf_offset + 2, 6, 0, 0)
                                                                          : TT_OP_REPLAY(ckernel::math::replay_buf_offset, replay_buff_len_throttle, 0, 0);
-    constexpr std::uint32_t loop_instruction_1 = (THROTTLE_LEVEL == 5)   ? lltt::replay_insn(ckernel::math::replay_buf_offset + 9, 4)
-                                                 : (THROTTLE_LEVEL == 4) ? lltt::replay_insn(ckernel::math::replay_buf_offset + 8, 4)
+    constexpr std::uint32_t loop_instruction_1 = (THROTTLE_LEVEL == 5)   ? TT_OP_REPLAY(ckernel::math::replay_buf_offset + 9, 4, 0, 0)
+                                                 : (THROTTLE_LEVEL == 4) ? TT_OP_REPLAY(ckernel::math::replay_buf_offset + 8, 4, 0, 0)
                                                                          : TT_OP_MVMUL(p_setrwc::CLR_NONE, 0, ADDR_MOD_0, 0);
     ckernel_template tmp(outer_loops, inner_loops, loop_instruction_0, loop_instruction_1);
 

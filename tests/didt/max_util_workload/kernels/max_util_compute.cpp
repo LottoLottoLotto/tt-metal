@@ -103,11 +103,11 @@ ALWI void max_util_unpack(
     ckernel_unpack_template tmp = ckernel_unpack_template(
         false,                    // src B
         false,                    // halo - just used for 4 unpacks
-        lltt::replay_insn(0, 6),  // runs when context is 0
+        TT_OP_REPLAY(0, 6, 0, 0),  // runs when context is 0
         0,
         0,
         0,
-        lltt::replay_insn(6, 6),  // runs when context is 1
+        TT_OP_REPLAY(6, 6, 0, 0),  // runs when context is 1
         0,
         0);
 

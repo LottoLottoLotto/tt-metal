@@ -1732,9 +1732,9 @@ inline NOINLINE void record_len32_group(const bool dir)
 
 inline NOINLINE void replay_len32_group(const bool dir)
 {
-    lltt::replay(0, len32_loads_len);
+    TT_REPLAY(0, len32_loads_len, 0, 0);
     bitonic_sort_len_32_tail(dir);
-    lltt::replay(len32_loads_len, len32_stores_len);
+    TT_REPLAY(len32_loads_len, len32_stores_len, 0, 0);
 }
 
 } // namespace topk_xl_fused_macro
@@ -1931,7 +1931,7 @@ inline void transpose_faces_from_dst()
     load_replay_buf<Exec>(0, transpose_face_body_len, [] { transpose_dest_face_32b_body(); });
     for (std::uint32_t face = 1; face < N; face++)
     {
-        lltt::replay(0, transpose_face_body_len);
+        TT_REPLAY(0, transpose_face_body_len, 0, 0);
     }
 }
 
@@ -2121,7 +2121,7 @@ inline void canonical_big_block_with_replay_body(bool dir)
         topk_xl_fused_macro::record_step_group_pipelined<64, 16>(dir);
         for (int i = 1; i < row_scale_factor; i++)
         {
-            lltt::replay(0, topk_xl_fused_macro::pipelined_group_len);
+            TT_REPLAY(0, topk_xl_fused_macro::pipelined_group_len, 0, 0);
         }
 #else
         load_replay_buf<Exec>(0, 8, [] { load16_rows_x2<64>(); });
@@ -2129,9 +2129,9 @@ inline void canonical_big_block_with_replay_body(bool dir)
         load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<64, 16>(); });
         for (int i = 1; i < row_scale_factor; i++)
         {
-            lltt::replay(0, 8);
+            TT_REPLAY(0, 8, 0, 0);
             bitonic_sort_len_k(dir);
-            lltt::replay(8, 8);
+            TT_REPLAY(8, 8, 0, 0);
         }
 #endif
         TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
@@ -2180,9 +2180,9 @@ inline void canonical_big_block_with_replay_body(bool dir)
             load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<consecutive_32_offset, 32>(); });
             for (int i = 1; i < row_scale_factor; i++)
             {
-                lltt::replay(0, 8);
+                TT_REPLAY(0, 8, 0, 0);
                 bitonic_sort_len_32(dir);
-                lltt::replay(8, 8);
+                TT_REPLAY(8, 8, 0, 0);
             }
         }
         TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
@@ -2295,7 +2295,7 @@ inline void _topk_xl_local_sort_(const std::uint32_t dst_index, const bool ascen
             }
             else
             {
-                lltt::replay(0, 32);
+                TT_REPLAY(0, 32, 0, 0);
             }
             bitonic_sort_len_32(dir);
             store16_rows_x2<consecutive_32_offset, 32>();
@@ -2341,16 +2341,16 @@ inline void _topk_xl_local_sort_(const std::uint32_t dst_index, const bool ascen
         load_replay_buf<Exec>(0, 8, [] { load16_rows_x2<consecutive_32_offset>(); });
         bitonic_sort_len_32(dir);
         load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<consecutive_32_offset, 32>(); });
-        lltt::replay(0, 8);
+        TT_REPLAY(0, 8, 0, 0);
         bitonic_sort_len_32(dir);
-        lltt::replay(8, 8);
+        TT_REPLAY(8, 8, 0, 0);
         dir = !dir;
-        lltt::replay(0, 8);
+        TT_REPLAY(0, 8, 0, 0);
         bitonic_sort_len_32(dir);
-        lltt::replay(8, 8);
-        lltt::replay(0, 8);
+        TT_REPLAY(8, 8, 0, 0);
+        TT_REPLAY(0, 8, 0, 0);
         bitonic_sort_len_32(dir);
-        lltt::replay(8, 8);
+        TT_REPLAY(8, 8, 0, 0);
         dir = !dir;
 #endif
         TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
@@ -2381,7 +2381,7 @@ inline void _topk_xl_local_sort_(const std::uint32_t dst_index, const bool ascen
     topk_xl_fused_macro::record_step_group_pipelined<2, 16>(dir);
     for (int i = 1; i < 8; i++)
     {
-        lltt::replay(0, topk_xl_fused_macro::pipelined_group_len);
+        TT_REPLAY(0, topk_xl_fused_macro::pipelined_group_len, 0, 0);
     }
 #else
     load_replay_buf<Exec>(0, 8, [] { load16_rows_x2<2>(); });
@@ -2389,9 +2389,9 @@ inline void _topk_xl_local_sort_(const std::uint32_t dst_index, const bool ascen
     load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<2, 16>(); });
     for (int i = 1; i < 8; i++)
     {
-        lltt::replay(0, 8);
+        TT_REPLAY(0, 8, 0, 0);
         bitonic_sort_len_k(dir);
-        lltt::replay(8, 8);
+        TT_REPLAY(8, 8, 0, 0);
     }
 #endif
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
@@ -2425,10 +2425,10 @@ inline void _topk_xl_local_sort_(const std::uint32_t dst_index, const bool ascen
     load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<2, 16>(); });
     for (int i = 1; i < 8; i++)
     {
-        lltt::replay(0, 8);
+        TT_REPLAY(0, 8, 0, 0);
         TTI_SFPTRANSP(0, 0, 0, 0);
         bitonic_sort_len_4(dir);
-        lltt::replay(8, 8);
+        TT_REPLAY(8, 8, 0, 0);
     }
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
     transpose_8_faces<true, 256, /*manage_outer_cfg=*/false>();
@@ -2452,9 +2452,9 @@ inline void _topk_xl_local_sort_(const std::uint32_t dst_index, const bool ascen
     load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<2, 16>(); });
     for (int i = 1; i < 8; i++)
     {
-        lltt::replay(0, 8);
+        TT_REPLAY(0, 8, 0, 0);
         bitonic_sort_len_8(dir);
-        lltt::replay(8, 8);
+        TT_REPLAY(8, 8, 0, 0);
     }
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
     transpose_8_faces<true, 256, /*manage_outer_cfg=*/false>();
@@ -2478,9 +2478,9 @@ inline void _topk_xl_local_sort_(const std::uint32_t dst_index, const bool ascen
     load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<2, 16>(); });
     for (int i = 1; i < 8; i++)
     {
-        lltt::replay(0, 8);
+        TT_REPLAY(0, 8, 0, 0);
         bitonic_sort_len_16_alt(dir);
-        lltt::replay(8, 8);
+        TT_REPLAY(8, 8, 0, 0);
     }
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
     transpose_8_faces<true, 256, /*manage_outer_cfg=*/false>();
@@ -2585,7 +2585,7 @@ inline void _topk_xl_local_sort_generic_(const std::uint32_t dst_index, const bo
             }
             else
             {
-                lltt::replay(0, 32);
+                TT_REPLAY(0, 32, 0, 0);
             }
             bitonic_sort_len_32(dir);
             store16_rows_x2<consecutive_32_offset, 32>();
@@ -2635,9 +2635,9 @@ inline void _topk_xl_local_sort_generic_(const std::uint32_t dst_index, const bo
             load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<consecutive_32_offset, 32>(); });
             for (int i = 1; i < row_scale_factor; i++)
             {
-                lltt::replay(0, 8);
+                TT_REPLAY(0, 8, 0, 0);
                 bitonic_sort_len_32(dir);
-                lltt::replay(8, 8);
+                TT_REPLAY(8, 8, 0, 0);
                 if constexpr ((!topk_xl_blaze_compat && !early_exit_K64) || row_scale_factor > 2)
                 {
                     if ((i & 1) == 1)
@@ -2677,7 +2677,7 @@ inline void _topk_xl_local_sort_generic_(const std::uint32_t dst_index, const bo
         topk_xl_fused_macro::record_step_group_pipelined<2, 16>(dir);
         for (int i = 1; i < n_iters_stride2; i++)
         {
-            lltt::replay(0, topk_xl_fused_macro::pipelined_group_len);
+            TT_REPLAY(0, topk_xl_fused_macro::pipelined_group_len, 0, 0);
         }
     }
     else
@@ -2688,9 +2688,9 @@ inline void _topk_xl_local_sort_generic_(const std::uint32_t dst_index, const bo
         load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<2, 16>(); });
         for (int i = 1; i < n_iters_stride2; i++)
         {
-            lltt::replay(0, 8);
+            TT_REPLAY(0, 8, 0, 0);
             bitonic_sort_len_k(dir);
-            lltt::replay(8, 8);
+            TT_REPLAY(8, 8, 0, 0);
         }
     }
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
@@ -2729,10 +2729,10 @@ inline void _topk_xl_local_sort_generic_(const std::uint32_t dst_index, const bo
     load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<2, 16>(); });
     for (int i = 1; i < n_iters_stride2; i++)
     {
-        lltt::replay(0, 8);
+        TT_REPLAY(0, 8, 0, 0);
         TTI_SFPTRANSP(0, 0, 0, 0);
         bitonic_sort_len_4(dir);
-        lltt::replay(8, 8);
+        TT_REPLAY(8, 8, 0, 0);
     }
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
     transpose_N_faces</*N*/ row_scale_factor * 2, /*fused=*/true, /*indices_offset=*/256, /*manage_outer_cfg=*/false>();
@@ -2752,9 +2752,9 @@ inline void _topk_xl_local_sort_generic_(const std::uint32_t dst_index, const bo
     load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<2, 16>(); });
     for (int i = 1; i < n_iters_stride2; i++)
     {
-        lltt::replay(0, 8);
+        TT_REPLAY(0, 8, 0, 0);
         bitonic_sort_len_8(dir);
-        lltt::replay(8, 8);
+        TT_REPLAY(8, 8, 0, 0);
     }
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
     transpose_N_faces</*N*/ row_scale_factor * 2, /*fused=*/true, /*indices_offset=*/256, /*manage_outer_cfg=*/false>();
@@ -2774,9 +2774,9 @@ inline void _topk_xl_local_sort_generic_(const std::uint32_t dst_index, const bo
     load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<2, 16>(); });
     for (int i = 1; i < n_iters_stride2; i++)
     {
-        lltt::replay(0, 8);
+        TT_REPLAY(0, 8, 0, 0);
         bitonic_sort_len_16_alt(dir);
-        lltt::replay(8, 8);
+        TT_REPLAY(8, 8, 0, 0);
     }
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
     transpose_N_faces</*N*/ row_scale_factor * 2, /*fused=*/true, /*indices_offset=*/256, /*manage_outer_cfg=*/false>();
@@ -3042,9 +3042,9 @@ inline void _topk_xl_rebuild_(const std::uint32_t dst_index, const bool ascendin
         {
             for (int i = 1 - pass; i < 8; i++)
             {
-                lltt::replay(0, 8);
+                TT_REPLAY(0, 8, 0, 0);
                 bitonic_sort_len_16_alt<fused>(dir);
-                lltt::replay(8, 8);
+                TT_REPLAY(8, 8, 0, 0);
             }
             TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
             set_dst_write_addr_offset(tile_offset + (pass ? 0 : 2));
@@ -3072,7 +3072,7 @@ inline void _topk_xl_rebuild_(const std::uint32_t dst_index, const bool ascendin
             topk_xl_unfused_macro::record_ce_full<indices_offset, 64, 8>(dir);
             for (int i = 1; i < 8; i++)
             {
-                lltt::replay(0, 16);
+                TT_REPLAY(0, 16, 0, 0);
             }
             TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
 
@@ -3090,11 +3090,11 @@ inline void _topk_xl_rebuild_(const std::uint32_t dst_index, const bool ascendin
                     }
                     else if (j < 3)
                     {
-                        lltt::replay(0, 16);
+                        TT_REPLAY(0, 16, 0, 0);
                     }
                     else
                     {
-                        lltt::replay(0, 15);
+                        TT_REPLAY(0, 15, 0, 0);
                         topk_xl_unfused_macro::ce_tail<indices_offset, 32, 40>();
                     }
                 }
@@ -3112,11 +3112,11 @@ inline void _topk_xl_rebuild_(const std::uint32_t dst_index, const bool ascendin
                     }
                     else if (j == 0)
                     {
-                        lltt::replay(0, 16);
+                        TT_REPLAY(0, 16, 0, 0);
                     }
                     else
                     {
-                        lltt::replay(0, 15);
+                        TT_REPLAY(0, 15, 0, 0);
                         topk_xl_unfused_macro::ce_tail<indices_offset, 16, 24>();
                     }
                 }
@@ -3129,9 +3129,9 @@ inline void _topk_xl_rebuild_(const std::uint32_t dst_index, const bool ascendin
             load_replay_buf<Exec>(8, 8, [] { store8_rows_x2_unfused<indices_offset, 64, 8>(); });
             for (int i = 1; i < 8; i++)
             {
-                lltt::replay(0, 8);
+                TT_REPLAY(0, 8, 0, 0);
                 bitonic_sort_len_k<fused>(dir);
-                lltt::replay(8, 8);
+                TT_REPLAY(8, 8, 0, 0);
             }
             TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
 
@@ -3155,9 +3155,9 @@ inline void _topk_xl_rebuild_(const std::uint32_t dst_index, const bool ascendin
                     }
                     else
                     {
-                        lltt::replay(0, 8);
+                        TT_REPLAY(0, 8, 0, 0);
                         bitonic_sort_len_k<fused>(dir);
-                        lltt::replay(8, 7);
+                        TT_REPLAY(8, 7, 0, 0);
                     }
                     if (j < 3)
                     {
@@ -3189,9 +3189,9 @@ inline void _topk_xl_rebuild_(const std::uint32_t dst_index, const bool ascendin
                     }
                     else
                     {
-                        lltt::replay(0, 8);
+                        TT_REPLAY(0, 8, 0, 0);
                         bitonic_sort_len_k<fused>(dir);
-                        lltt::replay(8, 7);
+                        TT_REPLAY(8, 7, 0, 0);
                     }
                     if (j == 0)
                     {
@@ -3212,9 +3212,9 @@ inline void _topk_xl_rebuild_(const std::uint32_t dst_index, const bool ascendin
             load_replay_buf<Exec>(8, 8, [] { store8_rows_x2_unfused<indices_offset, 8, 16>(); });
             for (int i = 1; i < 8; i++)
             {
-                lltt::replay(0, 8);
+                TT_REPLAY(0, 8, 0, 0);
                 bitonic_sort_len_16_alt<fused>(dir);
-                lltt::replay(8, 8);
+                TT_REPLAY(8, 8, 0, 0);
             }
             TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
 
@@ -3352,17 +3352,17 @@ inline void _topk_xl_rebuild_generic_(const std::uint32_t dst_index, const bool 
         load_replay_buf<Exec>(8, 8, [] { store8_rows_x2_unfused<indices_offset, 8, 16>(); });
         for (int i = 1; i < n_iters_stride2; i++)
         {
-            lltt::replay(0, 8);
+            TT_REPLAY(0, 8, 0, 0);
             bitonic_sort_len_16_alt<fused>(dir);
-            lltt::replay(8, 8);
+            TT_REPLAY(8, 8, 0, 0);
         }
         TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
         set_dst_write_addr_offset(tile_offset + 2);
         for (int i = 0; i < n_iters_stride2; i++)
         {
-            lltt::replay(0, 8);
+            TT_REPLAY(0, 8, 0, 0);
             bitonic_sort_len_16_alt<fused>(dir);
-            lltt::replay(8, 8);
+            TT_REPLAY(8, 8, 0, 0);
         }
         TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
         set_dst_write_addr_offset(tile_offset + 0);
@@ -3416,11 +3416,11 @@ inline void _topk_xl_rebuild_generic_(const std::uint32_t dst_index, const bool 
                 {
                     if (!(i == 0))
                     {
-                        lltt::replay(0, 16);
+                        TT_REPLAY(0, 16, 0, 0);
                     }
-                    lltt::replay(0, 16);
-                    lltt::replay(0, 16);
-                    lltt::replay(0, 15);
+                    TT_REPLAY(0, 16, 0, 0);
+                    TT_REPLAY(0, 16, 0, 0);
+                    TT_REPLAY(0, 15, 0, 0);
                     topk_xl_unfused_macro::ce_tail<indices_offset, 32, 40>();
                 }
                 TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
@@ -3438,16 +3438,16 @@ inline void _topk_xl_rebuild_generic_(const std::uint32_t dst_index, const bool 
                 {
                     if (!(i == 0))
                     {
-                        lltt::replay(0, 8);
+                        TT_REPLAY(0, 8, 0, 0);
                         bitonic_sort_len_k<fused>(dir);
-                        lltt::replay(8, 8);
+                        TT_REPLAY(8, 8, 0, 0);
                     }
-                    lltt::replay(0, 8);
+                    TT_REPLAY(0, 8, 0, 0);
                     bitonic_sort_len_k<fused>(dir);
-                    lltt::replay(8, 8);
-                    lltt::replay(0, 8);
+                    TT_REPLAY(8, 8, 0, 0);
+                    TT_REPLAY(0, 8, 0, 0);
                     bitonic_sort_len_k<fused>(dir);
-                    lltt::replay(8, 8);
+                    TT_REPLAY(8, 8, 0, 0);
                     // Last sort_k of the outer iter: fold +8 into the LREG7 store.
                     load8_rows_x2_unfused<indices_offset, 32>();
                     bitonic_sort_len_k<fused>(dir);
@@ -3461,12 +3461,12 @@ inline void _topk_xl_rebuild_generic_(const std::uint32_t dst_index, const bool 
             // ── stride-16 — 16-slot macro body; every second body replays
             // [0, 15) and emits the ADDR_MOD_2 (+24) fold tail.
             topk_xl_unfused_macro::record_ce_full<indices_offset, 16, 8>(dir);
-            lltt::replay(0, 15);
+            TT_REPLAY(0, 15, 0, 0);
             topk_xl_unfused_macro::ce_tail<indices_offset, 16, 24>();
             for (int i = 1; i < row_scale_factor; i++)
             {
-                lltt::replay(0, 16);
-                lltt::replay(0, 15);
+                TT_REPLAY(0, 16, 0, 0);
+                TT_REPLAY(0, 15, 0, 0);
                 topk_xl_unfused_macro::ce_tail<indices_offset, 16, 24>();
             }
             TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
@@ -3487,9 +3487,9 @@ inline void _topk_xl_rebuild_generic_(const std::uint32_t dst_index, const bool 
             store8_rows_x2_unfused<indices_offset, 16, 24 /* inc_dst_addr */>();
             for (int i = 1; i < row_scale_factor; i++)
             {
-                lltt::replay(0, 8);
+                TT_REPLAY(0, 8, 0, 0);
                 bitonic_sort_len_k<fused>(dir);
-                lltt::replay(8, 8);
+                TT_REPLAY(8, 8, 0, 0);
                 load8_rows_x2_unfused<indices_offset, 16>();
                 bitonic_sort_len_k<fused>(dir);
                 store8_rows_x2_unfused<indices_offset, 16, 24 /* inc_dst_addr */>();
@@ -3505,9 +3505,9 @@ inline void _topk_xl_rebuild_generic_(const std::uint32_t dst_index, const bool 
             load_replay_buf<Exec>(8, 8, [] { store8_rows_x2_unfused<indices_offset, 8, 16>(); });
             for (int i = 1; i < n_iters_stride2; i++)
             {
-                lltt::replay(0, 8);
+                TT_REPLAY(0, 8, 0, 0);
                 bitonic_sort_len_16_alt<fused>(dir);
-                lltt::replay(8, 8);
+                TT_REPLAY(8, 8, 0, 0);
             }
             TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
 
@@ -3645,7 +3645,7 @@ inline void _topk_xl_add_lsb_indices_()
 
         for (int i = 1; i < 4; i++)
         {
-            lltt::replay(0, 16);
+            TT_REPLAY(0, 16, 0, 0);
         }
 
         // Outer loop over the remaining face-pairs, same shape as the
@@ -3662,7 +3662,7 @@ inline void _topk_xl_add_lsb_indices_()
 
             for (int i = 0; i < 4; i++)
             {
-                lltt::replay(0, 16);
+                TT_REPLAY(0, 16, 0, 0);
             }
         }
         return;
@@ -3733,7 +3733,7 @@ inline void _topk_xl_add_lsb_indices_()
 
     for (int i = 1; i < 4; i++)
     {
-        lltt::replay(0, 16);
+        TT_REPLAY(0, 16, 0, 0);
     }
 
     // Outer loop over the remaining face-pairs. We hoist the
@@ -3757,7 +3757,7 @@ inline void _topk_xl_add_lsb_indices_()
 
         for (int i = 0; i < 4; i++)
         {
-            lltt::replay(0, 16);
+            TT_REPLAY(0, 16, 0, 0);
         }
     }
 }
@@ -3826,7 +3826,7 @@ inline void _topk_xl_add_lsb_indices_rt_(const std::uint32_t chunk_id)
 
     for (int i = 1; i < 4; i++)
     {
-        lltt::replay(0, 16);
+        TT_REPLAY(0, 16, 0, 0);
     }
 
     constexpr int row_scale_factor = K == 512 ? 1 : K == 1024 ? 2 : 4;
@@ -3836,7 +3836,7 @@ inline void _topk_xl_add_lsb_indices_rt_(const std::uint32_t chunk_id)
 
         for (int i = 0; i < 4; i++)
         {
-            lltt::replay(0, 16);
+            TT_REPLAY(0, 16, 0, 0);
         }
     }
 }
@@ -3910,7 +3910,7 @@ inline void _topk_xl_remove_msb_values_()
             });
         for (int i = 1; i < row_scale_factor * 16; i++)
         {
-            lltt::replay(0, 3);
+            TT_REPLAY(0, 3, 0, 0);
         }
     }
     else
@@ -4260,7 +4260,7 @@ inline void _topk_xl_separate_indices_()
 
     for (int i = 1; i < row_scale_factor * 16; i++)
     {
-        lltt::replay(0, 9);
+        TT_REPLAY(0, 9, 0, 0);
     }
 }
 
@@ -4351,7 +4351,7 @@ inline void _topk_xl_split_sort_head_512_(const std::uint32_t tile_offset, const
         // Pipelined; see `step_group_pipelined`. The last iteration prefetches one group past the end, which only writes LREGs that are dead by then.
         topk_xl_fused_macro::prologue_loads_rt<2>(dir);
         topk_xl_fused_macro::record_step_group_pipelined<2, 16>(dir);
-        lltt::replay(0, topk_xl_fused_macro::pipelined_group_len);
+        TT_REPLAY(0, topk_xl_fused_macro::pipelined_group_len, 0, 0);
     }
     else
 #endif
@@ -4359,9 +4359,9 @@ inline void _topk_xl_split_sort_head_512_(const std::uint32_t tile_offset, const
         load_replay_buf<Exec>(0, 8, [] { load16_rows_x2<2>(); });
         bitonic_sort_len_k(dir);
         load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<2, 16>(); });
-        lltt::replay(0, 8);
+        TT_REPLAY(0, 8, 0, 0);
         bitonic_sort_len_k(dir);
-        lltt::replay(8, 8);
+        TT_REPLAY(8, 8, 0, 0);
     }
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
     for (int col = 0; col < 2; col++)
@@ -4400,7 +4400,7 @@ inline void _topk_xl_split_sort_head_1024_(const std::uint32_t tile_offset, cons
             }
             else
             {
-                lltt::replay(0, 32);
+                TT_REPLAY(0, 32, 0, 0);
             }
             bitonic_sort_len_32(dir);
             store16_rows_x2<consecutive_32_offset, 32>();
@@ -4427,9 +4427,9 @@ inline void _topk_xl_split_sort_head_1024_(const std::uint32_t tile_offset, cons
         load_replay_buf<Exec>(0, 8, [] { load16_rows_x2<consecutive_32_offset>(); });
         bitonic_sort_len_32(dir);
         load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<consecutive_32_offset, 32>(); });
-        lltt::replay(0, 8);
+        TT_REPLAY(0, 8, 0, 0);
         bitonic_sort_len_32(dir);
-        lltt::replay(8, 8);
+        TT_REPLAY(8, 8, 0, 0);
         if constexpr (!topk_xl_blaze_compat)
         {
             dir = !dir;
@@ -4448,7 +4448,7 @@ inline void _topk_xl_split_sort_head_1024_(const std::uint32_t tile_offset, cons
     topk_xl_fused_macro::record_step_group_pipelined<2, 16>(dir);
     for (int i = 1; i < 4; i++)
     {
-        lltt::replay(0, topk_xl_fused_macro::pipelined_group_len);
+        TT_REPLAY(0, topk_xl_fused_macro::pipelined_group_len, 0, 0);
     }
 #else
     load_replay_buf<Exec>(0, 8, [] { load16_rows_x2<2>(); });
@@ -4456,9 +4456,9 @@ inline void _topk_xl_split_sort_head_1024_(const std::uint32_t tile_offset, cons
     load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<2, 16>(); });
     for (int i = 1; i < 4; i++)
     {
-        lltt::replay(0, 8);
+        TT_REPLAY(0, 8, 0, 0);
         bitonic_sort_len_k(dir);
-        lltt::replay(8, 8);
+        TT_REPLAY(8, 8, 0, 0);
     }
 #endif
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
@@ -4497,7 +4497,7 @@ inline void _topk_xl_split_sort_head_2048_(const std::uint32_t tile_offset, cons
             }
             else
             {
-                lltt::replay(0, 32);
+                TT_REPLAY(0, 32, 0, 0);
             }
             bitonic_sort_len_32(dir);
             store16_rows_x2<consecutive_32_offset, 32>();
@@ -4532,16 +4532,16 @@ inline void _topk_xl_split_sort_head_2048_(const std::uint32_t tile_offset, cons
         load_replay_buf<Exec>(0, 8, [] { load16_rows_x2<consecutive_32_offset>(); });
         bitonic_sort_len_32(dir);
         load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<consecutive_32_offset, 32>(); });
-        lltt::replay(0, 8);
+        TT_REPLAY(0, 8, 0, 0);
         bitonic_sort_len_32(dir);
-        lltt::replay(8, 8);
+        TT_REPLAY(8, 8, 0, 0);
         dir = !dir;
-        lltt::replay(0, 8);
+        TT_REPLAY(0, 8, 0, 0);
         bitonic_sort_len_32(dir);
-        lltt::replay(8, 8);
-        lltt::replay(0, 8);
+        TT_REPLAY(8, 8, 0, 0);
+        TT_REPLAY(0, 8, 0, 0);
         bitonic_sort_len_32(dir);
-        lltt::replay(8, 8);
+        TT_REPLAY(8, 8, 0, 0);
         dir = !dir;
 #endif
         TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
@@ -4559,7 +4559,7 @@ inline void _topk_xl_split_sort_head_2048_(const std::uint32_t tile_offset, cons
     topk_xl_fused_macro::record_step_group_pipelined<2, 16>(dir);
     for (int i = 1; i < 8; i++)
     {
-        lltt::replay(0, topk_xl_fused_macro::pipelined_group_len);
+        TT_REPLAY(0, topk_xl_fused_macro::pipelined_group_len, 0, 0);
     }
 #else
     load_replay_buf<Exec>(0, 8, [] { load16_rows_x2<2>(); });
@@ -4567,9 +4567,9 @@ inline void _topk_xl_split_sort_head_2048_(const std::uint32_t tile_offset, cons
     load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<2, 16>(); });
     for (int i = 1; i < 8; i++)
     {
-        lltt::replay(0, 8);
+        TT_REPLAY(0, 8, 0, 0);
         bitonic_sort_len_k(dir);
-        lltt::replay(8, 8);
+        TT_REPLAY(8, 8, 0, 0);
     }
 #endif
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
@@ -4632,9 +4632,9 @@ inline void _topk_xl_split_stride2_(const std::uint32_t tile_offset, const bool 
         load_replay_buf<Exec>(stores_at, 8, [] { store16_rows_x2<2, 16>(); });
         for (int i = 1; i < n_iters; i++)
         {
-            lltt::replay(0, topk_xl_fused_macro::stride2_len16_loads_len);
+            TT_REPLAY(0, topk_xl_fused_macro::stride2_len16_loads_len, 0, 0);
             bitonic_sort_len_16_alt_tail(dir);
-            lltt::replay(stores_at, 8);
+            TT_REPLAY(stores_at, 8, 0, 0);
         }
         topk_xl_fused_macro::restore_step_group_templates();
     }
@@ -4658,9 +4658,9 @@ inline void _topk_xl_split_stride2_(const std::uint32_t tile_offset, const bool 
         load_replay_buf<Exec>(stores_at, 8, [] { store16_rows_x2<2, 16>(); });
         for (int i = 1; i < n_iters; i++)
         {
-            lltt::replay(0, topk_xl_fused_macro::stride2_len8_loads_len);
+            TT_REPLAY(0, topk_xl_fused_macro::stride2_len8_loads_len, 0, 0);
             bitonic_sort_len_8_tail(dir);
-            lltt::replay(stores_at, 8);
+            TT_REPLAY(stores_at, 8, 0, 0);
         }
         topk_xl_fused_macro::restore_step_group_templates();
     }
@@ -4672,9 +4672,9 @@ inline void _topk_xl_split_stride2_(const std::uint32_t tile_offset, const bool 
         load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<2, 16>(); });
         for (int i = 1; i < n_iters; i++)
         {
-            lltt::replay(0, 8);
+            TT_REPLAY(0, 8, 0, 0);
             _topk_xl_split_stride2_sort_<sort_len>(dir);
-            lltt::replay(8, 8);
+            TT_REPLAY(8, 8, 0, 0);
         }
     }
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);

@@ -123,7 +123,7 @@ inline void _llk_pack_fast_tilize_mop_config_(const std::uint32_t unit_dim)
     ckernel::ckernel_template tmp(
         unit_dim, // outerloop: one iteration per tile
         1,        // innerloop: single tile body
-        lltt::replay_insn(REPLAY_TILE_OFFSET, REPLAY_TILE_LEN),
+        TT_OP_REPLAY(REPLAY_TILE_OFFSET, REPLAY_TILE_LEN, 0, 0),
         TT_OP_ADDRCRZW(p_setadc::PAC, 0, 0, 1, 0, 0b0010 /* CH0_W */));
 
     // start_op: restore Z/W from CR shadows. W_Cr accumulates across tiles.

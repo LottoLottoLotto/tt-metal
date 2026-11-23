@@ -158,7 +158,7 @@ constexpr std::uint32_t get_replay_insn_for_combo(const std::uint8_t combo)
         }
         else
         {
-            return need_stall ? lltt::replay_insn(24, 1) : TT_OP_NOP;
+            return need_stall ? TT_OP_REPLAY(24, 1, 0, 0) : TT_OP_NOP;
         }
     }
 
