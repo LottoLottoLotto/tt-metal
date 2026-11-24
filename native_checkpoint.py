@@ -283,8 +283,17 @@ def verify_files(root, manifest):
             raise ValueError(f"Checkpoint file hash/size mismatch: {name}")
 
 
+# The release ships one checkpoint and one pair of reload proofs per runtime image (checkpoint/ for the 8K / 128K
+# image, proofs-262k/ for the 262K image); its launcher mounts the image's pair over the checkpoint's.  This variable
+# names the directory holding the pair recorded on the running runtime instead; unset, the checkpoint's own.  The
+# proof is still bound to the checkpoint's manifest, precision and MTP mode, and validate_runtime still compares its
+# environment and every source it names.
+PROOFS_ENV = "QWEN36_NATIVE_PROOFS"
+
+
 def require_equivalence(root, manifest):
-    proof = json.loads((Path(root) / equivalence_filename(os.environ)).read_text())
+    proofs = os.environ.get(PROOFS_ENV) or root
+    proof = json.loads((Path(proofs) / equivalence_filename(os.environ)).read_text())
     if (proof.get("manifest_sha256") != digest(Path(root) / MANIFEST)
             or proof.get("exact_logits_equal") is not True or proof.get("tokens_compared", 0) < 1):
         raise ValueError("Native checkpoint lacks matching exact end-to-end equivalence evidence")

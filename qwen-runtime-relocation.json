@@ -9,13 +9,18 @@
  "files": {
   "/home/container_app_user/tt-metal/native_checkpoint.py": {
    "release_sha256": "14138c43afd112ddc64ef943e361747d66cf6d43c29cf29b16dc2ef294f38719",
-   "sha256": "10e65fbb553a332422e1429a6176597483e59235818d110334104401dcf489c9",
-   "reason": "SPDX header; relocatable runtime-support check; Hugging Face cache symlinks accepted by local_file (this file)"
+   "sha256": "fc97b508a7aac784ecee6eed8844b2730e1b36ea63c00250bf0606805d49697e",
+   "reason": "SPDX header; relocatable runtime-support check; Hugging Face cache symlinks accepted by local_file; reload-proof directory (QWEN36_NATIVE_PROOFS) (this file)"
   },
   "/home/container_app_user/tt-metal/models/demos/blackhole/qwen36/tt/shared_serving.py": {
    "release_sha256": "f8cd050e45cc8195680a194e4125a330754556bcaddc3944bbf963718dc49d35",
    "sha256": "b6f685f34627a4d50dfcc661d26f9e21f85223685177e3ac0a561be10a41ef6c",
    "reason": "comment only: an internal path removed"
+  },
+  "/home/container_app_user/tt-metal/models/demos/blackhole/qwen36/README.md": {
+   "release_sha256": "8ef5523ebcc274ccb9f5e84517ac9f5fbf52e83153167c9041ee5fa202fc2ac6",
+   "sha256": "768d0c19449accc1515cbdb21ca6bbddbcd81e8d153f05f567b12a8b9c44e5ef",
+   "reason": "documentation only: an internal path removed"
   },
   "/home/container_app_user/tt-metal/build/lib/_ttnn.so": {
    "release_sha256": "72446dcea0b262582d070e63561247ada40f25dd850cf66e249769b669991333",
