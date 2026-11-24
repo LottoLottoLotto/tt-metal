@@ -9,8 +9,8 @@
  "files": {
   "/home/container_app_user/tt-metal/native_checkpoint.py": {
    "release_sha256": "14138c43afd112ddc64ef943e361747d66cf6d43c29cf29b16dc2ef294f38719",
-   "sha256": "4cd221ba88dfc0fd063a70382444401fdd5b18fb198a642a7eb723ebe053ad25",
-   "reason": "SPDX header; relocatable runtime-support check (this file)"
+   "sha256": "d14d8f25eae5a93f212c712008138596effc6c9df181c36c89820e34f41e2b5b",
+   "reason": "SPDX header; relocatable runtime-support check; Hugging Face cache symlinks accepted by local_file (this file)"
   },
   "/home/container_app_user/tt-metal/models/demos/blackhole/qwen36/tt/shared_serving.py": {
    "release_sha256": "f8cd050e45cc8195680a194e4125a330754556bcaddc3944bbf963718dc49d35",

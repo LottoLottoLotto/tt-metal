@@ -197,9 +197,21 @@ def save_json(path, value):
 def local_file(root, name):
     root = Path(root).resolve()
     path = (root / name).resolve()
-    if not path.is_relative_to(root) or path == root:
+    if path == root or not (path.is_relative_to(root) or hf_cache_blob(root, name, path)):
         raise ValueError(f"Artifact path escapes checkpoint: {name}")
     return path
+
+
+def hf_cache_blob(root, name, path):
+    """A Hugging Face cache snapshot (<cache>/models--<org>--<name>/snapshots/<revision>/...) stores every file as a
+    symlink into the cache's blob store (the repo's blobs/, which may link on into a cache-wide store); accept a
+    target inside that cache, for a name that stays inside the checkpoint lexically."""
+    if not Path(os.path.normpath(root / name)).is_relative_to(root):
+        return False
+    for parent in (root, *root.parents):
+        if parent.parent.name == "snapshots" and parent.parent.parent.name.startswith("models--"):
+            return path.is_relative_to(parent.parent.parent.parent)
+    return False
 
 
 def read_manifest(root):
