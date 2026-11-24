@@ -197,9 +197,14 @@ def save_json(path, value):
 def local_file(root, name):
     root = Path(root).resolve()
     path = (root / name).resolve()
-    if path == root or not (path.is_relative_to(root) or hf_cache_blob(root, name, path)):
+    if path == root:
         raise ValueError(f"Artifact path escapes checkpoint: {name}")
-    return path
+    if path.is_relative_to(root):
+        return path
+    if hf_cache_blob(root, name, path):
+        # The snapshot entry itself, not its blob: loaders key on the file name (e.g. ttnn's .tensorbin check).
+        return Path(os.path.normpath(root / name))
+    raise ValueError(f"Artifact path escapes checkpoint: {name}")
 
 
 def hf_cache_blob(root, name, path):
