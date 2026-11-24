@@ -14,6 +14,7 @@ from models.demos.deepseek_v3_b1.unified_kernel_descriptor import (
 _KERNEL = str(Path(__file__).with_name("rope_to_sdpa_kernel.cpp").resolve())
 _TILE_BYTES = 2048
 _BFP8_TILE_BYTES = 1088
+_BFP4_TILE_BYTES = 576
 _WORKERS = 56
 
 
@@ -57,7 +58,20 @@ def _validate(q, k, cos, sin, qkv, tokens=1):
         raise ValueError("rope_to_sdpa requires at least an 11x6 logical worker grid")
 
 
-def _program(q, k, cos, sin, qkv, q_out, k_out, v_out, token=0, out_token=None):
+def _v_source(qkv, v_rows):
+    """V source for the RoPE launches: the fused QKV projection (V at tile 416) or, for the 4-bit V
+    cache, the rotated rows on their BFP4 grid (v_rotate.rotate_v_rows [1,T,1024], tile 0)."""
+    if v_rows is None:
+        return qkv, []
+    tokens = _shape(qkv)[1]
+    if (_shape(v_rows) != (1, tokens, 1024) or _shape(v_rows, True) != (1, 32, 1024)
+            or v_rows.dtype != ttnn.bfloat16 or v_rows.layout != ttnn.TILE_LAYOUT
+            or v_rows.memory_config() != ttnn.DRAM_MEMORY_CONFIG):
+        raise ValueError("rope_to_sdpa v_rows must be the DRAM BF16 [1,T,1024] rotated V of the same rows")
+    return v_rows, [("ROPE_V_TILE0", "0")]
+
+
+def _program(q, k, cos, sin, qkv, q_out, k_out, v_out, token=0, out_token=None, v_rows=None):
     core_list = [ttnn.CoreCoord(index % 11, index // 11) for index in range(_WORKERS)]
     cores = ttnn.CoreRangeSet({ttnn.CoreRange(core, core) for core in core_list})
     tile = ttnn.TileDescriptor(ttnn.Tile((32, 32)))
@@ -92,13 +106,15 @@ def _program(q, k, cos, sin, qkv, q_out, k_out, v_out, token=0, out_token=None):
         defines.append(("ROPE_TOKEN", str(token)))
     if out_token is not None and out_token != token:
         defines.append(("ROPE_OUT_TOKEN", str(out_token)))
+    v_source, v_defines = _v_source(qkv, v_rows)
+    defines += v_defines
     # Never assume logical (0,0) is the physical NoC location of the KV shard.
     shard_core = q.device().worker_core_from_logical_core(ttnn.CoreCoord(0, 0))
     kernel = UnifiedKernelDescriptor(
         kernel_source=_KERNEL,
         core_ranges=cores,
         defines=defines,
-        ncrisc_common_runtime_args=[int(t.buffer_address()) for t in (q, k, cos, sin, qkv)],
+        ncrisc_common_runtime_args=[int(t.buffer_address()) for t in (q, k, cos, sin, v_source)],
         brisc_common_runtime_args=[int(t.buffer_address()) for t in (q_out, k_out, v_out)]
         + [int(shard_core.x), int(shard_core.y)],
         trisc_compute_config=compute,
@@ -111,7 +127,7 @@ def _program(q, k, cos, sin, qkv, q_out, k_out, v_out, token=0, out_token=None):
     return ttnn.ProgramDescriptor(kernels=kernel.get_kernel_descriptors().kernels, cbs=cbs, semaphores=[])
 
 
-def rope_to_sdpa(q, k, cos, sin, qkv):
+def rope_to_sdpa(q, k, cos, sin, qkv, v_rows=None):
     """Return DRAM Q and single-core height-sharded L1 K/V for B1/T1 decode.
 
     Q/K are normalized head-row tensors, not original [1,heads,1,256]
@@ -124,6 +140,7 @@ def rope_to_sdpa(q, k, cos, sin, qkv):
     output element. Padding rows are zeroed by separate row owners without
     overlapping live-head writes; no prezero operation or scratch tensor is
     needed. All DMA source CBs remain reserved until the respective barrier.
+    v_rows (4-bit V cache): the rotated V [1,1,1024] read instead of QKV's V columns.
     """
     _validate(q, k, cos, sin, qkv)
     device = q.device()
@@ -135,13 +152,13 @@ def rope_to_sdpa(q, k, cos, sin, qkv):
     k_out = ttnn.empty((1, 1, 4, 256), memory_config=sharded_mc, **allocation)
     v_out = ttnn.empty((1, 1, 4, 256), memory_config=sharded_mc, **allocation)
     ttnn.generic_op(
-        [q, k, cos, sin, qkv, q_out, k_out, v_out],
-        _program(q, k, cos, sin, qkv, q_out, k_out, v_out),
+        [q, k, cos, sin, qkv, q_out, k_out, v_out] + ([v_rows] if v_rows is not None else []),
+        _program(q, k, cos, sin, qkv, q_out, k_out, v_out, v_rows=v_rows),
     )
     return q_out, k_out, v_out
 
 
-def rope_to_sdpa_two(q, k, cos, sin, qkv, token, q_out):
+def rope_to_sdpa_two(q, k, cos, sin, qkv, token, q_out, v_rows=None):
     """M=2 verification RoPE for one token row of [1,2,...] Q/K/cos/sin/QKV.
 
     Writes token `token` into tiles [8*token, 8*token+8) of the caller's DRAM
@@ -162,13 +179,13 @@ def rope_to_sdpa_two(q, k, cos, sin, qkv, token, q_out):
     k_out = ttnn.empty((1, 1, 4, 256), memory_config=sharded_mc, **allocation)
     v_out = ttnn.empty((1, 1, 4, 256), memory_config=sharded_mc, **allocation)
     ttnn.generic_op(
-        [q, k, cos, sin, qkv, q_out, k_out, v_out],
-        _program(q, k, cos, sin, qkv, q_out, k_out, v_out, token=token),
+        [q, k, cos, sin, qkv, q_out, k_out, v_out] + ([v_rows] if v_rows is not None else []),
+        _program(q, k, cos, sin, qkv, q_out, k_out, v_out, token=token, v_rows=v_rows),
     )
     return k_out, v_out
 
 
-def rope_to_sdpa_row(q, k, cos, sin, qkv, token, q_out, out_token):
+def rope_to_sdpa_row(q, k, cos, sin, qkv, token, q_out, out_token, v_rows=None):
     """Wide (T=3/4) verification RoPE for token row `token` of [1,T,...] Q/K/cos/sin/QKV.
 
     Writes the token's query into tiles [8*out_token, 8*out_token+8) of the
@@ -191,8 +208,8 @@ def rope_to_sdpa_row(q, k, cos, sin, qkv, token, q_out, out_token):
     k_out = ttnn.empty((1, 1, 4, 256), memory_config=sharded_mc, **allocation)
     v_out = ttnn.empty((1, 1, 4, 256), memory_config=sharded_mc, **allocation)
     ttnn.generic_op(
-        [q, k, cos, sin, qkv, q_out, k_out, v_out],
-        _program(q, k, cos, sin, qkv, q_out, k_out, v_out, token=token, out_token=out_token),
+        [q, k, cos, sin, qkv, q_out, k_out, v_out] + ([v_rows] if v_rows is not None else []),
+        _program(q, k, cos, sin, qkv, q_out, k_out, v_out, token=token, out_token=out_token, v_rows=v_rows),
     )
     return k_out, v_out
 
@@ -209,7 +226,7 @@ def verify_row_groups(tokens):
     return [tuple(range(start, min(start + VERIFY_SDPA_GROUP, tokens))) for start in range(0, tokens, VERIFY_SDPA_GROUP)]
 
 
-def rope_kv_many(q, k, cos, sin, qkv, q_groups, cache_key, cache_value, positions, page_table):
+def rope_kv_many(q, k, cos, sin, qkv, q_groups, cache_key, cache_value, positions, page_table, v_rows=None):
     """Verification RoPE (T=2..8) for every token row in one launch.
 
     Token t's query goes to row t%G of q_groups[t//G] (DRAM [1,G,24,256] SDPA groups of
@@ -220,6 +237,8 @@ def rope_kv_many(q, k, cos, sin, qkv, q_groups, cache_key, cache_value, position
     BFP8 caches (long-context serving) receive each row through the packer's BF16->BFP8
     conversion, patched into its tile (one shared exponent per 16-element face row, so other rows
     keep their bytes).
+    4-bit V cache (K BFP8, V BFP4): v_rows is the rotated V [1,T,1024] on its BFP4 grid
+    (v_rotate.rotate_v_rows); the packer's BF16->BFP4 conversion stores those values exactly.
     """
     tokens = _shape(q)[1]
     q_packed = isinstance(q_groups, ttnn.Tensor)
@@ -241,13 +260,18 @@ def rope_kv_many(q, k, cos, sin, qkv, q_groups, cache_key, cache_value, position
         ):
             raise ValueError("rope_kv_many requires DRAM [1,G,24,256] query groups of consecutive VERIFY_SDPA_GROUP rows")
     cache_bfp8 = cache_key.dtype == ttnn.bfloat8_b
+    value_bfp4 = cache_value.dtype == ttnn.bfloat4_b
+    if value_bfp4 and (not cache_bfp8 or v_rows is None):
+        raise ValueError("rope_kv_many: a BFP4 V cache needs a BFP8 K cache and the rotated v_rows")
     for cache in (cache_key, cache_value):
         shape = _shape(cache)
-        if (cache.dtype not in (ttnn.bfloat16, ttnn.bfloat8_b) or cache.dtype != cache_key.dtype
+        if (cache.dtype not in (ttnn.bfloat16, ttnn.bfloat8_b, ttnn.bfloat4_b)
+                or (cache.dtype != cache_key.dtype and not value_bfp4)
                 or cache.layout != ttnn.TILE_LAYOUT or len(shape) != 4
                 or (shape[1], shape[3]) != (4, 256) or shape[2] % 32
                 or cache.memory_config() != ttnn.DRAM_MEMORY_CONFIG):
-            raise ValueError("rope_kv_many requires tiled BF16/BFP8 DRAM paged caches [blocks,4,block,256]")
+            raise ValueError("rope_kv_many requires tiled BF16/BFP8 (or BFP8 K + BFP4 V) DRAM paged caches "
+                             "[blocks,4,block,256]")
     if (tuple(positions.shape) != (tokens,) or positions.dtype != ttnn.int32
             or positions.memory_config() != ttnn.DRAM_MEMORY_CONFIG
             or len(page_table.shape) != 2 or int(page_table.shape[0]) != tokens
@@ -267,13 +291,21 @@ def rope_kv_many(q, k, cos, sin, qkv, q_groups, cache_key, cache_value, position
         for index, count in cb_tiles.items()
     ]
     if cache_bfp8:
-        # 21: eight packed BFP8 row tiles per KV token (K rotated half, 3 K pass, 4 V);
-        # 22: one cache tile staged for the row patch (read-modify-write).
-        for index, count in ((21, 8), (22, 1)):
+        # 21: eight packed BFP8 row tiles per KV token (K rotated half, 3 K pass, 4 V; K only with a
+        # BFP4 V cache); 22: one cache tile staged for the row patch (read-modify-write).
+        for index, count in ((21, 4 if value_bfp4 else 8), (22, 1)):
             cbs.append(ttnn.CBDescriptor(
                 total_size=count * _BFP8_TILE_BYTES,
                 core_ranges=cores,
                 format_descriptors=[ttnn.CBFormatDescriptor(index, ttnn.bfloat8_b, _BFP8_TILE_BYTES, tile)],
+            ))
+    if value_bfp4:
+        # 23: four packed BFP4 V row tiles per KV token; 24: one BFP4 cache tile staged for the patch.
+        for index, count in ((23, 4), (24, 1)):
+            cbs.append(ttnn.CBDescriptor(
+                total_size=count * _BFP4_TILE_BYTES,
+                core_ranges=cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(index, ttnn.bfloat4_b, _BFP4_TILE_BYTES, tile)],
             ))
     compute = ttnn.ComputeConfigDescriptor(
         math_fidelity=ttnn.MathFidelity.HiFi4,
@@ -296,12 +328,14 @@ def rope_kv_many(q, k, cos, sin, qkv, q_groups, cache_key, cache_value, position
         ("ROPE_POSITION_BYTES", str(int(positions.padded_shape[-1]) * 4)),
         ("ROPE_TABLE_BYTES", str(int(page_table.padded_shape[-1]) * 4)),
     ] + ([("ROPE_CACHE_BFP8", "1")] if cache_bfp8 else []) + ([("ROPE_Q_PACKED", "1")] if q_packed else [])
+    v_source, v_defines = _v_source(qkv, v_rows)
+    defines += v_defines + ([("ROPE_V_BFP4", "1")] if value_bfp4 else [])
     groups = list(q_groups) + [q_groups[-1]] * (4 - len(q_groups))
     kernel = UnifiedKernelDescriptor(
         kernel_source=_KV_MANY_KERNEL,
         core_ranges=cores,
         defines=defines,
-        ncrisc_common_runtime_args=[int(t.buffer_address()) for t in (q, k, cos, sin, qkv)],
+        ncrisc_common_runtime_args=[int(t.buffer_address()) for t in (q, k, cos, sin, v_source)],
         brisc_common_runtime_args=[int(t.buffer_address()) for t in (*groups, cache_key, cache_value, positions,
                                                                       page_table)],
         trisc_compute_config=compute,
@@ -312,4 +346,5 @@ def rope_kv_many(q, k, cos, sin, qkv, q_groups, cache_key, cache_value, position
         ),
     )
     program = ttnn.ProgramDescriptor(kernels=kernel.get_kernel_descriptors().kernels, cbs=cbs, semaphores=[])
-    ttnn.generic_op([q, k, cos, sin, qkv, *q_groups, cache_key, cache_value, positions, page_table], program)
+    ttnn.generic_op([q, k, cos, sin, qkv, *q_groups, cache_key, cache_value, positions, page_table]
+                    + ([v_rows] if v_rows is not None else []), program)

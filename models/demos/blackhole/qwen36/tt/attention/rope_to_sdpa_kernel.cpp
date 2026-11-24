@@ -14,6 +14,11 @@
 #include "api/compute/eltwise_binary.h"
 #endif
 
+// First V tile of the V source: the fused QKV projection (V at column 13312) or the rotated
+// 4-bit-cache V rows (v_rotate.rotate_v_rows), which start at column 0.
+#ifndef ROPE_V_TILE0
+#define ROPE_V_TILE0 416
+#endif
 #ifndef ROPE_TOKEN
 #define ROPE_TOKEN 0
 #endif
@@ -169,8 +174,9 @@ void kernel_main() {
         cb_reserve_back(kValue, 4);
         const uint32_t value_dst = get_write_ptr(kValue);
         for (uint32_t tile = 0; tile < 4; ++tile) {
-            // Packed Q/G occupy 12288 columns, K 1024, then V at 13312.
-            gather_row(packed, 416 + head * 8 + half * 4 + tile, ROPE_TOKEN, value_dst + tile * kTileBytes);
+            // Packed Q/G occupy 12288 columns, K 1024, then V at 13312 (tile 416); a rotated
+            // V source (v_rotate.rotate_v_rows, [1,T,1024]) starts at tile 0.
+            gather_row(packed, ROPE_V_TILE0 + head * 8 + half * 4 + tile, ROPE_TOKEN, value_dst + tile * kTileBytes);
         }
         noc_async_read_barrier();
         cb_push_back(kValue, 4);

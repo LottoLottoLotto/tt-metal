@@ -89,7 +89,13 @@ def _attend_block(attention, qkv, cos, sin, positions, page_table, groups):
                    device=attention.device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         for rows, _, _ in groups
     ]
-    rope_kv_many(query_normed, key_normed, cos, sin, qkv, group_queries, key_cache, value_cache, positions, page_table)
+    # 4-bit V cache (bfp8_v4r): V rows rotated by R onto their BFP4 grid; outputs rotated back below.
+    v4 = value_cache.dtype == ttnn.bfloat4_b
+    if v4:
+        from models.demos.blackhole.qwen36.tt.attention import v_rotate
+    v_rows = v_rotate.rotate_v_rows(qkv) if v4 else None
+    rope_kv_many(query_normed, key_normed, cos, sin, qkv, group_queries, key_cache, value_cache, positions, page_table,
+                 v_rows=v_rows)
     ttnn.deallocate(query_normed)
     ttnn.deallocate(key_normed)
     max_seq = key_cache.shape[0] * key_cache.shape[2]
@@ -111,6 +117,10 @@ def _attend_block(attention, qkv, cos, sin, positions, page_table, groups):
     attended = merge_group_rows(outputs)
     for out in outputs:
         ttnn.deallocate(out)
+    if v4:
+        ttnn.deallocate(v_rows)
+        rotated, attended = attended, v_rotate.unrotate_rows(attended)
+        ttnn.deallocate(rotated)
     gate_act = ttnn.sigmoid(gate)
     ttnn.deallocate(gate)
     gated = ttnn.multiply(attended, gate_act)

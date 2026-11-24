@@ -61,15 +61,24 @@ payload per 32-row block. Block sizes in `mlp._packed_prefill_program_config` an
 `_packed_mega_prefill_program_config` are bounded to fit beside the resident state;
 `fused_horner.supports` admits the 27B's 3072 diagonal blocks per 2048-token chunk.
 
-M=2 GDN verification uses a separate 33-core BF8 output-projection program with
-K-block 2 (`out_verify_program_config`); M=1 retains its existing K-block 8.
-Reusing M=1's program for M=2 was faster but introduced rare projection rounding
-differences and recurrent-state drift over repeated traces. K-block 2 passed exact
-target/draft-logit and committed-state comparisons for accepted/rejected drafts,
-including the 127→128 KV-page boundary, and repeated 20-cycle trace comparisons.
-The final resident-model A/B measured 70.825→69.180 ms per MTP cycle (2.32% lower
-latency), not API token throughput. See `../../probes/m2_projection_ab.py` and
-`../../evidence/m2-projection-final.json`.
+Speculative verification is exact: every verification row (MTP-1's 2, MTP-3's 4, DFlash's 8)
+produces the logits a single-row (M=1) decode produces at that position, bit for bit, so greedy
+speculative streams equal non-speculative greedy streams. Three paths used to differ:
+
+- Attention: `verify_sdpa.py` splits each (row, KV head)'s KV range over 8 cores; M=1 decode's
+  paged SDPA took 16 cores/head on its 8x8 grid (different chunk ranges and reduction tree).
+  `_get_paged_sdpa_decode_program_config` now caps decode at `max_cores_per_head_batch=8`.
+- GDN output projection: verification ran K-block 2, M=1 K-block 8 (rare 1-bit differences).
+  Verification rows share M=1's `out_decode_program_config` (one tile row, same K blocking); the
+  `proj_o` prefetch family serves K blocks 4 (attention) and 8 (GDN).
+- Final norm: decode fuses the last residual add into the model RMSNorm
+  (`_final_norm_residual_decode`); verification added, then ran the bounded norm. The last
+  verification layer now applies the same fused norm (`Qwen36Model.verify_final_norm`).
+
+Everything else (norms, QKV/mega/gate-up/down/LM-head matmuls, RoPE and KV rows, GDN
+frontend/recurrence/state candidates) was already row-identical; a development probe (not part of
+this tree) compares every layer of a teacher-forced verification against
+M=1 decode (outputs, KV rows, GDN states) and the free-running logits.
 
 The packed BF8 27B mega projection `[5120,16512]` uses K-block 2 for M=1 and
 M=2 decode, retaining the 11x10 grid, six output tiles per core, subblock width 2,

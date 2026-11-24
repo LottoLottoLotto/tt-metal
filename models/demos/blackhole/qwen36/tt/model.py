@@ -3375,7 +3375,10 @@ class Qwen36Model:
                 else:
                     fill = k_full
                 ttnn.experimental.paged_fill_cache(k_cache, fill, pt, batch_idx=0)
-                ttnn.experimental.paged_fill_cache(v_cache, fill, pt, batch_idx=0)
+                if v_cache.dtype == k_cache.dtype:
+                    # The 4-bit V cache is filled by v_rotate.fill_v_paged, one width-independent
+                    # program the bucket forwards above already compiled.
+                    ttnn.experimental.paged_fill_cache(v_cache, fill, pt, batch_idx=0)
                 if page_len < bucket:
                     ttnn.deallocate(fill)
                 ttnn.deallocate(pt)
@@ -3986,6 +3989,25 @@ class Qwen36Model:
         )
         return states
 
+    def log_dram_usage(self, stage):
+        """Log paged-KV bytes and the DRAM allocator state (memory headroom of the serving profile)."""
+        tile_bytes = {ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
+        kv_bytes = 0
+        for pair in self._paged_kv_caches or []:
+            for t in pair:
+                tiles = 1
+                for d in t.padded_shape:
+                    tiles *= int(d)
+                kv_bytes += tiles // 1024 * tile_bytes.get(t.dtype, 0)
+        dtypes = sorted({str(t.dtype) for pair in (self._paged_kv_caches or []) for t in pair})
+        view = ttnn.get_memory_view(self.device, ttnn.BufferType.DRAM)
+        banks = int(view.num_banks)
+        logger.info(
+            "DRAM usage ({}): paged_kv_bytes={} kv_dtypes={} allocated={} free={} largest_free_block={} banks={}",
+            stage, kv_bytes, dtypes, int(view.total_bytes_allocated_per_bank) * banks,
+            int(view.total_bytes_free_per_bank) * banks, int(view.largest_contiguous_bytes_free_per_bank) * banks, banks,
+        )
+
     def set_paged_kv_caches(self, kv_caches):
         """Attach paged KV caches to the 8 attention layers."""
         self._paged_kv_caches = kv_caches
@@ -4010,12 +4032,22 @@ class Qwen36Model:
         if os.environ.get("QWEN_SDPA_BF8", "0") == "1":
             dtype = ttnn.bfloat8_b
         # QWEN36_KV_CACHE_DTYPE: native-context serving policy (bf16 exact default; bfp8 when the
-        # single-stream pool must hold up to 262144 tokens next to the weights).
+        # single-stream pool must hold up to 262144 tokens next to the weights; bfp8_v4r = BFP8 K and
+        # the Hadamard-rotated, round-to-nearest BFP4 V cache of attention/v_rotate.py, 26624 instead
+        # of 34816 bytes per token).
         kv_policy = os.environ.get("QWEN36_KV_CACHE_DTYPE", "bf16")
-        if kv_policy not in ("bf16", "bfp8"):
-            raise ValueError("QWEN36_KV_CACHE_DTYPE must be bf16 or bfp8")
-        if kv_policy == "bfp8":
+        if kv_policy not in ("bf16", "bfp8", "bfp8_v4r"):
+            raise ValueError("QWEN36_KV_CACHE_DTYPE must be bf16, bfp8 or bfp8_v4r")
+        if kv_policy in ("bfp8", "bfp8_v4r"):
             dtype = ttnn.bfloat8_b
+        value_dtype = dtype
+        if kv_policy == "bfp8_v4r":
+            if self.num_devices > 1:
+                raise ValueError("QWEN36_KV_CACHE_DTYPE=bfp8_v4r is implemented for the single-P150 27B only")
+            from models.demos.blackhole.qwen36.tt.attention import v_rotate
+
+            value_dtype = ttnn.bfloat4_b
+            v_rotate.matrices(self.device)  # R / R^T on device before any trace capture
         if self.num_devices > 1:
             return self._allocate_kv_caches_tp(kv_cache_shape, dtype, batch_size)
 
@@ -4027,9 +4059,10 @@ class Qwen36Model:
         kv_caches = []
         for idx in self._attention_layer_indices:
             k_cache = ttnn.zeros(shape, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=self.device)
-            v_cache = ttnn.zeros(shape, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=self.device)
+            v_cache = ttnn.zeros(shape, dtype=value_dtype, layout=ttnn.TILE_LAYOUT, device=self.device)
             kv_caches.append([k_cache, v_cache])
         self.set_paged_kv_caches(kv_caches)
+        self.log_dram_usage(f"paged KV allocated, policy {kv_policy}")
         if not self._native_gdn_state:
             logger.info("Generic GDN persistent state: layers={} recurrent_dtype={} placement=DRAM",
                         len(self._deltanet_external_states), self.args.mamba_ssm_dtype)

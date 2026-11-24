@@ -353,14 +353,19 @@ def gated_attention_forward_ttnn(
             ):
                 raise ValueError("Optimized 27B attention requires interleaved tiled BF8 DRAM weights")
         for cache in (paged_kv_cache_key, paged_kv_cache_value, kv_cache_key, kv_cache_value, past_key, past_value):
-            # Paged KV may be BFP8 for native-context serving; the other caches stay BF16.
+            # Paged KV may be BFP8 for native-context serving (V also BFP4: the 4-bit V cache with a
+            # BFP8 K cache); the other caches stay BF16.
             paged = cache is not None and (cache is paged_kv_cache_key or cache is paged_kv_cache_value)
             allowed = (ttnn.bfloat16, ttnn.bfloat8_b) if paged else (ttnn.bfloat16,)
+            if cache is not None and cache is paged_kv_cache_value and paged_kv_cache_key is not None and (
+                paged_kv_cache_key.dtype == ttnn.bfloat8_b
+            ):
+                allowed = (ttnn.bfloat8_b, ttnn.bfloat4_b)
             if cache is not None and (
                 cache.dtype not in allowed or cache.layout != ttnn.TILE_LAYOUT
                 or cache.memory_config() != ttnn.DRAM_MEMORY_CONFIG
             ):
-                raise ValueError("Optimized 27B attention requires tiled BF16 (paged: BF16/BFP8) DRAM caches")
+                raise ValueError("Optimized 27B attention requires tiled BF16 (paged: BF16/BFP8, V BFP4) DRAM caches")
         # Persistent native state already occupies 749568 bytes/core. Keep transient
         # activations in DRAM; only the explicit cache-update shards reside in L1.
         memory_config = ttnn.DRAM_MEMORY_CONFIG
@@ -394,6 +399,16 @@ def gated_attention_forward_ttnn(
         if update_bytes > 650368:
             raise ValueError("27B packed cache update exceeds the resident-state L1 budget")
     scaling = head_dim**-0.5
+    # 4-bit V cache (QWEN36_KV_CACHE_DTYPE=bfp8_v4r): V is rotated by R and stored as RNE-rounded
+    # BFP4 (v_rotate.py); every attention output is rotated back by R^T before the gate. Only the
+    # optimized single-P150 paths below implement it; the others refuse a BFP4 V cache.
+    v4 = paged_kv_cache_value is not None and paged_kv_cache_value.dtype == ttnn.bfloat4_b
+    if v4:
+        from models.demos.blackhole.qwen36.tt.attention import v_rotate
+
+    def v4_unsupported(path):
+        if v4:
+            raise ValueError(f"The 4-bit V cache (bfp8_v4r) is not implemented for the {path} attention path")
 
     # Full 27B stores only fused Q+gate/K/V, shared by decode, M=2 and prefill.
     # Other modes retain their existing projection layout and precision.
@@ -479,15 +494,21 @@ def gated_attention_forward_ttnn(
             packed_q_shape(2), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
+        v_rows = v_rotate.rotate_v_rows(qkv_fused) if v4 else None
         rope_kv_many(query_normed, key_normed, cos, sin, qkv_fused, q_packed,
-                     paged_kv_cache_key, paged_kv_cache_value, cur_pos_tensor, page_table)
+                     paged_kv_cache_key, paged_kv_cache_value, cur_pos_tensor, page_table, v_rows=v_rows)
         ttnn.deallocate(query_normed)
         ttnn.deallocate(key_normed)
         ttnn.deallocate(qkv_fused)
+        if v4:
+            ttnn.deallocate(v_rows)
         attn_output = verify_sdpa(
             q_packed, paged_kv_cache_key, paged_kv_cache_value, cur_pos_tensor, page_table, scaling,
         )
         ttnn.deallocate(q_packed)
+        if v4:
+            rotated, attn_output = attn_output, v_rotate.unrotate_rows(attn_output)
+            ttnn.deallocate(rotated)
         gate_act = ttnn.sigmoid(gate)
         ttnn.deallocate(gate)
         gated = ttnn.multiply(attn_output, gate_act)
@@ -501,13 +522,16 @@ def gated_attention_forward_ttnn(
             (1, 2, num_attention_heads, head_dim), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
+        v_rows = v_rotate.rotate_v_rows(qkv_fused) if v4 else None
         kv_shards = [
-            rope_to_sdpa_two(query_normed, key_normed, cos, sin, qkv_fused, token, q_decode)
+            rope_to_sdpa_two(query_normed, key_normed, cos, sin, qkv_fused, token, q_decode, v_rows=v_rows)
             for token in (0, 1)
         ]
         ttnn.deallocate(query_normed)
         ttnn.deallocate(key_normed)
         ttnn.deallocate(qkv_fused)
+        if v4:
+            ttnn.deallocate(v_rows)
         rows = verify_rows if verify_rows is not None else tuple(
             (cur_pos_tensor[t : t + 1], page_table[t : t + 1, :]) for t in range(2)
         )
@@ -535,6 +559,9 @@ def gated_attention_forward_ttnn(
         )
         ttnn.deallocate(q_decode)
         attn_output = ttnn.reshape(attn_output, [1, 2, num_attention_heads * head_dim])
+        if v4:
+            rotated, attn_output = attn_output, v_rotate.unrotate_rows(attn_output)
+            ttnn.deallocate(rotated)
         gate_act = ttnn.sigmoid(gate)
         ttnn.deallocate(gate)
         gated = ttnn.multiply(attn_output, gate_act)
@@ -576,6 +603,7 @@ def gated_attention_forward_ttnn(
         ttnn.deallocate(query_states)
         key_normed = ttnn.rms_norm(key_states, weight=k_norm_weight, epsilon=norm_eps)
         ttnn.deallocate(key_states)
+        v_rows = v_rotate.rotate_v_rows(qkv_fused) if v4 else None
         shared_sdpa = _os.environ.get("QWEN36_VERIFY_SDPA", "shared") == "shared"
         if shared_sdpa:
             # DFlash / wide-MTP rows: one shared-KV SDPA launch (verify_sdpa.py), bitwise equal to
@@ -587,7 +615,7 @@ def gated_attention_forward_ttnn(
                 device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
             rope_kv_many(query_normed, key_normed, cos, sin, qkv_fused, q_packed,
-                         paged_kv_cache_key, paged_kv_cache_value, cur_pos_tensor, page_table)
+                         paged_kv_cache_key, paged_kv_cache_value, cur_pos_tensor, page_table, v_rows=v_rows)
             ttnn.deallocate(query_normed)
             ttnn.deallocate(key_normed)
             ttnn.deallocate(qkv_fused)
@@ -606,7 +634,7 @@ def gated_attention_forward_ttnn(
             # One launch: RoPE for every row, queries into the SDPA groups, K/V rows written
             # straight into the paged caches (the bytes per-row paged_update_cache stored).
             rope_kv_many(query_normed, key_normed, cos, sin, qkv_fused, group_queries,
-                         paged_kv_cache_key, paged_kv_cache_value, cur_pos_tensor, page_table)
+                         paged_kv_cache_key, paged_kv_cache_value, cur_pos_tensor, page_table, v_rows=v_rows)
             ttnn.deallocate(query_normed)
             ttnn.deallocate(key_normed)
             ttnn.deallocate(qkv_fused)
@@ -639,6 +667,10 @@ def gated_attention_forward_ttnn(
             attn_output = merge_group_rows(group_outputs)
             for out in group_outputs:
                 ttnn.deallocate(out)
+        if v4:
+            ttnn.deallocate(v_rows)
+            rotated, attn_output = attn_output, v_rotate.unrotate_rows(attn_output)
+            ttnn.deallocate(rotated)
         gate_act = ttnn.sigmoid(gate)
         ttnn.deallocate(gate)
         gated = ttnn.multiply(attn_output, gate_act)
@@ -654,12 +686,18 @@ def gated_attention_forward_ttnn(
         query_states, key_states, gate = split_qkg(qkv_fused)
         query_states = ttnn.rms_norm(query_states, weight=q_norm_weight, epsilon=norm_eps)
         key_states = ttnn.rms_norm(key_states, weight=k_norm_weight, epsilon=norm_eps)
-        q_decode, k_sharded, v_sharded = rope_to_sdpa(query_states, key_states, cos, sin, qkv_fused)
+        v_rows = v_rotate.rotate_v_rows(qkv_fused) if v4 else None
+        q_decode, k_sharded, v_sharded = rope_to_sdpa(query_states, key_states, cos, sin, qkv_fused, v_rows=v_rows)
         ttnn.deallocate(query_states)
         ttnn.deallocate(key_states)
         ttnn.deallocate(qkv_fused)
+        if v4:
+            ttnn.deallocate(v_rows)
         query_states = q_decode
     else:
+        prefill_v4 = v4 and T > 1 and chunk_page_table is not None and not verify_two and not verify_many
+        if v4 and not prefill_v4:
+            v4_unsupported("unfused decode")
         if use_fused_qkv:
             qkv_fused = decode_linear(
                 hidden_states,
@@ -672,8 +710,19 @@ def gated_attention_forward_ttnn(
                 ..., qkv_fused_q_dim : qkv_fused_q_dim + qkv_fused_k_dim
             ]
             key_states = ttnn.to_layout(key_states, ttnn.TILE_LAYOUT)
-            value_states = qkv_fused[..., qkv_fused_q_dim + qkv_fused_k_dim :]
-            value_states = ttnn.to_layout(value_states, ttnn.TILE_LAYOUT)
+            if prefill_v4:
+                # 4-bit V cache: one launch rotates, rounds (RNE) and writes this chunk's V straight
+                # into the paged V cache (the V slice, typecast and paged_fill_cache it replaces).
+                if (qkv_fused_q_dim, qkv_fused_k_dim) != (12288, 1024) or T % 32:
+                    v4_unsupported("non-tile-aligned prefill")
+                v_rotate.fill_v_paged(
+                    qkv_fused, paged_kv_cache_value, chunk_page_table,
+                    min(int(chunk_page_table.shape[1]) * int(paged_kv_cache_value.shape[2]), T),
+                )
+                value_states = None
+            else:
+                value_states = qkv_fused[..., qkv_fused_q_dim + qkv_fused_k_dim :]
+                value_states = ttnn.to_layout(value_states, ttnn.TILE_LAYOUT)
             ttnn.deallocate(qkv_fused)
         else:
             qg = decode_linear(
@@ -685,7 +734,7 @@ def gated_attention_forward_ttnn(
             T > 1 and use_fused_qkv and len(qg.shape) == 3
             and _tile_heads_ok(qg, T, 2 * head_dim)
             and _tile_heads_ok(key_states, T, head_dim)
-            and _tile_heads_ok(value_states, T, head_dim)
+            and (prefill_v4 or _tile_heads_ok(value_states, T, head_dim))
         ):
             # Prefill: move whole tiles instead of padded [B,T,H,D] reshapes and transposes.
             # A flat [B,T,H*W] tile buffer is ordered [B,T/32,H,W/32], i.e. it is exactly a
@@ -705,8 +754,9 @@ def gated_attention_forward_ttnn(
             ttnn.deallocate(q5)
             k5 = ttnn.experimental.view(key_states, [B, T // 32, num_key_value_heads, 32, head_dim])
             key_states = head_major(k5, num_key_value_heads)
-            v5 = ttnn.experimental.view(value_states, [B, T // 32, num_key_value_heads, 32, head_dim])
-            value_states = head_major(v5, num_key_value_heads)
+            if not prefill_v4:
+                v5 = ttnn.experimental.view(value_states, [B, T // 32, num_key_value_heads, 32, head_dim])
+                value_states = head_major(v5, num_key_value_heads)
             if norm_weights_pre_offset:
                 query_states = ttnn.rms_norm(query_states, weight=q_norm_weight, epsilon=norm_eps)
                 key_states = ttnn.rms_norm(key_states, weight=k_norm_weight, epsilon=norm_eps)
@@ -714,6 +764,8 @@ def gated_attention_forward_ttnn(
                 query_states = rms_norm_zero_centered_ttnn(query_states, q_norm_weight, eps=norm_eps)
                 key_states = rms_norm_zero_centered_ttnn(key_states, k_norm_weight, eps=norm_eps)
         else:
+            if prefill_v4:
+                v4_unsupported("generic-layout prefill")
             qg = ttnn.reshape(qg, [B, T, num_attention_heads, head_dim * 2])
             # Split into query and gate
             query_states, gate = ttnn.chunk(qg, 2, dim=-1)
@@ -763,6 +815,7 @@ def gated_attention_forward_ttnn(
     _use_sdpa_decode = False
     _paged_sdpa_done = False
     if verify_many:
+        v4_unsupported("transactional verification")
         from models.demos.blackhole.qwen36.tt.attention.verify import causal_verify_many
 
         if verify_two or paged_kv_cache_key is None or paged_kv_cache_value is None or page_table is None:
@@ -779,6 +832,7 @@ def gated_attention_forward_ttnn(
         new_value = None
         _paged_sdpa_done = True
     elif verify_two:
+        v4_unsupported("transactional MTP-1 verification")
         if paged_kv_cache_key is None or page_table is None:
             raise ValueError("verify_two requires paged KV caches and a two-row page table")
         if shadow_fill_page_table is not None:
@@ -866,21 +920,23 @@ def gated_attention_forward_ttnn(
             # the packer's BF16->BFP8 conversion (as the decode-row updates do) BEFORE the page
             # slice, whose cache-dtype programs _warmup_paged_fill_widths compiles.
             key_cast = ttnn.typecast(key_states, paged_kv_cache_key.dtype)
-            value_cast = ttnn.typecast(value_states, paged_kv_cache_value.dtype)
             ttnn.deallocate(key_states)
-            ttnn.deallocate(value_states)
-            key_states, value_states = key_cast, value_cast
+            key_states = key_cast
+            if not v4:  # the 4-bit V cache was already written by v_rotate.fill_v_paged
+                value_cast = ttnn.typecast(value_states, paged_kv_cache_value.dtype)
+                ttnn.deallocate(value_states)
+                value_states = value_cast
 
         # Slice K/V to page_len to handle tile-padded tensors.
         block_size_cache = paged_kv_cache_key.shape[2]
         page_len = chunk_page_table.shape[1] * block_size_cache
         key_fill = key_states[:, :, :page_len, :] if page_len < key_states.shape[2] else key_states
-        value_fill = value_states[:, :, :page_len, :] if page_len < value_states.shape[2] else value_states
-
         ttnn.experimental.paged_fill_cache(paged_kv_cache_key, key_fill, chunk_page_table, batch_idx=0)
-        ttnn.experimental.paged_fill_cache(paged_kv_cache_value, value_fill, chunk_page_table, batch_idx=0)
         ttnn.deallocate(key_states)
-        ttnn.deallocate(value_states)
+        if not v4:
+            value_fill = value_states[:, :, :page_len, :] if page_len < value_states.shape[2] else value_states
+            ttnn.experimental.paged_fill_cache(paged_kv_cache_value, value_fill, chunk_page_table, batch_idx=0)
+            ttnn.deallocate(value_states)
 
         if chunk_start_idx_tensor is not None:
             # Flexible chunked SDPA: chunk_start_idx is a runtime device tensor and the
@@ -907,6 +963,10 @@ def gated_attention_forward_ttnn(
                 program_config=_get_sdpa_program_config(device, T, chunk_start_idx=chunk_start_idx),
                 compute_kernel_config=_get_sdpa_compute_kernel_config(),
             )
+        if v4:
+            # R^T per Q head, written token-major [B,T,H*D] (replaces the head relayout below).
+            rotated, attn_output = attn_output, v_rotate.unrotate_heads_major(attn_output)
+            ttnn.deallocate(rotated)
 
         new_key = paged_kv_cache_key
         new_value = paged_kv_cache_value
@@ -955,6 +1015,10 @@ def gated_attention_forward_ttnn(
                 device, paged_kv_cache_key.shape[0] * paged_kv_cache_key.shape[2]
             ),
         )
+        if v4:
+            # [1,1,24,256] (rows = Q heads) -> R^T per head, the same row products as verification.
+            rotated, attn_output = attn_output, v_rotate.unrotate_rows(attn_output)
+            ttnn.deallocate(rotated)
         if not _attention_layout_fused:
             attn_output = ttnn.reshape(attn_output, [B, num_attention_heads, 1, head_dim])
         new_key = paged_kv_cache_key
@@ -963,6 +1027,8 @@ def gated_attention_forward_ttnn(
         S_total = paged_kv_cache_key.shape[0] * paged_kv_cache_key.shape[2]
         is_causal = False
         segmented_attn_mask = None
+    elif v4:
+        v4_unsupported("non-paged")
     elif cur_pos_tensor is not None and kv_cache_key is not None and T == 1:
         # Trace-compatible SDPA decode: write K/V at dynamic position, attend up to cur_pos.
         # Uses paged_update_cache (takes device tensor for index, trace-compatible) +
@@ -1137,7 +1203,9 @@ def gated_attention_forward_ttnn(
     ttnn.deallocate(query_states)
 
     # Convert from [B, H, T, D] back to [B, T, H*D]
-    if T == 1:
+    if v4 and T > 1:
+        pass  # v_rotate.unrotate_heads_major already wrote the token-major [B,T,H*D] rows
+    elif T == 1:
         # For a single query row [B, H, 1, D] the head concat is a pure reinterpretation:
         # the H tiles of one row are already contiguous in H*D order.
         attn_output = ttnn.reshape(attn_output, [B, 1, num_attention_heads * head_dim])

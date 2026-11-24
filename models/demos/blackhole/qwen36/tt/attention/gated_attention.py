@@ -282,14 +282,19 @@ class Qwen36GatedAttention:
     def set_paged_kv_cache(self, k_cache, v_cache):
         """Attach externally-allocated paged KV cache (called once after allocate_kv_cache)."""
         if self.optimized_27b:
+            # V may be BFP4 only next to a BFP8 K cache (the rotated 4-bit V cache, v_rotate.py).
+            v4 = v_cache.dtype == ttnn.bfloat4_b and k_cache.dtype == ttnn.bfloat8_b
             for cache in (k_cache, v_cache):
                 if (
-                    cache.dtype not in (ttnn.bfloat16, ttnn.bfloat8_b) or cache.layout != ttnn.TILE_LAYOUT
+                    (cache.dtype not in (ttnn.bfloat16, ttnn.bfloat8_b) and not (v4 and cache is v_cache))
+                    or cache.layout != ttnn.TILE_LAYOUT
                     or len(cache.shape) != 4 or cache.shape[1] != 4 or cache.shape[-1] != 256
                     or cache.shape[2] % 32 != 0
                     or cache.memory_config() != ttnn.DRAM_MEMORY_CONFIG
                 ):
-                    raise ValueError("Optimized 27B KV cache must be tiled BF16/BFP8 DRAM [blocks,4,page,256]")
+                    raise ValueError(
+                        "Optimized 27B KV cache must be tiled BF16/BFP8 (or BFP8 K + BFP4 V) DRAM [blocks,4,page,256]"
+                    )
         self.paged_kv_cache_key = k_cache
         self.paged_kv_cache_value = v_cache
         self.use_paged_attention = True

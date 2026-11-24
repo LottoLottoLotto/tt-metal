@@ -16,6 +16,12 @@
 #include "api/compute/eltwise_binary.h"
 #endif
 
+// First V tile of the V source: the fused QKV projection (V at column 13312) or the rotated
+// 4-bit-cache V rows (v_rotate.rotate_v_rows), which start at column 0.
+#ifndef ROPE_V_TILE0
+#define ROPE_V_TILE0 416
+#endif
+
 namespace rope_fusion {
 constexpr uint32_t kTileBytes = 2048;
 constexpr uint32_t kTokens = ROPE_TOKENS;
@@ -36,6 +42,17 @@ constexpr uint32_t kScratch = 20;   // Writer-owned position / page-table metada
 constexpr uint32_t kCache8 = 21;    // Eight packed BFP8 row tiles per KV token: K rot, 3 K pass, 4 V
 constexpr uint32_t kStage8 = 22;    // Writer-owned staging copy of one BFP8 cache tile
 constexpr uint32_t kTile8Bytes = 1088;  // 64 exponent bytes (face-major, one per face row) + 1024 mantissas
+#if defined(ROPE_V_BFP4)
+// 4-bit V cache (QWEN36_KV_CACHE_DTYPE=bfp8_v4r; K stays BFP8): kCache8 holds the four K row tiles,
+// and the V rows (rotated and already on their BFP4 grid, v_rotate.rotate_v_rows) go through the
+// packer's BF16->BFP4 conversion, which stores grid values exactly, into kCache4.
+constexpr uint32_t kCache8Tiles = 4;
+constexpr uint32_t kCache4 = 23;    // Four packed BFP4 V row tiles per KV token
+constexpr uint32_t kStage4 = 24;    // Writer-owned staging copy of one BFP4 cache tile
+constexpr uint32_t kTile4Bytes = 576;   // 64 exponent bytes (face-major, one per face row) + 512 nibble bytes
+#else
+constexpr uint32_t kCache8Tiles = 8;
+#endif
 #endif
 
 #if defined(COMPILE_FOR_NCRISC) || defined(COMPILE_FOR_BRISC)
@@ -128,6 +145,26 @@ void patch_row_bfp8(uint32_t src, uint32_t src_row, uint64_t tile_addr, uint32_t
     noc_async_write(stage, tile_addr, kTile8Bytes);
     noc_async_write_barrier();
 }
+#if defined(ROPE_V_BFP4)
+// patch_row_bfp8 for BFP4 tiles: one exponent byte and 8 nibble bytes per face row.
+void patch_row_bfp4(uint32_t src, uint32_t src_row, uint64_t tile_addr, uint32_t dst_row, uint32_t stage) {
+    noc_async_read(tile_addr, stage, kTile4Bytes);
+    noc_async_read_barrier();
+    volatile uint8_t* s8 = reinterpret_cast<volatile uint8_t*>(src);
+    volatile uint8_t* d8 = reinterpret_cast<volatile uint8_t*>(stage);
+    for (uint32_t column = 0; column < 2; ++column) {
+        const uint32_t src_face = (src_row / 16) * 2 + column;
+        const uint32_t dst_face = (dst_row / 16) * 2 + column;
+        d8[dst_face * 16 + dst_row % 16] = s8[src_face * 16 + src_row % 16];
+        volatile uint32_t* sw = reinterpret_cast<volatile uint32_t*>(src + 64 + src_face * 128 + (src_row % 16) * 8);
+        volatile uint32_t* dw = reinterpret_cast<volatile uint32_t*>(stage + 64 + dst_face * 128 + (dst_row % 16) * 8);
+        dw[0] = sw[0];
+        dw[1] = sw[1];
+    }
+    noc_async_write(stage, tile_addr, kTile4Bytes);
+    noc_async_write_barrier();
+}
+#endif
 #endif
 #elif defined(COMPILE_FOR_TRISC)
 void multiply_and_round(uint32_t lhs, uint32_t rhs, uint32_t output) {
@@ -153,11 +190,12 @@ void multiply_and_round(uint32_t lhs, uint32_t rhs, uint32_t output) {
     cb_pop_front(rhs, 1);
 }
 #if defined(ROPE_CACHE_BFP8)
-// BF16 row tiles -> BFP8 through the packer (the conversion paged_update_cache's tilize applies).
-void pack_bfp8(uint32_t input, uint32_t count) {
+// BF16 row tiles -> BFP8/BFP4 through the packer (the conversion paged_update_cache's tilize applies).
+// Not named pack_rows: that collides with the compute API's ckernel::pack_rows under `using namespace`.
+void pack_to_cache(uint32_t input, uint32_t count, uint32_t output) {
     cb_wait_front(input, count);
     reconfig_data_format_srca(input);
-    pack_reconfig_data_format(kCache8);
+    pack_reconfig_data_format(output);
     copy_tile_to_dst_init_short(input);
     tile_regs_acquire();
     for (uint32_t tile = 0; tile < count; ++tile) {
@@ -166,7 +204,7 @@ void pack_bfp8(uint32_t input, uint32_t count) {
     tile_regs_commit();
     tile_regs_wait();
     for (uint32_t tile = 0; tile < count; ++tile) {
-        pack_tile(tile, kCache8);
+        pack_tile(tile, output);
     }
     tile_regs_release();
     cb_pop_front(input, count);
@@ -212,8 +250,9 @@ void kernel_main() {
             cb_reserve_back(kValue, 4);
             const uint32_t value_dst = get_write_ptr(kValue);
             for (uint32_t tile = 0; tile < 4; ++tile) {
-                // Packed Q/G occupy 12288 columns, K 1024, then V at 13312.
-                gather_row(packed, 416 + head * 8 + half * 4 + tile, token, value_dst + tile * kTileBytes);
+                // Packed Q/G occupy 12288 columns, K 1024, then V at 13312 (tile 416); a rotated
+            // V source (v_rotate.rotate_v_rows, [1,T,1024]) starts at tile 0.
+                gather_row(packed, ROPE_V_TILE0 + head * 8 + half * 4 + tile, token, value_dst + tile * kTileBytes);
             }
             noc_async_read_barrier();
             cb_push_back(kValue, 4);
@@ -230,10 +269,15 @@ void kernel_main() {
 #else
     constexpr uint32_t cache_page_bytes = kTileBytes;
 #endif
+#if defined(ROPE_V_BFP4)
+    constexpr uint32_t value_page_bytes = kTile4Bytes;
+#else
+    constexpr uint32_t value_page_bytes = cache_page_bytes;
+#endif
     const auto cache_key = TensorAccessor(
         tensor_accessor::make_interleaved_dspec<true>(), get_common_arg_val<uint32_t>(4), cache_page_bytes);
     const auto cache_value = TensorAccessor(
-        tensor_accessor::make_interleaved_dspec<true>(), get_common_arg_val<uint32_t>(5), cache_page_bytes);
+        tensor_accessor::make_interleaved_dspec<true>(), get_common_arg_val<uint32_t>(5), value_page_bytes);
     const auto positions = TensorAccessor(
         tensor_accessor::make_interleaved_dspec<true>(), get_common_arg_val<uint32_t>(6), ROPE_POSITION_BYTES);
     const auto table = TensorAccessor(
@@ -312,7 +356,7 @@ void kernel_main() {
         }
 #if defined(ROPE_CACHE_BFP8)
         if (!is_query) {
-            cb_wait_front(kCache8, 8);
+            cb_wait_front(kCache8, kCache8Tiles);
             const uint32_t src = get_read_ptr(kCache8);
             const uint32_t stage = get_write_ptr(kStage8);
             // Tile order (see TRISC): K rotated half, K pass columns, then V (row token % 2).
@@ -321,11 +365,23 @@ void kernel_main() {
                 patch_row_bfp8(src + (1 + tile) * kTile8Bytes, 0,
                                get_noc_addr(cache_tile + 2 + half * 3 + tile, cache_key), cache_row, stage);
             }
+#if defined(ROPE_V_BFP4)
+            cb_pop_front(kCache8, kCache8Tiles);
+            cb_wait_front(kCache4, 4);
+            const uint32_t src4 = get_read_ptr(kCache4);
+            const uint32_t stage4 = get_write_ptr(kStage4);
+            for (uint32_t tile = 0; tile < 4; ++tile) {
+                patch_row_bfp4(src4 + tile * kTile4Bytes, token % 2,
+                               get_noc_addr(cache_tile + half * 4 + tile, cache_value), cache_row, stage4);
+            }
+            cb_pop_front(kCache4, 4);
+#else
             for (uint32_t tile = 0; tile < 4; ++tile) {
                 patch_row_bfp8(src + (4 + tile) * kTile8Bytes, token % 2,
                                get_noc_addr(cache_tile + half * 4 + tile, cache_value), cache_row, stage);
             }
             cb_pop_front(kCache8, 8);
+#endif
             continue;
         }
 #endif
@@ -411,11 +467,18 @@ void kernel_main() {
         cb_pop_front(kProductSin, 1);
 #if defined(ROPE_CACHE_BFP8)
         if (!is_query) {
-            cb_reserve_back(kCache8, 8);
-            pack_bfp8(kOutput, 1);
-            pack_bfp8(kPass, 3);
-            pack_bfp8(kValue, 4);
-            cb_push_back(kCache8, 8);
+            cb_reserve_back(kCache8, kCache8Tiles);
+            pack_to_cache(kOutput, 1, kCache8);
+            pack_to_cache(kPass, 3, kCache8);
+#if defined(ROPE_V_BFP4)
+            cb_push_back(kCache8, kCache8Tiles);
+            cb_reserve_back(kCache4, 4);
+            pack_to_cache(kValue, 4, kCache4);
+            cb_push_back(kCache4, 4);
+#else
+            pack_to_cache(kValue, 4, kCache8);
+            cb_push_back(kCache8, kCache8Tiles);
+#endif
         }
 #endif
     }

@@ -1180,6 +1180,8 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
             if saved is not None:
                 model._restore_deltanet_states(saved, model.device)
                 self.dflash_reset()
+        if capture:
+            model.log_dram_usage("after decode warmup")
         return result
 
     def decode_forward(self, *args, exact_sampling=None, **kwargs):

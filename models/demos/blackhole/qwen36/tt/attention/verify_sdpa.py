@@ -152,7 +152,7 @@ def _program(q, cache_key, cache_value, positions, page_table, output, scale, ro
                                             dst_full_sync_en=False, math_approx_mode=True))
 
     full = ttnn.TileDescriptor(ttnn.Tile((32, 32)))
-    kv_bytes = 1088 if cache_key.dtype == ttnn.bfloat8_b else _TILE
+    tile_bytes = {ttnn.bfloat16: _TILE, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
     out_tiles = pnht * vdht
 
     def cb(index, tiles, dtype=ttnn.bfloat16, page=_TILE, tile=full):
@@ -165,8 +165,8 @@ def _program(q, cache_key, cache_value, positions, page_table, output, scale, ro
 
     cbs = [
         cb(0, pnht * dht),
-        cb(1, sk * dht * KV_SLOTS, cache_key.dtype, kv_bytes),
-        cb(2, sk * vdht * KV_SLOTS, cache_value.dtype, kv_bytes),
+        cb(1, sk * dht * KV_SLOTS, cache_key.dtype, tile_bytes[cache_key.dtype]),
+        cb(2, sk * vdht * KV_SLOTS, cache_value.dtype, tile_bytes[cache_value.dtype]),
         cb(3, pnht * sk),
         cb(5, 1), cb(6, pnht), cb(7, pnht),
         stick(8, pos_stick, ttnn.int32), stick(15, pos_stick, ttnn.int32), stick(9, table_stick, ttnn.int32),
@@ -190,10 +190,11 @@ def verify_sdpa(q, cache_key, cache_value, positions, page_table, scale, output=
         raise ValueError("verify_sdpa serves 2..8 verification rows")
     if tuple(int(v) for v in q.shape) != packed_q_shape(rows) or q.dtype != ttnn.bfloat16:
         raise ValueError(f"verify_sdpa expects packed BF16 Q {packed_q_shape(rows)}")
-    if (cache_key.dtype != cache_value.dtype or cache_key.dtype not in (ttnn.bfloat16, ttnn.bfloat8_b)
+    mixed = (cache_key.dtype, cache_value.dtype) == (ttnn.bfloat8_b, ttnn.bfloat4_b)  # 4-bit V cache
+    if ((cache_key.dtype != cache_value.dtype and not mixed) or cache_key.dtype not in (ttnn.bfloat16, ttnn.bfloat8_b)
             or int(cache_key.shape[1]) != KV_HEADS or int(cache_key.shape[3]) != HEAD_DIM
             or int(cache_key.shape[2]) % 32):
-        raise ValueError("verify_sdpa expects BF16/BFP8 paged caches [blocks,4,block,256]")
+        raise ValueError("verify_sdpa expects BF16/BFP8 (or BFP8 K + BFP4 V) paged caches [blocks,4,block,256]")
     if (tuple(positions.shape) != (rows,) or positions.dtype != ttnn.int32
             or int(page_table.shape[0]) != rows or page_table.dtype != ttnn.int32):
         raise ValueError("verify_sdpa expects int32 positions [T] and page_table [T, W]")
